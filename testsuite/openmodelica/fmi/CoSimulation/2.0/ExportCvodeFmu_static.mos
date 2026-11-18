@@ -1,0 +1,71 @@
+// name:     ExportCvodeFmu_static
+// keywords: fmu export simulation flags
+// status: correct
+// teardown_command: rm -rf *.fmu Pendulum* Pendulum-static* Pendulum_static* Pendulum_me_cs_systemCall.log Pendulum_flags_static.json
+//
+// Export Pendulum as 2.0 CS FMU with CVODE solver
+
+// Generate FMU
+loadModel(Modelica, {"4.1.0"}); getErrorString();
+loadString("model Pendulum
+extends Modelica.Mechanics.MultiBody.Examples.Elementary.Pendulum;
+end Pendulum;"); getErrorString();
+setCommandLineOptions("--fmiFlags=s:cvode"); getErrorString();
+buildModelFMU(Pendulum, version = "2.0", fmuType="me_cs"); getErrorString();
+
+// Check _flags.json for simulation flags
+system("unzip -cqq Pendulum.fmu resources/Pendulum_flags.json > Pendulum_flags_static.json"); getErrorString();
+readFile("Pendulum_flags_static.json"); getErrorString();
+
+// Simulate with OMSimulator
+system(getInstallationDirectoryPath() + "/bin/OMSimulator Pendulum.fmu --mode=cs --tolerance=1e-6 --stopTime=1.0 --resultFile=\"Pendulum_static_res.mat\" --stripRoot --suppressPath --tempDir=\"Pendulum-static-tmp\"", "Pendulum_me_cs_systemCall.log"); getErrorString();
+readFile("Pendulum_me_cs_systemCall.log"); getErrorString();
+
+// Check results
+// TODO: The results are wrong, but with the same error as when using euler.
+val(rev.phi, 0.0, "Pendulum_static_res.mat"); getErrorString();
+val(rev.w, 0.0, "Pendulum_static_res.mat"); getErrorString();
+val(rev.phi, 1.0, "Pendulum_static_res.mat"); getErrorString();
+val(rev.w, 1.0, "Pendulum_static_res.mat"); getErrorString();
+
+
+// Result:
+// true
+// ""
+// true
+// ""
+// true
+// ""
+// "Pendulum.fmu"
+// "Notification: Building FMU for platform 'static' (1/1).
+// Notification: Finished FMU for platform 'static' (1/1).
+// "
+// 0
+// ""
+// "{
+//   \"s\" : \"cvode\"
+// }"
+// ""
+// 0
+// ""
+// "info: *** FMU Simulation Info ***
+//      - model     : Pendulum (co-simulation)
+//      - fmiVersion: 2.0
+//      - startTime : 0.000000
+//      - stopTime  : 1.000000
+//      - tolerance : 1e-06
+//      - stepSize  : 0.01
+// info:    Result file: Pendulum_static_res.mat (bufferSize=10)
+// info:    Parameter Pendulum.world.label1 will not be stored in the result file, because the signal type is not supported
+// info:    Parameter Pendulum.world.label2 will not be stored in the result file, because the signal type is not supported
+// "
+// ""
+// 0.0
+// ""
+// 0.0
+// ""
+// -2.580795424025482
+// ""
+// 3.1740981888855195
+// ""
+// endResult

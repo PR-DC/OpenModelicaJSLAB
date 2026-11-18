@@ -1,0 +1,21 @@
+// name: AlgPatternm
+// status: correct
+// suite: metamodelica
+// suite: smoke
+// cflags: -g=MetaModelica -d=gen
+
+loadFile("AlgPatternm.mo");
+getErrorString();
+AlgPatternm.f1(1);
+getErrorString();
+AlgPatternm.f2(1);
+getErrorString();
+
+// Result:
+// true
+// ""
+// (1,2)
+// ""
+// (1,2)
+// ""
+// endResult

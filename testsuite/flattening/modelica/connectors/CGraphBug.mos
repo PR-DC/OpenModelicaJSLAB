@@ -1,0 +1,20 @@
+// name:     CGraphBug
+// keywords: <insert keywords here>
+// status:   correct
+
+loadModel(Modelica, {"4.1.0"}); getErrorString();
+loadFile("CGraphBug.mo"); getErrorString();
+
+checkModel(Test); getErrorString();
+
+
+// Result:
+// true
+// ""
+// true
+// ""
+// "Check of Test completed successfully.
+// Class Test has 119 equation(s) and 119 variable(s).
+// 107 of these are trivial equation(s)."
+// ""
+// endResult

@@ -1,0 +1,251 @@
+/*
+ * This file belongs to the OpenModelica Run-Time System
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC), c/o Linköpings
+ * universitet, Department of Computer and Information Science, SE-58183 Linköping, Sweden. All rights
+ * reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF THE BSD NEW LICENSE OR THE
+ * AGPL VERSION 3 LICENSE OR THE OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8. ANY
+ * USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES RECIPIENT'S
+ * ACCEPTANCE OF THE BSD NEW LICENSE OR THE OSMC PUBLIC LICENSE OR THE AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium) Public License
+ * (OSMC-PL) are obtained from OSMC, either from the above address, from the URLs:
+ * http://www.openmodelica.org or https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica, and in the OpenModelica distribution. GNU
+ * AGPL version 3 is obtained from: https://www.gnu.org/licenses/licenses.html#GPL. The BSD NEW
+ * License is obtained from: http://www.opensource.org/licenses/BSD-3-Clause.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY
+ * SET FORTH IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF
+ * OSMC-PL.
+ *
+ */
+#ifndef MODEL_HELP_H
+#define MODEL_HELP_H
+#include "../../omc_dll.h"
+
+#include <math.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "../../simulation_data.h"
+
+DLLDataDirection extern int maxEventIterations;
+DLLDataDirection extern double linearSparseSolverMaxDensity;
+DLLDataDirection extern int linearSparseSolverMinSize;
+DLLDataDirection extern double nonlinearSparseSolverMaxDensity;
+DLLDataDirection extern int nonlinearSparseSolverMinSize;
+DLLDataDirection extern double newtonXTol;
+DLLDataDirection extern double newtonFTol;
+DLLDataDirection extern int newtonMaxSteps;
+DLLDataDirection extern int maxJacUpdate[4];
+DLLDataDirection extern double maxStepFactor;
+DLLDataDirection extern double steadyStateTol;
+DLLDataDirection extern const size_t SIZERINGBUFFER;
+DLLDataDirection extern int compiledInDAEMode;
+DLLDataDirection extern double numericalDifferentiationDeltaXlinearize;
+DLLDataDirection extern double numericalDifferentiationDeltaXsolver;
+DLLDataDirection extern double homAdaptBend;
+DLLDataDirection extern double homHEps;
+DLLDataDirection extern int homMaxLambdaSteps;
+DLLDataDirection extern int homMaxNewtonSteps;
+DLLDataDirection extern int homMaxTries;
+DLLDataDirection extern double homTauDecreasingFactor;
+DLLDataDirection extern double homTauDecreasingFactorPredictor;
+DLLDataDirection extern double homTauIncreasingFactor;
+DLLDataDirection extern double homTauIncreasingThreshold;
+DLLDataDirection extern double homTauMax;
+DLLDataDirection extern double homTauMin;
+DLLDataDirection extern double homTauStart;
+DLLDataDirection extern int homBacktraceStrategy;
+
+/**
+ * @brief Unsigned finite-difference step for one column of a numerical Jacobian.
+ *
+ * DASKR's DMATD and IDA's ida_ls difference over `delta_h*max(|y|,|h*y'|)`,
+ * floored at the unknown's error weight `1/wt = rtol*|y| + atol`. The floor is
+ * a tolerance, not a differencing step: an unknown below it is zero as far as
+ * the error control is concerned and its magnitude is no scale to difference
+ * over, but `1/wt` is `tolerance` times the nominal where the step wants
+ * `delta_h` times it. So take the nominal there instead.
+ *
+ * @param y         Value of the unknown.
+ * @param hyprime   Step size times its derivative.
+ * @param ewtInv    Its error weight inverted, `rtol*|y| + atol`.
+ * @param nominal   Its nominal value, scaled by -jacobianNominalFactor.
+ * @return double   The step, unsigned.
+ */
+static inline double numericalJacobianStep(double y, double hyprime, double ewtInv, double nominal)
+{
+  const double scale = fmax(fabs(y), fabs(hyprime));
+  return numericalDifferentiationDeltaXsolver * (scale > ewtInv ? scale : fmax(ewtInv, nominal));
+}
+
+void allocModelDataVars(MODEL_DATA* modelData, modelica_boolean allocAlias, threadData_t* threadData);
+
+void freeModelDataVars(MODEL_DATA* modelData);
+void freeModelDataVarArrays(MODEL_DATA* modelData);
+
+void scalarAllocArrayAttributes(MODEL_DATA* modelData);
+
+void initializeDataStruc(DATA *data, threadData_t *threadData);
+
+void deInitializeDataStruc(DATA *data);
+
+void allocIndexMap(MODEL_DATA* modelData, SIMULATION_INFO* simulationInfo);
+
+void updateDiscreteSystem(DATA *data, threadData_t *threadData);
+
+void saveZeroCrossings(DATA *data, threadData_t *threadData);
+
+void copyStartValuestoInitValues(DATA *data);
+
+void printAllVars(DATA *data, int ringSegment, int stream);
+void printRelations(DATA *data, int stream);
+void printZeroCrossings(DATA *data, int stream);
+int printCurrentStatesVector(int logLevel, double* states, DATA* data, double time);
+int printVector(int logLevel, const char* name,  double* vec, int n, double time);
+void printParameters(DATA *data, int stream);
+void printSparseStructure(SPARSE_PATTERN *sparsePattern, int sizeRows, int sizeCols, int stream, const char*);
+modelica_boolean sparsitySanityCheck(SPARSE_PATTERN *sparsePattern, int nlsSize, int stream);
+
+void overwriteOldSimulationData(DATA *data);
+void continueSimulationData(DATA *data);
+void copyRingBufferSimulationData(DATA *data, threadData_t *threadData, SIMULATION_DATA **destData, RINGBUFFER* destRing);
+void printRingBufferSimulationData(RINGBUFFER* rb, DATA* data);
+
+void restoreExtrapolationDataOld(DATA *data);
+
+void setAllVarsToStart(SIMULATION_DATA *simulationData, const SIMULATION_INFO *simulationInfo, const MODEL_DATA *modelData);
+void setAllParamsToStart(SIMULATION_INFO *simulationInfo, const MODEL_DATA *modelData);
+void setStartToCurrentValues(DATA *data);
+
+void restoreOldValues(DATA *data);
+
+void storePreValues(DATA *data);
+
+void updateRelationsPre(DATA *data);
+
+modelica_boolean checkRelations(DATA *data);
+
+void printHysteresisRelations(DATA *data);
+void activateHysteresis(DATA* data);
+void storeRelations(DATA* data);
+void setZCtol(double relativeTol);
+
+int getNextSampleTimeFMU(DATA *data, double *nextSampleEvent);
+void updateNextSampleEvent(DATA *data, threadData_t *threadData);
+
+/* Advance sample i to start + k*interval; adding the interval accumulates rounding. */
+static inline void advanceSample(DATA *data, long i)
+{
+  const SAMPLE_INFO *info = &data->modelData->samplesInfo[i];
+  double k = floor((data->simulationInfo->nextSampleTimes[i] - info->start) / info->interval + 0.5);
+  data->simulationInfo->nextSampleTimes[i] = info->start + (k + 1) * info->interval;
+}
+
+void storeOldValues(DATA *data);
+
+modelica_integer _event_integer(modelica_real x, modelica_integer index, DATA *data);
+modelica_real _event_floor(modelica_real x, modelica_integer index, DATA *data);
+modelica_real _event_ceil(modelica_real x, modelica_integer index, DATA *data);
+modelica_integer _event_mod_integer(modelica_integer x1, modelica_integer x2, modelica_integer index, DATA *data, threadData_t *threadData);
+modelica_real _event_mod_real(modelica_real x1, modelica_real x2, modelica_integer index, DATA *data, threadData_t *threadData);
+modelica_integer _event_div_integer(modelica_integer x1, modelica_integer x2, modelica_integer index, DATA *data, threadData_t *threadData);
+modelica_real _event_div_real(modelica_real x1, modelica_real x2, modelica_integer index, DATA *data, threadData_t *threadData);
+
+/* functions used for relation which
+ * are not used as zero-crossings
+ */
+static inline modelica_boolean Less(double a, double b) { return a < b; }
+static inline modelica_boolean LessEq(double a, double b) { return a <= b; }
+static inline modelica_boolean Greater(double a, double b) { return a > b; }
+static inline modelica_boolean GreaterEq(double a, double b) { return a >= b; }
+
+/* functions used to evaluate relation in
+ * zero-crossing with hysteresis effect
+ */
+modelica_boolean LessZC(double a, double b, double a_nominal, double b_nominal, modelica_boolean);
+modelica_boolean LessEqZC(double a, double b, double a_nominal, double b_nominal, modelica_boolean);
+modelica_boolean GreaterZC(double a, double b, double a_nominal, double b_nominal, modelica_boolean);
+modelica_boolean GreaterEqZC(double a, double b, double a_nominal, double b_nominal, modelica_boolean);
+
+
+/**
+ * @brief Relation function for compare functions.
+ *
+ * Used for cases where exp1 or exp2 are discrete.
+ *
+ * Two cases:
+ *   1. During initialization or discrete calls or not continuous mode: Use op_w(exp1,exp2) and update relations[index] and return result in res.
+ *   2. Else (Not discrete call or in continuous mode) : Only return pre-value of relation in res
+ *
+ * @param[in]   data      Pointer to data struct
+ * @param[out]  res       Gets overwritten with result of relation.
+ * @param[in]   exp1      First value (left side of relation).
+ * @param[in]   exp2      Second value (right side of relation).
+ * @param[in]   index     Index of relation in data->simulationInfo->relations.
+ * @param[in]   op_w      Comparison function, e.g. Less.
+ */
+static inline void relation(DATA* data, modelica_boolean* res, double exp1, double exp2, int index, modelica_boolean(*op_w)(double, double))
+{
+  if(data->simulationInfo->initial || !(data->simulationInfo->discreteCall == 0 || data->simulationInfo->solveContinuous) )
+  {
+    *res = op_w(exp1,exp2);
+    data->simulationInfo->relations[index] = *res;
+  }
+  else
+  {
+    *res = data->simulationInfo->relationsPre[index];
+  }
+}
+
+/**
+ * @brief Relation hysteresis function for compare functions.
+ *
+ * Used for cases where exp1 and exp2 are continuous.
+ *
+ * Three cases:
+ *   1. During initialization: Use op_w(exp1,exp2) and update relations[index] and return result in res.
+ *   2. No descrete call or in continuous case: Only return pre-value of relation in res
+ *   3. Else (events, zero-crossing): Use op_w_zc(exp1,exp2,...) to update relations[index] and return result in res.
+ *
+ * @param[in]   data      Pointer to data struct
+ * @param[out]  res       Gets overwritten with result of relation.
+ * @param[in]   exp1      First value (left side of relation).
+ * @param[in]   exp2      Second value (right side of relation).
+ * @param[in]   index     Index of relation in data->simulationInfo->relations.
+ * @param[in]   op_w      Comparison function, e.g. Less.
+ * @param[in]   op_w_zc   Matching comparison function of op_w for zero-crossing, e.g. LessZC.
+ */
+static inline void relationhysteresis(DATA* data, modelica_boolean* res, double exp1, double exp2, double exp1_nominal, double exp2_nominal, int index, modelica_boolean(*op_w)(double, double), modelica_boolean(*op_w_zc)(double, double, double, double, modelica_boolean))
+{
+  if(data->simulationInfo->initial)
+  {
+    *res = op_w(exp1,exp2);
+    data->simulationInfo->relations[index] = *res;
+  }
+  else if(data->simulationInfo->discreteCall == 0 || data->simulationInfo->solveContinuous)
+  {
+    *res = data->simulationInfo->relationsPre[index];
+  }
+  else
+  {
+    *res = op_w_zc(exp1, exp2, exp1_nominal, exp2_nominal, data->simulationInfo->storedRelations[index]);
+    data->simulationInfo->relations[index] = *res;
+  }
+}
+
+DLLDataDirection extern int measure_time_flag;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

@@ -1,0 +1,744 @@
+cmake_minimum_required(VERSION 3.10)
+
+set(FMU_NAME @FMU_NAME_IN@)
+# The file name prefix of the generated sources; FMU_NAME is the modelIdentifier.
+set(FMU_FILE_PREFIX "@FMU_FILE_PREFIX_IN@")
+
+set(FMU_NAME_HASH @FMU_NAME_HASH_IN@)
+
+# build the project with fmu hash string to make shorter paths (e.g) ToroidalCoreQuadraticCrossSection.dir => 759.dir
+project(${FMU_NAME_HASH} C)
+
+set(CMAKE_BUILD_TYPE @CMAKE_BUILD_TYPE@)
+
+# FMU compilation options
+set(COMPILE_MODELICA_EXTERNAL_C
+    @COMPILE_MODELICA_EXTERNAL_C@
+    CACHE BOOL
+    "Add Modelica External C sources to build target if 'ON'.")
+set(BUILD_SHARED_LIBS
+    ON
+    CACHE BOOL
+    "Compile DLL/Shared Object binary object if 'ON', compile static binary object if 'OFF'.")
+set(FMI_INTERFACE_HEADER_FILES_DIRECTORY
+    "${CMAKE_CURRENT_SOURCE_DIR}/fmi"
+    CACHE STRING
+    "Path to FMI header files containing fmi2Functions.h, fmi2FunctionTypes.h, fmi2TypesPlatforms.h")
+set(RUNTIME_DEPENDENCIES_LEVEL
+    @RUNTIME_DEPENDENCIES_LEVEL@
+    CACHE STRING
+    "Add modelica runtime dependencies to FMU if set to 'modelica'. Add system runtime dependencies as well if set to 'all'.")
+set(NEED_DAE_MODE
+    @NEED_DAE_MODE@
+    CACHE BOOL
+    "FMU of a --daeMode model, which evaluates the residual form (dae_mode.c) if 'ON'. Use 'OFF' otherwise.")
+set(NEED_IDA
+    @NEED_IDA@
+    CACHE BOOL
+    "FMU needs to link to SUNDIALS IDAS if 'ON'. Used for CoSimulation FMUs of a --daeMode model. Use 'OFF' otherwise.")
+set(SOLVER_LIBRARY_DIRECTORY
+    ""
+    CACHE PATH
+    "Prebuilt SuiteSparse, SUNDIALS, Lis and zlib archives of the exporting installation. Empty compiles them from the sources.")
+# As OM_LIBRARY_ARCH in OpenModelica's top-level CMakeLists.txt.
+if(CMAKE_LIBRARY_ARCHITECTURE)
+  set(OM_LIBRARY_ARCH "${CMAKE_LIBRARY_ARCHITECTURE}")
+else()
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" OM_LIBRARY_ARCH)
+  if(OM_LIBRARY_ARCH STREQUAL "amd64")
+    set(OM_LIBRARY_ARCH "x86_64")
+  elseif(OM_LIBRARY_ARCH STREQUAL "arm64")
+    set(OM_LIBRARY_ARCH "aarch64")
+  endif()
+  if(APPLE)
+    set(OM_LIBRARY_ARCH "universal-apple-darwin")
+  elseif(MINGW OR CYGWIN)
+    string(APPEND OM_LIBRARY_ARCH "-windows-gnu")
+  elseif(WIN32)
+    string(APPEND OM_LIBRARY_ARCH "-windows-msvc")
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    string(APPEND OM_LIBRARY_ARCH "-linux-gnu")
+  endif()
+endif()
+# --simCodeTarget=C+Rust: the sources under simulation/ and external_solvers/ are
+# not in this FMU. libSimulationRuntimeRust provides what they did, and is either
+# a prebuilt archive the exporting installation pointed at, or built from the
+# crates under rust/ (--fmiSources=slim or full).
+set(OMC_RUST_SIMULATION_RUNTIME
+    @OMC_RUST_SIMULATION_RUNTIME@
+    CACHE BOOL
+    "Link the Rust simulation runtime instead of compiling the C one from these sources.")
+set(RUST_SIM_RUNTIME_LIBRARY
+    @RUST_SIM_RUNTIME_LIBRARY@
+    CACHE FILEPATH
+    "Prebuilt libSimulationRuntimeRust archive. Empty, or missing, builds it from rust/.")
+set(SIMULATION_RUNTIME_FMI_LIBRARY
+    ""
+    CACHE FILEPATH
+    "Prebuilt libSimulationRuntimeFMI archive of the exporting installation. Empty, or missing, compiles the C runtime from these sources.")
+
+if(NOT ${CMAKE_VERSION} VERSION_LESS "4.3")
+  cmake_policy(SET CMP0207 NEW)
+endif()
+
+# CMake cannot resolve runtime dependencies of a foreign platform, it rejects
+# install(TARGETS ... RUNTIME_DEPENDENCIES) with "not supported when cross-compiling".
+# Install the external libraries we linked against directly instead, so a cross
+# compiled FMU still ships them.
+set(OM_INSTALL_LINKED_DEPENDENCIES OFF)
+if(CMAKE_CROSSCOMPILING AND NOT RUNTIME_DEPENDENCIES_LEVEL STREQUAL "none")
+  message(STATUS "Cross compiling: installing the linked external libraries instead of "
+                 "resolving runtime dependencies.")
+  set(OM_INSTALL_LINKED_DEPENDENCIES ON)
+  set(RUNTIME_DEPENDENCIES_LEVEL "none")
+endif()
+
+# Test if RUNTIME_DEPENDENCIES is needed and available
+if(${CMAKE_VERSION} VERSION_LESS "3.21" AND NOT ${RUNTIME_DEPENDENCIES_LEVEL} STREQUAL "none")
+  message(FATAL_ERROR
+          "--fmuRuntimeDepends=${RUNTIME_DEPENDENCIES_LEVEL} requires CMake version 3.21 or higher.\n"
+          "You are running version ${CMAKE_VERSION}.\n"
+          "Use OpenModelica compiler flag '--fmuRuntimeDepends=none' to disable including runtime dependencies into FMU.")
+endif()
+
+# On musl libc (e.g. Alpine), ldconfig is a BusyBox applet that doesn't support
+# "-p" (needed by install(... RUNTIME_DEPENDENCIES ...) below). It silently
+# ignores the flag and exits 0 with empty stdout, so check for empty output
+# too and fall back to not bundling runtime dependencies instead of failing.
+if(UNIX AND NOT APPLE AND NOT RUNTIME_DEPENDENCIES_LEVEL STREQUAL "none")
+  find_program(OMC_LDCONFIG_EXECUTABLE ldconfig PATHS /sbin /usr/sbin)
+  if(OMC_LDCONFIG_EXECUTABLE)
+    execute_process(
+      COMMAND ${OMC_LDCONFIG_EXECUTABLE} -p
+      RESULT_VARIABLE OMC_LDCONFIG_P_RESULT
+      OUTPUT_VARIABLE OMC_LDCONFIG_P_OUTPUT
+      ERROR_QUIET)
+    string(STRIP "${OMC_LDCONFIG_P_OUTPUT}" OMC_LDCONFIG_P_OUTPUT)
+    if(NOT OMC_LDCONFIG_P_RESULT EQUAL 0 OR OMC_LDCONFIG_P_OUTPUT STREQUAL "")
+      message(WARNING
+              "ldconfig does not support '-p' (likely musl libc, e.g. Alpine). "
+              "CMake's runtime dependency resolution needs this, so falling back "
+              "to RUNTIME_DEPENDENCIES_LEVEL=none for this FMU. Use "
+              "--fmuRuntimeDepends=none to silence this warning.")
+      set(RUNTIME_DEPENDENCIES_LEVEL "none")
+    endif()
+  endif()
+endif()
+
+# Create position independent code for static libraries
+if(NOT BUILD_SHARED_LIBS)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Export all symbols on Windows
+if(MSVC)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
+# FMI header files
+if(NOT FMI_INTERFACE_HEADER_FILES_DIRECTORY)
+  message(FATAL_ERROR "No FMI export headers provided. Set -DFMI_INTERFACE_HEADER_FILES_DIRECTORY=/path/to/fmi/headers")
+endif()
+find_file(FMI2_FUNCTIONS_H "fmi2Functions.h"
+          PATHS ${FMI_INTERFACE_HEADER_FILES_DIRECTORY}
+          NO_DEFAULT_PATH,
+          NO_CMAKE_FIND_ROOT_PATH)
+if(NOT FMI2_FUNCTIONS_H)
+  message(FATAL_ERROR "Could not find fmi2Functions.h in FMI_INTERFACE_HEADER_FILES_DIRECTORY=${FMI_INTERFACE_HEADER_FILES_DIRECTORY}")
+endif()
+message(STATUS "FMI2 include directory: ${FMI_INTERFACE_HEADER_FILES_DIRECTORY}")
+
+
+# Look for a threading library and see if it is PThreads.
+find_package(Threads)
+# If we find a threading library and it is PThreads then we enable its usage.
+if(Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
+  set(OM_HAVE_PTHREADS ON)
+# Otherwise threading will be disabled.
+else()
+  set(OM_HAVE_PTHREADS OFF)
+endif()
+
+# Source files
+file(GLOB_RECURSE FMU_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/external_solvers/*.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/fmi-export/*.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/gc/*.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/math-support/pivot.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/meta/*.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/simulation/*.c
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/util/*.c)
+# The static ModelicaExternalC libraries and zlib of the exporting installation,
+# in link order.
+if(${COMPILE_MODELICA_EXTERNAL_C} AND SOLVER_LIBRARY_DIRECTORY)
+  find_library(OM_ZLIB_LIBRARY NAMES zlib zlibstatic
+               PATHS ${SOLVER_LIBRARY_DIRECTORY}
+               NO_DEFAULT_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_FIND_ROOT_PATH)
+  set(_om_mec_libraries "")
+  foreach(_om_lib ModelicaStandardTables ModelicaIO ModelicaMatIO ModelicaExternalC)
+    find_library(OM_${_om_lib}_LIBRARY NAMES ${_om_lib}
+                 PATHS ${SOLVER_LIBRARY_DIRECTORY}
+                 NO_DEFAULT_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    list(APPEND _om_mec_libraries ${OM_${_om_lib}_LIBRARY})
+  endforeach()
+  if(OM_ZLIB_LIBRARY AND NOT _om_mec_libraries MATCHES "NOTFOUND")
+    set(OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES ${_om_mec_libraries} ${OM_ZLIB_LIBRARY})
+  endif()
+endif()
+if(OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES)
+  message(STATUS "ModelicaExternalC: ${OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES}")
+elseif(${COMPILE_MODELICA_EXTERNAL_C})
+  list(APPEND FMU_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaFFT.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaInternal.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaRandom.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaStrings.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/win32_dirent.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaStandardTables.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/snprintf.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaIO.c
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaMatIO.c)
+endif()
+if(NOT ${NEED_DAE_MODE})
+  list(REMOVE_ITEM FMU_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/simulation/solver/dae_mode.c)
+endif()
+if(NOT ${NEED_IDA})
+  list(REMOVE_ITEM FMU_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/simulation/solver/ida_solver.c)
+endif()
+# The archive holds the rest of the runtime, built with OM_HAVE_PTHREADS and
+# for the platform omc runs on.
+set(OM_LINK_SIMULATION_RUNTIME_FMI OFF)
+if(SIMULATION_RUNTIME_FMI_LIBRARY AND EXISTS "${SIMULATION_RUNTIME_FMI_LIBRARY}"
+   AND NOT OMC_RUST_SIMULATION_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND OM_HAVE_PTHREADS
+   AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(OM_LINK_SIMULATION_RUNTIME_FMI ON)
+  list(FILTER FMU_RUNTIME_SOURCES INCLUDE REGEX
+       "/(fmi-export|ModelicaExternalC)/|/simulation/solver/(cvode_solver|ida_solver|dae_mode|sundials_error|sundials_util)\\.c$")
+  message(STATUS "C simulation runtime: ${SIMULATION_RUNTIME_FMI_LIBRARY}")
+endif()
+file(GLOB FMU_GENERATED_MODEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*.c)
+# <Model>_info.c is not a standalone translation unit; it is a bare string literal that gets
+# #included into <Model>_init_fmu.c (used by FMI 1.0). Remove it from the compiled sources so
+# it is not built on its own. See https://github.com/OpenModelica/OpenModelica/issues/15838
+file(GLOB FMU_GENERATED_INCLUDE_ONLY_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*_info.c)
+if(FMU_GENERATED_INCLUDE_ONLY_SOURCES)
+  list(REMOVE_ITEM FMU_GENERATED_MODEL_SOURCES ${FMU_GENERATED_INCLUDE_ONLY_SOURCES})
+endif()
+
+# buildModelFMU(version="2.0+3.0"), for OpenModelicaLibraryTesting only: the
+# FMI 3.0 binary also serves FMI 2.0 and is installed where FMI 2.0 looks for
+# it. libSimulationRuntimeRust serves both. The C interfaces both compile
+# fmu_model_interface.c.inc, so the FMI 2.0 one is linked as one object whose
+# hidden symbols are made local.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi2" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi3")
+  set(OM_FMU_WITH_FMI2 ON)
+endif()
+if(OM_FMU_WITH_FMI2 AND NOT OMC_RUST_SIMULATION_RUNTIME)
+  set(OM_FMU_FMI2_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fmi-export/fmu2_model_interface.c
+                          "${CMAKE_CURRENT_SOURCE_DIR}/${FMU_FILE_PREFIX}_FMU2.c")
+  list(REMOVE_ITEM FMU_RUNTIME_SOURCES ${OM_FMU_FMI2_SOURCES})
+  list(REMOVE_ITEM FMU_GENERATED_MODEL_SOURCES ${OM_FMU_FMI2_SOURCES})
+  if(NOT (BUILD_SHARED_LIBS AND UNIX AND NOT APPLE AND CMAKE_OBJCOPY))
+    message(FATAL_ERROR "FMI 2.0+3.0 needs a shared library on Linux and objcopy")
+  endif()
+endif()
+
+# Set install prefix to FMU target system short and architecture
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+  set(FMU_TARGET_SYSTEM_NAME "win")
+elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+  set(FMU_TARGET_SYSTEM_NAME "linux")
+elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
+  set(FMU_TARGET_SYSTEM_NAME "darwin")
+else()
+  message(FATAL_ERROR "Unknown target system: ${CMAKE_SYSTEM_NAME}")
+endif()
+
+# Normalized target architecture, e.g. x86_64 or i686.
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" FMU_TARGET_ARCH)
+if(FMU_TARGET_ARCH STREQUAL "amd64")
+  set(FMU_TARGET_ARCH "x86_64")
+elseif(FMU_TARGET_ARCH STREQUAL "arm64")
+  set(FMU_TARGET_ARCH "aarch64")
+elseif(FMU_TARGET_ARCH STREQUAL "")
+  if(${CMAKE_SIZEOF_VOID_P} EQUAL 8)
+    set(FMU_TARGET_ARCH "x86_64")
+  else()
+    set(FMU_TARGET_ARCH "i686")
+  endif()
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi3" AND NOT OM_FMU_WITH_FMI2)
+  # FMI 3.0 uses the platform tuple "{architecture}-{os}" for the binaries folder
+  # (e.g. x86_64-linux), unlike FMI 1.0/2.0 which use "{os}{bitness}" (e.g. linux64).
+  # The two schemes do not spell Windows the same way: FMI 1.0/2.0 want "win"
+  # (win64), FMI 3.0 wants it in full (x86_64-windows). Linux and darwin are the
+  # same word in both, so only this one has to be translated.
+  set(FMU_TARGET_SYSTEM_TUPLE "${FMU_TARGET_SYSTEM_NAME}")
+  if(FMU_TARGET_SYSTEM_NAME STREQUAL "win")
+    set(FMU_TARGET_SYSTEM_TUPLE "windows")
+  endif()
+  set(FMU_TARGET_PLATFORM "${FMU_TARGET_ARCH}-${FMU_TARGET_SYSTEM_TUPLE}")
+elseif(FMU_TARGET_ARCH STREQUAL "arm" AND FMU_TARGET_SYSTEM_NAME STREQUAL "linux")
+  # The FMI 1.0/2.0 spec only defines win/linux/darwin 32/64 as binaries
+  # folder names, so 32-bit ARM Linux (as cross-compiled by e.g.
+  # arm-linux-gnueabihf-gcc, CMAKE_SYSTEM_PROCESSOR "arm") has no bitness-only
+  # name to fall back on; it would otherwise collide with the 32-bit x86
+  # build's "linux32". Use the community convention of the full GNU target
+  # triple instead, matching what the old Autoconf --host=<triple> build used.
+  set(FMU_TARGET_PLATFORM "arm-linux-gnueabihf")
+elseif(${CMAKE_SIZEOF_VOID_P} EQUAL 8)
+  set(FMU_TARGET_PLATFORM "${FMU_TARGET_SYSTEM_NAME}64")
+else()
+  set(FMU_TARGET_PLATFORM "${FMU_TARGET_SYSTEM_NAME}32")
+endif()
+
+message(STATUS "Building for FMI platform ${FMU_TARGET_PLATFORM}")
+
+# Normalize the path
+get_filename_component(FMU_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../binaries/${FMU_TARGET_PLATFORM}" ABSOLUTE)
+set(CMAKE_INSTALL_PREFIX ${FMU_INSTALL_DIR})
+set(CMAKE_INSTALL_LIBDIR ${FMU_INSTALL_DIR})
+set(CMAKE_INSTALL_BINDIR ${FMU_INSTALL_DIR})
+set(CMAKE_SHARED_LIBRARY_PREFIX "")
+set(CMAKE_STATIC_LIBRARY_PREFIX "")
+message(STATUS "Install directory: ${CMAKE_INSTALL_PREFIX}")
+
+# Set RPATH
+if(APPLE)
+  set(CMAKE_INSTALL_RPATH "@loader_path")
+else()
+  if(NOT OMC_RUST_SIMULATION_RUNTIME AND RUNTIME_DEPENDENCIES_LEVEL STREQUAL "none")
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH True)
+  endif()
+  set(CMAKE_INSTALL_RPATH "$ORIGIN")
+endif()
+
+# Target library
+add_library(${FMU_NAME_HASH}
+            ${FMU_RUNTIME_SOURCES}
+            ${FMU_GENERATED_MODEL_SOURCES})
+
+if(OM_LINK_SIMULATION_RUNTIME_FMI)
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE "${SIMULATION_RUNTIME_FMI_LIBRARY}")
+endif()
+
+if(${COMPILE_MODELICA_EXTERNAL_C} AND NOT OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES)
+  # An archive, so that a usertab of the model takes the place of the dummy one.
+  add_library(omc_fmu_dummy_usertab STATIC ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaStandardTablesDummyUsertab.c)
+  set_target_properties(omc_fmu_dummy_usertab PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+
+  # MAT-files v7 are compressed with zlib.
+  set(_om_zlib_dir ${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/zlib)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ModelicaExternalC/ModelicaMatIO.c PROPERTIES
+                              COMPILE_DEFINITIONS HAVE_ZLIB=1)
+  target_include_directories(${FMU_NAME_HASH} PRIVATE ${_om_zlib_dir})
+  if(OM_ZLIB_LIBRARY)
+    set(OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES omc_fmu_dummy_usertab ${OM_ZLIB_LIBRARY})
+  else()
+    file(GLOB _om_zlib_sources ${_om_zlib_dir}/*.c)
+    add_library(omc_fmu_zlib STATIC ${_om_zlib_sources})
+    set_target_properties(omc_fmu_zlib PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+    set(OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES omc_fmu_dummy_usertab omc_fmu_zlib)
+  endif()
+endif()
+
+# Set output name for the .dll's and .so files to use the full FMU name instead of fmu hash string
+set_target_properties(${FMU_NAME_HASH} PROPERTIES OUTPUT_NAME ${FMU_NAME})
+
+# Linker options
+if(NOT ${CMAKE_VERSION} VERSION_LESS "3.13")
+  if(UNIX AND NOT APPLE)
+    target_link_options(${FMU_NAME_HASH} PRIVATE "LINKER:SHELL:--no-undefined")
+  endif()
+
+  # An FMU is loaded for its `fmi2*`/`fmi3*` entry points and nothing else, so
+  # everything they do not reach can go. That is what decides how much of a Rust
+  # simulation runtime an FMU carries: the archive holds Model Exchange and
+  # Co-Simulation both, and an ME FMU, naming no `fmi3DoStep`, drops the
+  # Co-Simulation driver and with it every integrator. One archive serves both.
+  # FMI 1.0 is excluded: it spells its entry points `<modelIdentifier>_fmiXxx`,
+  # which no fixed pattern matches.
+  if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE
+     AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi1"
+     AND (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "Clang"))
+    set(OM_FMU_VERSION_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/fmu-exports.map")
+    file(WRITE "${OM_FMU_VERSION_SCRIPT}" "{ global: fmi2*; fmi3*; local: *; };\n")
+    target_link_options(${FMU_NAME_HASH} PRIVATE
+                        "LINKER:SHELL:--version-script=\"${OM_FMU_VERSION_SCRIPT}\""
+                        "LINKER:SHELL:--gc-sections")
+    # A prebuilt Rust runtime carries its own DWARF, which a C FMU has none of and
+    # no importer reads: 4.5 MB of a 10 MB FMU. `--fmuDebug` (CMAKE_BUILD_TYPE
+    # Debug) keeps it. `-s` rather than `--strip-debug`: the static symbol table is
+    # another 1 MB, and an FMU exports only its `fmi*` entry points, which live in
+    # `.dynsym`.
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+      target_link_options(${FMU_NAME_HASH} PRIVATE "LINKER:SHELL:-s")
+    endif()
+    set_target_properties(${FMU_NAME_HASH} PROPERTIES
+                          C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+  elseif(APPLE AND BUILD_SHARED_LIBS AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi1")
+    set(OM_FMU_EXPORT_LIST "${CMAKE_CURRENT_BINARY_DIR}/fmu-exports.txt")
+    file(WRITE "${OM_FMU_EXPORT_LIST}" "_fmi2*\n_fmi3*\n")
+    target_link_options(${FMU_NAME_HASH} PRIVATE
+                        "LINKER:-exported_symbols_list,${OM_FMU_EXPORT_LIST}"
+                        "LINKER:-dead_strip")
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+      target_link_options(${FMU_NAME_HASH} PRIVATE "LINKER:-S")
+    endif()
+  endif()
+  # A cross compiled Windows FMU cannot collect the MinGW runtime DLLs (libgcc,
+  # libwinpthread) the way install(TARGETS ... RUNTIME_DEPENDENCIES) would, so link
+  # them statically. Otherwise the FMU only loads on machines that have MinGW installed.
+  if(MINGW AND CMAKE_CROSSCOMPILING)
+    target_link_options(${FMU_NAME_HASH} PRIVATE "-static-libgcc" "-static")
+  endif()
+endif()
+
+# If we have PThreads support, define OM_HAVE_PTHREADS and link to the imported threading library.
+if(OM_HAVE_PTHREADS)
+  target_compile_definitions(${FMU_NAME_HASH} PRIVATE OM_HAVE_PTHREADS)
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE Threads::Threads)
+endif()
+
+# If not using MSVC, link to the math library libm.
+if(NOT MSVC)
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE m)
+endif()
+
+if(OMC_RUST_SIMULATION_RUNTIME)
+  target_compile_definitions(${FMU_NAME_HASH} PRIVATE OMC_RUST_SIMULATION_RUNTIME=1)
+
+  if(RUST_SIM_RUNTIME_LIBRARY AND EXISTS "${RUST_SIM_RUNTIME_LIBRARY}")
+    message(STATUS "Rust simulation runtime: ${RUST_SIM_RUNTIME_LIBRARY}")
+  else()
+    # Recompiling the FMU somewhere else: build the runtime from the crates the
+    # FMU carries. `vendor/` beside them means the dependencies are in the FMU
+    # too and cargo needs no network (--fmiSources=full).
+    set(OM_RUST_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/rust/SimulationRuntime/rust/Cargo.toml")
+    if(NOT EXISTS "${OM_RUST_MANIFEST}")
+      message(FATAL_ERROR
+              "This FMU was built with --simCodeTarget=C+Rust but carries neither a prebuilt "
+              "libSimulationRuntimeRust nor its sources. Re-export it with --fmiSources=slim "
+              "or --fmiSources=full, or point -DRUST_SIM_RUNTIME_LIBRARY at an archive.")
+    endif()
+    find_program(CARGO_EXECUTABLE cargo)
+    if(NOT CARGO_EXECUTABLE)
+      message(FATAL_ERROR "cargo was not found, and this FMU's simulation runtime is Rust. "
+                          "Install a Rust toolchain, or point -DRUST_SIM_RUNTIME_LIBRARY at an archive.")
+    endif()
+    # Shared between FMUs so a second build of the same runtime is a no-op.
+    set(OM_RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust-target"
+        CACHE PATH "Cargo target directory for the FMU's Rust runtime.")
+    set(OM_RUST_CARGO_FLAGS "")
+    # rustc's name for the archive, whatever the C toolchain calls one.
+    if(MSVC)
+      set(OM_RUST_SIM_RUNTIME_ARCHIVE "SimulationRuntimeRust.lib")
+    else()
+      set(OM_RUST_SIM_RUNTIME_ARCHIVE "libSimulationRuntimeRust.a")
+    endif()
+    set(OM_RUST_CARGO_ENV OMC_SIMRT_FMI=1)
+    if(CMAKE_CROSSCOMPILING AND OM_RUST_TARGET_TRIPLE)
+      list(APPEND OM_RUST_CARGO_FLAGS --target ${OM_RUST_TARGET_TRIPLE})
+      set(RUST_SIM_RUNTIME_LIBRARY "${OM_RUST_TARGET_DIR}/${OM_RUST_TARGET_TRIPLE}/release/${OM_RUST_SIM_RUNTIME_ARCHIVE}")
+      # cargo has no toolchain of its own for the target: the build scripts' C
+      # (cc-rs) and the crates' cdylibs use the one this build cross-compiles with.
+      string(REPLACE "-" "_" _om_rust_triple "${OM_RUST_TARGET_TRIPLE}")
+      string(TOUPPER "${_om_rust_triple}" _om_rust_triple_upper)
+      set(_om_rust_cflags "${CMAKE_C_FLAGS}")
+      if(CMAKE_C_COMPILER_TARGET)
+        string(APPEND _om_rust_cflags " --target=${CMAKE_C_COMPILER_TARGET}")
+      endif()
+      list(APPEND OM_RUST_CARGO_ENV
+           "CC_${_om_rust_triple}=${CMAKE_C_COMPILER}"
+           "CFLAGS_${_om_rust_triple}=${_om_rust_cflags}"
+           "AR_${_om_rust_triple}=${CMAKE_AR}")
+      if(MSVC)
+        find_program(OM_RUST_LINKER NAMES lld-link link HINTS "${CMAKE_LINKER}")
+      else()
+        set(OM_RUST_LINKER "${CMAKE_C_COMPILER}")
+      endif()
+      set(_om_rust_link_args "")
+      separate_arguments(_om_rust_link_flags NATIVE_COMMAND "${CMAKE_SHARED_LINKER_FLAGS}")
+      foreach(_om_rust_link_flag ${_om_rust_link_flags})
+        string(APPEND _om_rust_link_args " -Clink-arg=${_om_rust_link_flag}")
+      endforeach()
+      list(APPEND OM_RUST_CARGO_ENV
+           "CARGO_TARGET_${_om_rust_triple_upper}_LINKER=${OM_RUST_LINKER}"
+           "CARGO_TARGET_${_om_rust_triple_upper}_RUSTFLAGS=${_om_rust_link_args}")
+    else()
+      set(RUST_SIM_RUNTIME_LIBRARY "${OM_RUST_TARGET_DIR}/release/${OM_RUST_SIM_RUNTIME_ARCHIVE}")
+    endif()
+    # CVODE, IDA and KINSOL: the runtime archive takes in SUNDIALS and KLU, built
+    # from the sources the FMU carries.
+    file(GLOB_RECURSE _om_sundials_sources ${CMAKE_CURRENT_SOURCE_DIR}/3rdParty/sundials/*.c
+                                           ${CMAKE_CURRENT_SOURCE_DIR}/3rdParty/SuiteSparse/*.c)
+    if(_om_sundials_sources)
+      set(_om_sundials_dir "${CMAKE_BINARY_DIR}/rust-sundials")
+      add_library(omc_fmu_sundials STATIC ${_om_sundials_sources})
+      target_include_directories(omc_fmu_sundials PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      # $<0:> keeps multi-config generators from adding a subdirectory.
+      set_target_properties(omc_fmu_sundials PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                            ARCHIVE_OUTPUT_DIRECTORY "${_om_sundials_dir}/lib$<0:>")
+      # The name cargo looks for, which the empty CMAKE_STATIC_LIBRARY_PREFIX above changes.
+      if(NOT MSVC)
+        set_target_properties(omc_fmu_sundials PROPERTIES PREFIX "lib")
+      endif()
+      file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/sundials/sundials_config.h _om_sundials_int64
+           REGEX "^#define SUNDIALS_INT64_T")
+      if(_om_sundials_int64)
+        set(_om_sundials_index_size 64)
+      else()
+        set(_om_sundials_index_size 32)
+      endif()
+      list(APPEND OM_RUST_CARGO_ENV "OMC_SUNDIALS_NATIVE_DIR=${_om_sundials_dir}"
+                                    "OMC_SUNDIALS_NATIVE_LIBS=omc_fmu_sundials"
+                                    "OMC_SUNDIALS_NATIVE_INDEX_SIZE=${_om_sundials_index_size}")
+    endif()
+    # Only the archive: the crate's cdylib cannot link on Windows without the C half.
+    # Always run: cargo knows what changed, and a rebuild after nothing did is quick.
+    add_custom_target(om_rust_simulation_runtime
+      COMMAND ${CMAKE_COMMAND} -E env ${OM_RUST_CARGO_ENV}
+              ${CARGO_EXECUTABLE} rustc --release -p openmodelica_simulation_runtime --lib
+              --crate-type staticlib
+              --manifest-path "${OM_RUST_MANIFEST}"
+              --target-dir "${OM_RUST_TARGET_DIR}" ${OM_RUST_CARGO_FLAGS}
+      # cargo finds .cargo/config.toml by walking up from here, and
+      # --fmiSources=full puts one beside the crates pointing at vendor/.
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/rust"
+      BYPRODUCTS "${RUST_SIM_RUNTIME_LIBRARY}"
+      COMMENT "Rust: building the FMU's simulation runtime"
+      VERBATIM)
+    if(TARGET omc_fmu_sundials)
+      add_dependencies(om_rust_simulation_runtime omc_fmu_sundials)
+    endif()
+    add_dependencies(${FMU_NAME_HASH} om_rust_simulation_runtime)
+  endif()
+
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE "${RUST_SIM_RUNTIME_LIBRARY}")
+  # What the Rust standard library needs of the system.
+  if(UNIX)
+    target_link_libraries(${FMU_NAME_HASH} PRIVATE ${CMAKE_DL_LIBS})
+    find_package(Threads)
+    if(Threads_FOUND)
+      target_link_libraries(${FMU_NAME_HASH} PRIVATE Threads::Threads)
+    endif()
+  elseif(WIN32)
+    target_link_libraries(${FMU_NAME_HASH} PRIVATE ws2_32 userenv bcrypt ntdll advapi32)
+  endif()
+endif()
+
+# Directory names Modelica libraries use for platform specific binaries, both the
+# "{os}{bitness}" (win64) and the "{architecture}-{os}" (x86_64-windows) flavour.
+set(OM_LIBRARY_PLATFORM_DIR_REGEX
+    "^((win|linux|darwin)(32|64)|(x86_64|amd64|i386|i686|aarch64|arm)-(windows|linux|darwin))$")
+
+# The external library directories below were resolved for the platform the FMU
+# sources were generated on. When cross compiling we have to look into the
+# Resources/Library sub directory of the *target* platform instead, e.g.
+# Resources/Library/win64 instead of Resources/Library/linux64.
+# See https://github.com/OpenModelica/OpenModelica/issues/9509
+macro(om_add_target_library_directories _om_var)
+  set(_om_target_subdirs "${FMU_TARGET_PLATFORM}"
+                         "${FMU_TARGET_ARCH}-${FMU_TARGET_SYSTEM_NAME}")
+  if(WIN32)
+    list(APPEND _om_target_subdirs "${FMU_TARGET_ARCH}-windows")
+  endif()
+
+  # Library root directories to look into: every listed directory that is not
+  # platform specific, plus the parent of every platform specific one.
+  set(_om_roots "")
+  set(_om_keep "")
+  foreach(_om_dir IN LISTS ${_om_var})
+    string(REGEX REPLACE "/+$" "" _om_dir "${_om_dir}")
+    if(_om_dir STREQUAL "")
+      continue()
+    endif()
+    get_filename_component(_om_base "${_om_dir}" NAME)
+    if(_om_base MATCHES "${OM_LIBRARY_PLATFORM_DIR_REGEX}")
+      get_filename_component(_om_parent "${_om_dir}" DIRECTORY)
+      list(APPEND _om_roots "${_om_parent}")
+      if(CMAKE_CROSSCOMPILING AND NOT "${_om_base}" IN_LIST _om_target_subdirs)
+        # Binaries of a different platform, searching them would find the wrong library.
+        continue()
+      endif()
+    else()
+      list(APPEND _om_roots "${_om_dir}")
+    endif()
+    list(APPEND _om_keep "${_om_dir}")
+  endforeach()
+  list(REMOVE_DUPLICATES _om_roots)
+
+  set(_om_target_dirs "")
+  foreach(_om_root IN LISTS _om_roots)
+    foreach(_om_sub IN LISTS _om_target_subdirs)
+      if(IS_DIRECTORY "${_om_root}/${_om_sub}")
+        list(APPEND _om_target_dirs "${_om_root}/${_om_sub}")
+      endif()
+    endforeach()
+  endforeach()
+  if(_om_target_dirs)
+    list(REMOVE_DUPLICATES _om_target_dirs)
+    message(STATUS "Target platform library directories: ${_om_target_dirs}")
+  endif()
+
+  # Target specific directories take precedence over the generic ones.
+  set(${_om_var} ${_om_target_dirs} ${_om_keep})
+  list(REMOVE_DUPLICATES ${_om_var})
+endmacro()
+
+@FMU_ADDITIONAL_LIBS@
+
+# After the libraries of the model: they can use zlib too.
+if(OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES)
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE ${OM_FMU_MODELICA_EXTERNAL_C_LIBRARIES})
+endif()
+
+if(NOT OMC_RUST_SIMULATION_RUNTIME)
+  if(${NEED_DAE_MODE})
+    set(OMC_FMI_DAE_MODE ";OMC_FMI_DAE_MODE")
+  endif()
+  if(${NEED_IDA})
+    set(OMC_FMI_HAVE_IDA ";OMC_FMI_HAVE_IDA")
+  endif()
+
+  if(SOLVER_LIBRARY_DIRECTORY)
+    # Force static compilation on Windows or if CMake is too old
+    if(WIN32 OR (${CMAKE_VERSION} VERSION_LESS "3.21" AND NOT ${RUNTIME_DEPENDENCIES_LEVEL} STREQUAL "none"))
+      set(CMAKE_FIND_LIBRARY_SUFFIXES .a .lib)
+      target_compile_definitions(${FMU_NAME_HASH} PRIVATE SUNDIALS_STATIC_DEFINE)
+    endif()
+
+    message(STATUS "SOLVER_LIBRARY_DIRECTORY: ${SOLVER_LIBRARY_DIRECTORY}")
+    set(_om_solver_libs sundials_kinsol sundials_cvode)
+    if(${NEED_IDA})
+      list(APPEND _om_solver_libs sundials_idas)
+    endif()
+    # Static libraries resolve left to right: the SUNDIALS libraries all need
+    # sundials_core, and KLU's solver needs the sparse matrix and SuiteSparse's KLU.
+    # Built with MSVC or clang-cl, SUNDIALS and SuiteSparse name them <name>_static.lib.
+    list(APPEND _om_solver_libs sundials_sunlinsolklu sundials_sunlinsollapackdense sundials_sunlinsoldense
+                                sundials_sunmatrixsparse sundials_sunmatrixdense sundials_nvecserial sundials_core
+                                klu amd colamd btf suitesparseconfig lis)
+    foreach(_om_lib ${_om_solver_libs})
+      string(TOUPPER "${_om_lib}_LIBRARY" _om_var)
+      find_library(${_om_var} NAMES ${_om_lib} ${_om_lib}_static
+                   PATHS ${SOLVER_LIBRARY_DIRECTORY}
+                   NO_DEFAULT_PATH
+                   NO_SYSTEM_ENVIRONMENT_PATH
+                   NO_CMAKE_FIND_ROOT_PATH
+                   REQUIRED)
+      if(NOT ${_om_var})
+        message(FATAL_ERROR "Couldn't find library ${_om_lib} in ${SOLVER_LIBRARY_DIRECTORY}")
+      endif()
+      list(APPEND SOLVER_LIBRARIES ${${_om_var}})
+    endforeach()
+    list(APPEND RUNTIME_DEPENDS ${SOLVER_LIBRARIES})
+  else()
+    # As <SourceFiles> compiles them: sources/ is the include directory.
+    file(GLOB_RECURSE _om_sources ${CMAKE_CURRENT_SOURCE_DIR}/3rdParty/*.c)
+    add_library(omc_fmu_solvers STATIC ${_om_sources})
+    target_include_directories(omc_fmu_solvers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(omc_fmu_solvers PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+    set(SOLVER_LIBRARIES omc_fmu_solvers)
+  endif()
+  target_link_libraries(${FMU_NAME_HASH} PRIVATE ${SOLVER_LIBRARIES})
+  set(OMC_FMI_SOLVER_DEFINITIONS ";WITH_SUITESPARSE${OMC_FMI_DAE_MODE}${OMC_FMI_HAVE_IDA}")
+  message(STATUS "Solver libraries: ${SOLVER_LIBRARIES}")
+endif()
+
+# Add include directories
+target_include_directories(${FMU_NAME_HASH} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(${FMU_NAME_HASH} PRIVATE ${FMI_INTERFACE_HEADER_FILES_DIRECTORY}@FMU_ADDITIONAL_INCLUDES@)
+
+# Set compiler definitions
+target_compile_definitions(${FMU_NAME_HASH} PRIVATE OMC_MINIMAL_RUNTIME=1;OMC_FMI_RUNTIME=1;CMINPACK_NO_DLL${OMC_FMI_SOLVER_DEFINITIONS})
+
+if(BUILD_SHARED_LIBS)
+  # Override FMI2_FUNCTION_PREFIX if FMU compiled dynamically (shared-library FMUs
+  # must export the plain, unprefixed fmiX function names).
+  target_compile_definitions(${FMU_NAME_HASH} PRIVATE FMI2_OVERRIDE_FUNCTION_PREFIX)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/isfmi3")
+    target_compile_definitions(${FMU_NAME_HASH} PRIVATE FMI3_OVERRIDE_FUNCTION_PREFIX)
+  endif()
+  message(STATUS "Not using FMI2_FUNCTION_PREFIX / FMI3_FUNCTION_PREFIX")
+else()
+  message(STATUS "Using FMI2_FUNCTION_PREFIX / FMI3_FUNCTION_PREFIX")
+endif()
+
+if(OM_FMU_FMI2_SOURCES)
+  add_library(omc_fmu_fmi2 OBJECT ${OM_FMU_FMI2_SOURCES})
+  set_target_properties(omc_fmu_fmi2 PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+  target_compile_definitions(omc_fmu_fmi2 PRIVATE $<TARGET_PROPERTY:${FMU_NAME_HASH},COMPILE_DEFINITIONS>)
+  target_include_directories(omc_fmu_fmi2 PRIVATE $<TARGET_PROPERTY:${FMU_NAME_HASH},INCLUDE_DIRECTORIES>)
+  set(OM_FMU_FMI2_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/fmu2_interface.o")
+  add_custom_command(OUTPUT "${OM_FMU_FMI2_OBJECT}"
+                     COMMAND ${CMAKE_C_COMPILER} -r -nostdlib -o "${OM_FMU_FMI2_OBJECT}" $<TARGET_OBJECTS:omc_fmu_fmi2>
+                     COMMAND ${CMAKE_OBJCOPY} --localize-hidden "${OM_FMU_FMI2_OBJECT}"
+                     DEPENDS omc_fmu_fmi2 $<TARGET_OBJECTS:omc_fmu_fmi2>
+                     COMMAND_EXPAND_LISTS
+                     VERBATIM)
+  set_source_files_properties("${OM_FMU_FMI2_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  target_sources(${FMU_NAME_HASH} PRIVATE "${OM_FMU_FMI2_OBJECT}")
+endif()
+
+# Install target
+if(RUNTIME_DEPENDENCIES_LEVEL STREQUAL "all")
+  install(TARGETS ${FMU_NAME_HASH}
+    RUNTIME_DEPENDENCIES
+      DIRECTORIES ${EXTERNAL_LIBDIRECTORIES} ${SOLVER_LIBRARY_DIRECTORY}
+    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    FRAMEWORK DESTINATION ${CMAKE_INSTALL_LIBDIR})
+elseif(RUNTIME_DEPENDENCIES_LEVEL STREQUAL "modelica")
+  message(STATUS "Installing dynamic dependencies from list: ${RUNTIME_DEPENDS}")
+  install(TARGETS ${FMU_NAME_HASH}
+    RUNTIME_DEPENDENCIES
+      DIRECTORIES ${EXTERNAL_LIBDIRECTORIES} ${SOLVER_LIBRARY_DIRECTORY}
+      PRE_EXCLUDE_REGEXES "api-ms-" "ext-ms-"
+      POST_EXCLUDE_REGEXES "^\\/lib.*" "^\\/usr\\/lib.*" "^\\/usr\\/local\\/lib.*" ".*system32/.*\\.dll"
+      POST_INCLUDE_FILES ${RUNTIME_DEPENDS}
+    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    FRAMEWORK DESTINATION ${CMAKE_INSTALL_LIBDIR})
+else()
+  install(TARGETS ${FMU_NAME_HASH}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+if(OM_INSTALL_LINKED_DEPENDENCIES)
+  # Only shared libraries, static ones are already part of the FMU binary.
+  set(OM_LINKED_SHARED_DEPENDENCIES "")
+  foreach(_om_dep IN LISTS RUNTIME_DEPENDS)
+    get_filename_component(_om_dep_name "${_om_dep}" NAME)
+    if(_om_dep_name MATCHES "\\.(dll|dylib|so)$" OR _om_dep_name MATCHES "\\.so\\.")
+      # The FMU binary references the library by its SONAME (libFoo.so.1.2.3), not by
+      # the link name (libFoo.so) find_library returned, so take the versioned
+      # siblings along as well.
+      get_filename_component(_om_dep_dir "${_om_dep}" DIRECTORY)
+      file(GLOB _om_dep_files "${_om_dep_dir}/${_om_dep_name}" "${_om_dep_dir}/${_om_dep_name}.*")
+      list(APPEND OM_LINKED_SHARED_DEPENDENCIES ${_om_dep_files})
+    endif()
+  endforeach()
+  if(OM_LINKED_SHARED_DEPENDENCIES)
+    list(REMOVE_DUPLICATES OM_LINKED_SHARED_DEPENDENCIES)
+    message(STATUS "Installing external libraries: ${OM_LINKED_SHARED_DEPENDENCIES}")
+    install(FILES ${OM_LINKED_SHARED_DEPENDENCIES}
+      PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+      DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  endif()
+endif()
+
+# Zip target creating modelname.fmu
+add_custom_target(create_fmu
+    COMMAND "${CMAKE_COMMAND}" --build ${CMAKE_BINARY_DIR} --target install
+    COMMAND "${CMAKE_COMMAND}" -E tar "cfv" "../@FMU_TARGET_NAME@.fmu" --format=zip
+      "binaries/"
+      "resources/"
+      "sources/"
+      "modelDescription.xml"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../")

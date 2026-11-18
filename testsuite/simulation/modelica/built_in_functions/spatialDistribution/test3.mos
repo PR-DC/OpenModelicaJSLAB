@@ -1,0 +1,28 @@
+// name:                test3.mos
+// keywords:            spatialDistribution
+// status:              correct
+// teardown_command:    rm -f TestSpatialDiscretization.Test3*
+//
+// Model with spatialDistribution with changing velocity.
+
+loadModel(Modelica); getErrorString();
+loadFile("TestSpatialDiscretization.mo"); getErrorString();
+
+// Simulate
+simulate(TestSpatialDiscretization.Test3); getErrorString();
+
+
+// Result:
+// true
+// ""
+// true
+// ""
+// record SimulationResult
+//     resultFile = "TestSpatialDiscretization.Test3_res.mat",
+//     simulationOptions = "startTime = 0.0, stopTime = 1.0, numberOfIntervals = 10000, tolerance = 1e-7, method = 'auto', fileNamePrefix = 'TestSpatialDiscretization.Test3', options = '', outputFormat = 'mat', variableFilter = '.*', cflags = '', simflags = ''",
+//     messages = "LOG_SUCCESS       | info    | The initialization finished successfully without homotopy method.
+// LOG_SUCCESS       | info    | The simulation finished successfully.
+// "
+// end SimulationResult;
+// ""
+// endResult

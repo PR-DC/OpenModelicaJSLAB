@@ -1,0 +1,19 @@
+// name:     PartialFn10
+// keywords: PartialFn
+// status:   correct
+// cflags:   +g=MetaModelica
+// suite: metamodelica
+//
+// Partial Function Testing
+//
+loadFile("PartialFn10.mo");
+setCommandLineOptions("-d=noevalfunc,gen");
+PartialFn10.TestCreateTestRecord(17.0, -12.0);
+getErrorString();
+
+// Result:
+// true
+// true
+// 17.0
+// ""
+// endResult

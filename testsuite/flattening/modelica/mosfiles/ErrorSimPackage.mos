@@ -1,0 +1,14 @@
+// name: ErrorSimPackage
+// status: correct
+//
+// Checks that a package cannot be translated.
+
+loadString("package P end P;");
+translateModel(P);getErrorString();
+
+// Result:
+// true
+// false
+// "[<interactive>:1:1-1:15:writable] Error: Cannot instantiate P due to class specialization package.
+// "
+// endResult

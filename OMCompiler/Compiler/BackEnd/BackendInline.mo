@@ -1,0 +1,1502 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package BackendInline
+" file:        BackendInline.mo
+  package:     BackendInline
+  description: inline functions
+
+
+  This module contains data structures and functions for inline functions.
+
+  The entry point is the inlineCalls function, or inlineCallsInFunctions
+  "
+
+public import BackendDAE;
+public import DAE;
+public import Inline;
+public import SCode;
+
+protected
+ import BackendDAEOptimize;
+ import BackendDAEUtil;
+ import BackendDump;
+ import BackendEquation;
+ import BackendUtil;
+ import BackendVariable;
+ import BackendVarTransform;
+ import ComponentReference;
+ import DAEDump;
+ import DAEUtil;
+ import Debug;
+ import DoubleEnded;
+ import ExpandableArray;
+ import Expression;
+ import Flags;
+ import HashTableCG;
+ import InlineArrayEquations;
+ import List;
+ import ExpressionBasics;
+ import Util;
+ import Absyn;
+
+// =============================================================================
+// late inline functions stuff
+//
+// =============================================================================
+public function lateInlineFunction
+  input BackendDAE.BackendDAE inDAE;
+  output BackendDAE.BackendDAE outDAE;
+algorithm
+  outDAE := inlineCalls({DAE.NORM_INLINE(), DAE.AFTER_INDEX_RED_INLINE()}, inDAE);
+end lateInlineFunction;
+
+// =============================================================================
+// normal inline functions stuff
+//
+// =============================================================================
+public function normalInlineFunction
+  input BackendDAE.BackendDAE inDAE;
+  output BackendDAE.BackendDAE outDAE;
+algorithm
+  if Flags.getConfigEnum(Flags.INLINE_METHOD) == 1 then
+    outDAE := inlineCalls({DAE.NORM_INLINE()}, inDAE);
+  else
+    outDAE := inlineCallsBDAE({DAE.NORM_INLINE()}, inDAE);
+  end if;
+end normalInlineFunction;
+
+// =============================================================================
+// inline calls stuff
+//
+// =============================================================================
+
+protected function inlineCalls
+"searches for calls where the inline flag is true, and inlines them"
+  input list<DAE.InlineType> inITLst;
+  input BackendDAE.BackendDAE inBackendDAE;
+  output BackendDAE.BackendDAE outBackendDAE;
+protected
+  Inline.Functiontuple tpl;
+  BackendDAE.EqSystems eqs;
+  BackendDAE.Shared shared;
+algorithm
+  try
+    shared := inBackendDAE.shared;
+    eqs := inBackendDAE.eqs;
+    tpl := (SOME(shared.functionTree), inITLst);
+    eqs := List.map1(eqs, inlineEquationSystem, tpl);
+    shared.globalKnownVars := inlineVariables(shared.globalKnownVars, tpl);
+    shared.externalObjects := inlineVariables(shared.externalObjects, tpl);
+    shared.initialEqs := inlineEquationArray(shared.initialEqs, tpl);
+    shared.removedEqs := inlineEquationArray(shared.removedEqs, tpl);
+    inlineEventInfo(shared.eventInfo, tpl);
+    outBackendDAE := BackendDAE.DAE(eqs, shared);
+  else
+    if Flags.isSet(Flags.FAILTRACE) then
+        Debug.traceln("BackendInline.inlineCalls failed");
+    end if;
+    fail();
+  end try;
+end inlineCalls;
+
+protected function inlineEquationSystem
+  input BackendDAE.EqSystem eqs;
+  input Inline.Functiontuple tpl;
+  output BackendDAE.EqSystem oeqs = eqs;
+algorithm
+  // carry the attributes (min/max/nominal/unit/...) declared on the function
+  // inputs/outputs onto the variables bound to them before the calls are
+  // replaced by the function bodies (#15947)
+  oeqs.orderedVars := propagateAttributes(oeqs.orderedVars, oeqs.orderedEqs, tpl);
+  inlineVariables(oeqs.orderedVars, tpl);
+  inlineEquationArray(oeqs.orderedEqs, tpl);
+  inlineEquationArray(oeqs.removedEqs, tpl);
+end inlineEquationSystem;
+
+// =============================================================================
+//        ATTRIBUTE PROPAGATION (min/max/nominal/unit/... see #15947)
+// =============================================================================
+
+protected function propagateAttributes
+  "Carries the attributes declared on the inputs and outputs of the functions
+   that are about to be inlined onto the variables bound to them, so they are not
+   lost when the calls are replaced by the function bodies (#15947)."
+  input output BackendDAE.Variables vars;
+  input BackendDAE.EquationArray eqns;
+  input Inline.Functiontuple tpl;
+algorithm
+  vars := BackendEquation.traverseEquationArray(eqns, function propagateEqnAttributes(tpl = tpl), vars);
+end propagateAttributes;
+
+protected function propagateEqnAttributes
+  "Merges function input/output attributes onto the bound variables for a single
+   equation. The equation is not changed, only the variable attributes are."
+  input output BackendDAE.Equation eqn;
+  input Inline.Functiontuple tpl;
+  input output BackendDAE.Variables vars;
+algorithm
+  // output side: a simple 'cref = fn(...)' or 'fn(...) = cref' equation
+  vars := match eqn
+    local
+      DAE.Exp lhs, rhs;
+      DAE.ComponentRef cr;
+    case BackendDAE.EQUATION(exp = lhs, scalar = rhs)         then propagateOutput(lhs, rhs, tpl, vars);
+    case BackendDAE.ARRAY_EQUATION(left = lhs, right = rhs)   then propagateOutput(lhs, rhs, tpl, vars);
+    case BackendDAE.COMPLEX_EQUATION(left = lhs, right = rhs) then propagateOutput(lhs, rhs, tpl, vars);
+    case BackendDAE.SOLVED_EQUATION(componentRef = cr, exp = rhs)
+      then propagateOutput(Expression.crefExp(cr), rhs, tpl, vars);
+    else vars;
+  end match;
+  // input side: every cref argument of every inlinable call in the equation
+  // (traverse deeply to also catch nested calls)
+  (_, vars) := BackendEquation.traverseExpsOfEquation(eqn, function propagateInputsExpDeep(tpl = tpl), vars);
+end propagateEqnAttributes;
+
+protected function propagateInputsExpDeep
+  "Deeply traverses a top-level equation expression to reach nested calls."
+  input output DAE.Exp exp;
+  input Inline.Functiontuple tpl;
+  input output BackendDAE.Variables vars;
+algorithm
+  (exp, vars) := Expression.traverseExpBottomUp(exp, function propagateInputsExp(tpl = tpl), vars);
+end propagateInputsExpDeep;
+
+protected function propagateOutput
+  "Carries the (single) output's attributes onto the result variable of a
+   'cref = fn(...)' / 'fn(...) = cref' equation."
+  input DAE.Exp lhs;
+  input DAE.Exp rhs;
+  input Inline.Functiontuple tpl;
+  input output BackendDAE.Variables vars;
+protected
+  DAE.ComponentRef cr;
+  DAE.Exp call_exp;
+  Absyn.Path p;
+  list<DAE.Element> outs;
+algorithm
+  // figure out which side is the result cref and which is the inlinable call
+  if Expression.isCref(lhs) and isInlinableCall(rhs, tpl) then
+    DAE.CREF(componentRef = cr) := lhs;
+    call_exp := rhs;
+  elseif Expression.isCref(rhs) and isInlinableCall(lhs, tpl) then
+    DAE.CREF(componentRef = cr) := rhs;
+    call_exp := lhs;
+  else
+    return;
+  end if;
+
+  DAE.CALL(path = p) := call_exp;
+  try
+    outs := DAEUtil.getFunctionOutputVars(Inline.getFunction(p, tpl));
+    // only single-output functions have a well defined result variable
+    if listLength(outs) == 1 then
+      vars := mergeVarOntoCref(cr, listHead(outs), vars);
+    end if;
+  else
+  end try;
+end propagateOutput;
+
+protected function propagateInputsExp
+  "Traverse with Expression.traverseExpBottomUp; merges declared input
+   attributes onto cref arguments of every inlinable call."
+  input output DAE.Exp exp;
+  input Inline.Functiontuple tpl;
+  input output BackendDAE.Variables vars;
+algorithm
+  vars := match exp
+    local
+      Absyn.Path p;
+      list<DAE.Exp> args;
+      DAE.InlineType it;
+      list<DAE.Element> ins;
+    case DAE.CALL(path = p, expLst = args, attr = DAE.CALL_ATTR(inlineType = it))
+      guard Inline.checkInlineType(it, tpl) algorithm
+      try
+        ins := DAEUtil.getFunctionInputVars(Inline.getFunction(p, tpl));
+        if listLength(ins) == listLength(args) then
+          for t in List.zip(ins, args) loop
+            vars := mergeVarOntoArg(Util.tuple21(t), Util.tuple22(t), vars);
+          end for;
+        end if;
+      else
+      end try;
+    then vars;
+    else vars;
+  end match;
+end propagateInputsExp;
+
+protected function isInlinableCall
+  "True if the expression is a call to a function that will be inlined."
+  input DAE.Exp exp;
+  input Inline.Functiontuple tpl;
+  output Boolean b;
+algorithm
+  b := match exp
+    local
+      DAE.InlineType it;
+    case DAE.CALL(attr = DAE.CALL_ATTR(inlineType = it)) then Inline.checkInlineType(it, tpl);
+    else false;
+  end match;
+end isInlinableCall;
+
+protected function mergeVarOntoArg
+  "Merges the attributes declared on a function input/output element onto the
+   variable bound to the given argument expression (only if it is a cref)."
+  input DAE.Element velem;
+  input DAE.Exp arg;
+  input output BackendDAE.Variables vars;
+algorithm
+  vars := match arg
+    local
+      DAE.ComponentRef cr;
+    case DAE.CREF(componentRef = cr) then mergeVarOntoCref(cr, velem, vars);
+    else vars;
+  end match;
+end mergeVarOntoArg;
+
+protected function mergeVarOntoCref
+  "Merges the attributes of a function input/output element onto the variable
+   referenced by cr."
+  input DAE.ComponentRef cr;
+  input DAE.Element velem;
+  input output BackendDAE.Variables vars;
+protected
+  BackendDAE.Var var;
+  Integer index;
+  Option<DAE.VariableAttributes> src, dst;
+algorithm
+  try
+    (var, index) := BackendVariable.getVarSingle(cr, vars);
+    DAE.VAR(variableAttributesOption = src) := velem;
+    dst := mergeDAEAttributes(BackendVariable.getVariableAttributes(var), src);
+    var := BackendVariable.setVarAttributes(var, dst);
+    vars := BackendVariable.setVarAt(vars, index, var);
+  else
+  end try;
+end mergeVarOntoCref;
+
+protected function mergeDAEAttributes
+  "Merges the source attributes (from a function input/output) into the
+   destination attributes (the model variable). The model variable wins for any
+   attribute that is already set; for min/max the tightest bound wins. Only
+   constant attribute values are propagated."
+  input Option<DAE.VariableAttributes> dstOpt;
+  input Option<DAE.VariableAttributes> srcOpt;
+  output Option<DAE.VariableAttributes> outOpt;
+protected
+  DAE.VariableAttributes dst, src;
+algorithm
+  if isNone(srcOpt) then
+    outOpt := dstOpt;
+    return;
+  end if;
+  src := Util.getOption(srcOpt);
+  // OB stores variables without declared attributes using a default empty
+  // VAR_ATTR_REAL placeholder regardless of the variable's actual type. If the
+  // destination kind does not match the source kind, fall back to an empty
+  // record of the source's kind so e.g. integer min/max can be carried over.
+  dst := match dstOpt
+    case SOME(dst) guard sameAttrKind(dst, src) then dst;
+    else emptyAttrLike(src);
+  end match;
+
+  outOpt := match (dst, src)
+    case (DAE.VAR_ATTR_REAL(), DAE.VAR_ATTR_REAL()) algorithm
+      dst.quantity    := mergeOpt(dst.quantity, attrConst(src.quantity));
+      dst.unit        := mergeOpt(dst.unit, attrConst(src.unit));
+      dst.displayUnit := mergeOpt(dst.displayUnit, attrConst(src.displayUnit));
+      dst.min         := tightestBound(dst.min, attrConst(src.min), true);
+      dst.max         := tightestBound(dst.max, attrConst(src.max), false);
+      dst.start       := mergeOpt(dst.start, attrConst(src.start));
+      dst.fixed       := mergeOpt(dst.fixed, attrConst(src.fixed));
+      dst.nominal     := mergeOpt(dst.nominal, attrConst(src.nominal));
+    then SOME(dst);
+
+    case (DAE.VAR_ATTR_INT(), DAE.VAR_ATTR_INT()) algorithm
+      dst.quantity    := mergeOpt(dst.quantity, attrConst(src.quantity));
+      dst.min         := tightestBound(dst.min, attrConst(src.min), true);
+      dst.max         := tightestBound(dst.max, attrConst(src.max), false);
+      dst.start       := mergeOpt(dst.start, attrConst(src.start));
+      dst.fixed       := mergeOpt(dst.fixed, attrConst(src.fixed));
+    then SOME(dst);
+
+    case (DAE.VAR_ATTR_BOOL(), DAE.VAR_ATTR_BOOL()) algorithm
+      dst.quantity    := mergeOpt(dst.quantity, attrConst(src.quantity));
+      dst.start       := mergeOpt(dst.start, attrConst(src.start));
+      dst.fixed       := mergeOpt(dst.fixed, attrConst(src.fixed));
+    then SOME(dst);
+
+    case (DAE.VAR_ATTR_STRING(), DAE.VAR_ATTR_STRING()) algorithm
+      dst.quantity    := mergeOpt(dst.quantity, attrConst(src.quantity));
+      dst.start       := mergeOpt(dst.start, attrConst(src.start));
+    then SOME(dst);
+
+    case (DAE.VAR_ATTR_ENUMERATION(), DAE.VAR_ATTR_ENUMERATION()) algorithm
+      dst.quantity    := mergeOpt(dst.quantity, attrConst(src.quantity));
+      dst.min         := mergeOpt(dst.min, attrConst(src.min));
+      dst.max         := mergeOpt(dst.max, attrConst(src.max));
+      dst.start       := mergeOpt(dst.start, attrConst(src.start));
+      dst.fixed       := mergeOpt(dst.fixed, attrConst(src.fixed));
+    then SOME(dst);
+
+    else dstOpt;
+  end match;
+end mergeDAEAttributes;
+
+protected function sameAttrKind
+  "True if both attribute records are of the same kind."
+  input DAE.VariableAttributes a;
+  input DAE.VariableAttributes b;
+  output Boolean same;
+algorithm
+  same := match (a, b)
+    case (DAE.VAR_ATTR_REAL(),        DAE.VAR_ATTR_REAL())        then true;
+    case (DAE.VAR_ATTR_INT(),         DAE.VAR_ATTR_INT())         then true;
+    case (DAE.VAR_ATTR_BOOL(),        DAE.VAR_ATTR_BOOL())        then true;
+    case (DAE.VAR_ATTR_STRING(),      DAE.VAR_ATTR_STRING())      then true;
+    case (DAE.VAR_ATTR_ENUMERATION(), DAE.VAR_ATTR_ENUMERATION()) then true;
+    else false;
+  end match;
+end sameAttrKind;
+
+protected function emptyAttrLike
+  "Returns an empty attribute record of the same kind as the given one."
+  input DAE.VariableAttributes attr;
+  output DAE.VariableAttributes empty;
+algorithm
+  empty := match attr
+    case DAE.VAR_ATTR_REAL()        then DAE.emptyVarAttrReal;
+    case DAE.VAR_ATTR_INT()         then DAE.emptyVarAttrInt;
+    case DAE.VAR_ATTR_BOOL()        then DAE.emptyVarAttrBool;
+    case DAE.VAR_ATTR_STRING()      then DAE.emptyVarAttrString;
+    case DAE.VAR_ATTR_ENUMERATION() then DAE.VAR_ATTR_ENUMERATION(NONE(),NONE(),NONE(),NONE(),NONE(),NONE(),NONE(),NONE(),NONE());
+    else attr;
+  end match;
+end emptyAttrLike;
+
+protected function attrConst
+  "Keeps an attribute value only if it is constant (contains no component
+   references), so that no function-local references leak onto the model var."
+  input Option<DAE.Exp> inOpt;
+  output Option<DAE.Exp> outOpt;
+algorithm
+  outOpt := match inOpt
+    local DAE.Exp e;
+    case SOME(e) guard not Expression.expHasCrefs(e) then inOpt;
+    else NONE();
+  end match;
+end attrConst;
+
+protected function mergeOpt
+  "Keeps dst if it is already set, otherwise takes src."
+  input Option<DAE.Exp> dst;
+  input Option<DAE.Exp> src;
+  output Option<DAE.Exp> res = if isSome(dst) then dst else src;
+end mergeOpt;
+
+protected function tightestBound
+  "Picks the tighter of two bounds when both are constant numbers, otherwise
+   keeps the already present (dst) bound. isMin = true for lower bounds (larger
+   is tighter), false for upper bounds (smaller is tighter)."
+  input Option<DAE.Exp> dst;
+  input Option<DAE.Exp> src;
+  input Boolean isMin;
+  output Option<DAE.Exp> res;
+protected
+  DAE.Exp de, se;
+  Real dv, sv;
+  Boolean dc, sc;
+algorithm
+  if isNone(dst) then
+    res := src;
+  elseif isNone(src) then
+    res := dst;
+  else
+    SOME(de) := dst;
+    SOME(se) := src;
+    (dc, dv) := constNumber(de);
+    (sc, sv) := constNumber(se);
+    if dc and sc then
+      if isMin then
+        res := if sv > dv then src else dst;
+      else
+        res := if sv < dv then src else dst;
+      end if;
+    else
+      res := dst;
+    end if;
+  end if;
+end tightestBound;
+
+protected function constNumber
+  "Returns the value of a constant Real/Integer literal expression."
+  input DAE.Exp exp;
+  output Boolean isConst;
+  output Real value;
+algorithm
+  (isConst, value) := match exp
+    case DAE.RCONST() then (true, exp.real);
+    case DAE.ICONST() then (true, intReal(exp.integer));
+    else (false, 0.0);
+  end match;
+end constNumber;
+
+protected function inlineEquationArray "
+function: inlineEquationArray
+  inlines function calls in an equation array"
+  input BackendDAE.EquationArray inEquationArray;
+  input Inline.Functiontuple inElementList;
+  output BackendDAE.EquationArray outEquationArray = inEquationArray;
+  output Boolean oInlined;
+algorithm
+  try
+    oInlined := inlineEquationOptArray(outEquationArray, inElementList);
+  else
+    if Flags.isSet(Flags.FAILTRACE) then
+      Debug.trace("Inline.inlineEquationArray failed\n");
+    end if;
+    fail();
+  end try;
+end inlineEquationArray;
+
+protected function inlineEquationOptArray
+  "inlines calls in a equation option"
+  input BackendDAE.EquationArray inEqnArray;
+  input Inline.Functiontuple fns;
+  output Boolean oInlined = false;
+protected
+  BackendDAE.Equation eqn;
+  Boolean inlined;
+algorithm
+  for i in 1:ExpandableArray.getLastUsedIndex(inEqnArray) loop
+    if ExpandableArray.occupied(i, inEqnArray) then
+      (eqn, inlined) := inlineEq(ExpandableArray.get(i, inEqnArray), fns);
+
+      if inlined then
+        ExpandableArray.update(i, eqn, inEqnArray);
+        oInlined := true;
+      end if;
+    end if;
+  end for;
+end inlineEquationOptArray;
+
+public function inlineEq "
+  inlines function calls in equations"
+  input BackendDAE.Equation inEquation;
+  input Inline.Functiontuple fns;
+  output BackendDAE.Equation outEquation;
+  output Boolean inlined;
+algorithm
+  try
+    (outEquation,inlined) := match inEquation
+      local
+        DAE.Exp e,e_1,e1,e1_1,e2,e2_1;
+        Integer size;
+        Option<Integer> recordSize;
+        list<DAE.Exp> explst;
+        DAE.ComponentRef cref;
+        BackendDAE.WhenEquation weq,weq_1;
+        DAE.ElementSource source;
+        list<Integer> dimSize;
+        list<DAE.Statement> stmts,stmts1;
+        list<BackendDAE.Equation> eqns;
+        list<list<BackendDAE.Equation>> eqnslst;
+        Boolean b,b1,b2,b3;
+        DAE.Expand crefExpand;
+        BackendDAE.EquationAttributes attr;
+        BackendDAE.Equation eqn;
+
+      case BackendDAE.EQUATION(e1,e2,source,attr)
+        algorithm
+          (e1_1,source,b1,_) := Inline.inlineExp(e1,fns,source);
+          (e2_1,source,b2,_) := Inline.inlineExp(e2,fns,source);
+          b := b1 or b2;
+        then
+          (if b then BackendDAE.EQUATION(e1_1,e2_1,source,attr) else inEquation, b);
+
+      case BackendDAE.ARRAY_EQUATION(dimSize,e1,e2,source,attr,recordSize)
+        algorithm
+          (e1_1,source,b1,_) := Inline.inlineExp(e1,fns,source);
+          (e2_1,source,b2,_) := Inline.inlineExp(e2,fns,source);
+          b := b1 or b2;
+          eqn := if not b then inEquation else match (e1_1, e2_1)
+            case (DAE.ARRAY(array = {e1}), DAE.ARRAY(array = {e2}))
+            then BackendDAE.EQUATION(e1,e2,source,attr); // flatten if size==1
+            else BackendDAE.ARRAY_EQUATION(dimSize,e1_1,e2_1,source,attr,recordSize);
+          end match;
+        then
+          (eqn, b);
+
+      case BackendDAE.FOR_EQUATION(e, e1, e2, eqn, source, attr)
+        algorithm
+          (eqn, b) := inlineEq(eqn, fns);
+        then
+          (if b then BackendDAE.FOR_EQUATION(e, e1, e2, eqn, source, attr) else inEquation, b);
+
+      case BackendDAE.SOLVED_EQUATION(cref,e,source,attr)
+        algorithm
+          (e_1,source,b,_) := Inline.inlineExp(e,fns,source);
+        then
+          (if b then BackendDAE.SOLVED_EQUATION(cref,e_1,source,attr) else inEquation, b);
+
+      case BackendDAE.RESIDUAL_EQUATION(e,source,attr)
+        algorithm
+          (e_1,source,b,_) := Inline.inlineExp(e,fns,source);
+        then
+          (if b then BackendDAE.RESIDUAL_EQUATION(e_1,source,attr) else inEquation, b);
+
+      case BackendDAE.ALGORITHM(size,DAE.ALGORITHM_STMTS(statementLst=stmts),source,crefExpand,attr)
+        algorithm
+          (stmts1,b) := Inline.inlineStatements(stmts,fns,{},false);
+        then
+          (if b then BackendDAE.ALGORITHM(size,DAE.ALGORITHM_STMTS(stmts1),source,crefExpand,attr) else inEquation, b);
+
+      case BackendDAE.WHEN_EQUATION(size,weq,source,attr)
+        algorithm
+          (weq_1,source,b) := inlineWhenEq(weq,fns,source);
+        then
+          (if b then BackendDAE.WHEN_EQUATION(size,weq_1,source,attr) else inEquation, b);
+
+      case BackendDAE.COMPLEX_EQUATION(size,e1,e2,source,attr)
+        algorithm
+          (e1_1,source,b1,_) := Inline.inlineExp(e1,fns,source);
+          (e2_1,source,b2,_) := Inline.inlineExp(e2,fns,source);
+          b := b1 or b2;
+        then
+          (if b then BackendDAE.COMPLEX_EQUATION(size,e1_1,e2_1,source,attr) else inEquation, b);
+
+      case BackendDAE.IF_EQUATION(explst,eqnslst,eqns,source,attr)
+        algorithm
+          (explst,source,b1) := Inline.inlineExps(explst,fns,source);
+          (eqnslst,b2) := inlineEqsLst(eqnslst,fns,{},false);
+          (eqns,b3) := inlineEqs(eqns,fns,{},false);
+          b := b1 or b2 or b3;
+        then
+          (if b then BackendDAE.IF_EQUATION(explst,eqnslst,eqns,source,attr) else inEquation, b);
+
+      else (inEquation,false);
+    end match;
+  else
+    (outEquation,inlined) := (inEquation,false);
+  end try;
+end inlineEq;
+
+protected function inlineEqsLst
+  input list<list<BackendDAE.Equation>> inEqnsList;
+  input Inline.Functiontuple inFunctions;
+  input list<list<BackendDAE.Equation>> iAcc;
+  input Boolean iInlined;
+  output list<list<BackendDAE.Equation>> outEqnsList;
+  output Boolean OInlined;
+algorithm
+  (outEqnsList,OInlined) := match inEqnsList
+    local
+      list<BackendDAE.Equation> eqn;
+      list<list<BackendDAE.Equation>> rest,acc;
+      Boolean inlined;
+    case {} then (listReverse(iAcc),iInlined);
+    case eqn::rest
+      algorithm
+        (eqn,inlined) := inlineEqs(eqn,inFunctions,{},false);
+        (acc,inlined) := inlineEqsLst(rest,inFunctions,eqn::iAcc,inlined or iInlined);
+      then
+        (acc,inlined);
+  end match;
+end inlineEqsLst;
+
+public function inlineEqs
+  input list<BackendDAE.Equation> inEqnsList;
+  input Inline.Functiontuple inFunctions;
+  input list<BackendDAE.Equation> iAcc;
+  input Boolean iInlined;
+  output list<BackendDAE.Equation> outEqnsList;
+  output Boolean OInlined;
+algorithm
+  (outEqnsList,OInlined) := match inEqnsList
+    local
+      BackendDAE.Equation eqn;
+      list<BackendDAE.Equation> rest,acc;
+      Boolean inlined;
+    case {} then (listReverse(iAcc),iInlined);
+    case eqn::rest
+      algorithm
+        (eqn,inlined) := inlineEq(eqn,inFunctions);
+        (acc,inlined) := inlineEqs(rest,inFunctions,eqn::iAcc,inlined or iInlined);
+      then
+        (acc,inlined);
+  end match;
+end inlineEqs;
+
+protected function inlineWhenEq
+"inlines function calls in when equations"
+  input BackendDAE.WhenEquation inWhenEquation;
+  input Inline.Functiontuple fns;
+  input DAE.ElementSource inSource;
+  output BackendDAE.WhenEquation outWhenEquation;
+  output DAE.ElementSource outSource;
+  output Boolean inlined;
+algorithm
+  (outWhenEquation,outSource,inlined) := match inWhenEquation
+    local
+      DAE.Exp cond;
+      DAE.ElementSource source;
+      Boolean b1,b2,b3;
+      BackendDAE.WhenEquation elsewe;
+      Option<BackendDAE.WhenEquation> oelsewe;
+      list<BackendDAE.WhenOperator> whenStmtLst;
+
+    case BackendDAE.WHEN_STMTS(condition=cond, whenStmtLst=whenStmtLst, elsewhenPart = oelsewe)
+      algorithm
+        (cond, source, b1,_) := Inline.inlineExp(cond, fns, inSource);
+        (whenStmtLst, b2) := inlineWhenOps(whenStmtLst, fns);
+
+        if isSome(oelsewe) then
+          SOME(elsewe) := oelsewe;
+          (elsewe, source, b3) := inlineWhenEq(elsewe, fns, source);
+          oelsewe := SOME(elsewe);
+        else
+          oelsewe := NONE();
+          b3 := false;
+        end if;
+      then (BackendDAE.WHEN_STMTS(cond, whenStmtLst, oelsewe), source, b1 or b2 or b3);
+
+  end match;
+end inlineWhenEq;
+
+protected function inlineWhenOps
+  input list<BackendDAE.WhenOperator> inWhenOps;
+  input Inline.Functiontuple fns;
+  output list<BackendDAE.WhenOperator> outWhenOps = {};
+  output Boolean inlined = false;
+protected
+
+algorithm
+  for whenOp in inWhenOps loop
+    () := match whenOp
+    local
+      Boolean b, b2;
+      DAE.Exp e1, e2, level;
+      DAE.ComponentRef cr;
+      DAE.ElementSource source;
+
+    case BackendDAE.ASSIGN(left = e1, right = e2, source = source)
+      algorithm
+        (e2, source, b,_) := Inline.inlineExp(e2, fns, source);
+        outWhenOps := (if b then BackendDAE.ASSIGN(e1, e2, source) else whenOp)::outWhenOps;
+        inlined := inlined or b;
+      then ();
+
+    case BackendDAE.REINIT(stateVar = cr, value = e2,  source = source)
+      algorithm
+        (e2, source, b,_) := Inline.inlineExp(e2, fns, source);
+        outWhenOps := (if b then BackendDAE.REINIT(cr, e2, source) else whenOp)::outWhenOps;
+        inlined := inlined or b;
+      then ();
+
+    case BackendDAE.ASSERT(condition = e1, message = e2, level = level,  source = source)
+      algorithm
+        (e1, source, b,_) := Inline.inlineExp(e1, fns, source);
+        (e2, source, b2,_) := Inline.inlineExp(e2, fns, source);
+        outWhenOps := (if b or b2 then BackendDAE.ASSERT(e1, e2, level, source) else whenOp)::outWhenOps;
+        inlined := inlined or b or b2;
+      then ();
+
+    case BackendDAE.TERMINATE(message = e1,  source = source)
+      algorithm
+        (e1, source, b,_) := Inline.inlineExp(e1, fns, source);
+        outWhenOps := (if b then BackendDAE.TERMINATE(e1, source) else whenOp)::outWhenOps;
+        inlined := inlined or b;
+      then ();
+
+    case BackendDAE.NORETCALL(exp = e1,  source = source)
+      algorithm
+        (e1, source, b,_) := Inline.inlineExp(e1, fns, source);
+        outWhenOps := (if b then BackendDAE.NORETCALL(e1, source) else whenOp)::outWhenOps;
+        inlined := inlined or b;
+      then ();
+  end match;
+  end for;
+end inlineWhenOps;
+
+protected function inlineVariables
+"inlines function calls in variables"
+  input BackendDAE.Variables inVariables;
+  input Inline.Functiontuple inElementList;
+  output BackendDAE.Variables outVariables;
+  output Boolean inlined;
+algorithm
+  (outVariables,inlined) := matchcontinue(inVariables,inElementList)
+    local
+      Inline.Functiontuple fns;
+      array<Option<BackendDAE.Var>> vararr;
+    case(BackendDAE.VARIABLES(varArr = BackendDAE.VARIABLE_ARRAY(varOptArr = vararr)),fns)
+      algorithm
+        inlined := inlineVarOptArray(vararr,fns);
+      then
+        (inVariables,inlined);
+    else
+      algorithm
+        true := Flags.isSet(Flags.FAILTRACE);
+        Debug.trace("Inline.inlineVariables failed\n");
+      then
+        fail();
+  end matchcontinue;
+end inlineVariables;
+
+protected function inlineVarOptArray
+"function: inlineVarOptArray
+  inlines calls in a variable option"
+  input array<Option<BackendDAE.Var>> inVarArray;
+  input Inline.Functiontuple fns;
+  output Boolean oInlined = false;
+protected
+  Boolean b;
+  Option<BackendDAE.Var> var;
+algorithm
+  for index in 1:arrayLength(inVarArray) loop
+    var := inVarArray[index];
+    (var,b) := inlineVarOpt(var,fns);
+    if b then
+      arrayUpdate(inVarArray,index,var);
+    end if;
+    oInlined := oInlined or b;
+  end for;
+end inlineVarOptArray;
+
+protected function inlineVarOpt
+"functio: inlineVarOpt
+  inlines calls in a variable option"
+  input Option<BackendDAE.Var> inVarOption;
+  input Inline.Functiontuple fns;
+  output Option<BackendDAE.Var> outVarOption;
+  output Boolean inlined;
+algorithm
+  (outVarOption,inlined) := match inVarOption
+    local
+      BackendDAE.Var var,var2;
+      Boolean b;
+    case NONE() then (NONE(),false);
+    case SOME(var)
+      algorithm
+        (var2,b) := inlineVar(var,fns);
+      then
+        (if referenceEq(var, var2) then inVarOption else SOME(var2),b);
+  end match;
+end inlineVarOpt;
+
+protected function inlineVar
+"functio: inlineVar
+  inlines calls in a variable"
+  input BackendDAE.Var inVar;
+  input Inline.Functiontuple inElementList;
+  output BackendDAE.Var outVar;
+  output Boolean inlined;
+algorithm
+  (outVar, inlined) := match inVar
+    local
+      DAE.ComponentRef varName;
+      BackendDAE.VarKind varKind;
+      DAE.VarDirection varDirection;
+      DAE.VarParallelism varParallelism;
+      BackendDAE.Type varType;
+      DAE.InstDims arrayDim;
+      Option<DAE.VariableAttributes> values,values1;
+      Option<BackendDAE.TearingSelect> ts;
+      Option<DAE.Exp> hideResult;
+      Option<SCode.Comment> comment;
+      DAE.ConnectorType ct;
+      DAE.ElementSource source;
+      Option<DAE.Exp> bind;
+      Option<DAE.Exp> tplExp;
+      Boolean b1,b2;
+      DAE.VarInnerOuter io;
+      Boolean unreplaceable;
+      Boolean e;
+
+    case BackendDAE.VAR(varName,varKind,varDirection,varParallelism,varType,bind,tplExp,arrayDim,source,values,ts,hideResult,comment,ct,io,unreplaceable,_,e) algorithm
+      (bind,source,b1) := Inline.inlineExpOpt(bind,inElementList,source);
+      (values1,source,b2) := Inline.inlineStartAttribute(values,source,inElementList);
+    then (if b1 or b2 then BackendDAE.VAR(varName,varKind,varDirection,varParallelism,varType,bind,tplExp,arrayDim,source,values1,ts,hideResult,comment,ct,io,unreplaceable,false,e) else inVar, b1 or b2);
+
+    else (inVar, false);
+  end match;
+end inlineVar;
+
+protected function inlineEventInfo "inlines function calls in event info"
+  input BackendDAE.EventInfo inEventInfo;
+  input Inline.Functiontuple fns;
+algorithm
+  () := matchcontinue inEventInfo
+    local
+      BackendDAE.ZeroCrossingSet zclst;
+      BackendDAE.ZeroCrossingSet relations;
+
+    case BackendDAE.EVENT_INFO(zeroCrossings=zclst, relations=relations) algorithm
+      inlineZeroCrossings(zclst.zc, fns);
+      inlineZeroCrossings(relations.zc, fns);
+    then ();
+
+    else
+      algorithm
+        true := Flags.isSet(Flags.FAILTRACE);
+        Debug.trace("Inline.inlineEventInfo failed\n");
+      then fail();
+  end matchcontinue;
+end inlineEventInfo;
+
+protected function inlineZeroCrossings "inlines function calls in zero crossings"
+  input DoubleEnded.MutableList<BackendDAE.ZeroCrossing> inStmts;
+  input Inline.Functiontuple fns;
+algorithm
+  DoubleEnded.mapNoCopy_1(inStmts, inlineZeroCrossing, fns);
+end inlineZeroCrossings;
+
+protected function inlineZeroCrossing "inlines function calls in a zero crossing"
+  input output BackendDAE.ZeroCrossing zc;
+  input Inline.Functiontuple fns;
+algorithm
+  zc := match zc
+    local
+      DAE.Exp e, e_1;
+
+    case BackendDAE.ZERO_CROSSING(relation_ = e)
+      algorithm
+        (e_1, _,_, _) := Inline.inlineExp(e, fns, DAE.emptyElementSource/*TODO: Propagate operation info*/);
+      then if not referenceEq(e,e_1) then BackendDAE.ZERO_CROSSING(zc.index, e_1, zc.occurEquLst, zc.iter) else zc;
+
+    else zc;
+  end match;
+end inlineZeroCrossing;
+
+// =============================================================================
+// inline append functions
+//
+// =============================================================================
+
+protected function inlineCallsBDAE
+"searches for calls where the inline flag is true, and inlines them"
+  input list<DAE.InlineType> inITLst;
+  input BackendDAE.BackendDAE inBackendDAE;
+  output BackendDAE.BackendDAE outBackendDAE;
+protected
+  Inline.Functiontuple tpl;
+  BackendDAE.EqSystems eqs;
+  BackendDAE.Shared shared;
+algorithm
+  try
+
+    if Flags.isSet(Flags.DUMPBACKENDINLINE) then
+      if Flags.getConfigEnum(Flags.INLINE_METHOD) == 1 then
+        print("\n############ BackendInline Method: replace ############");
+      elseif Flags.getConfigEnum(Flags.INLINE_METHOD) == 2 then
+        print("\n############ BackendInline Method: append ############");
+      end if;
+    end if;
+
+    shared := inBackendDAE.shared;
+    eqs := inBackendDAE.eqs;
+    tpl := (SOME(shared.functionTree), inITLst);
+    if Flags.getConfigEnum(Flags.INLINE_METHOD) == 1 then
+      eqs := List.map1(eqs, BackendInline.inlineEquationSystem, tpl);
+    elseif Flags.getConfigEnum(Flags.INLINE_METHOD) == 2 then
+      eqs := List.map2(eqs, inlineEquationSystemAppend, tpl, shared);
+    end if;
+    if Flags.isSet(Flags.DUMPBACKENDINLINE) then
+      BackendDump.dumpEqSystems(eqs, "Result DAE after Inline.");
+    end if;
+    // TODO: use new BackendInline also for other parts
+    shared.globalKnownVars := BackendInline.inlineVariables(shared.globalKnownVars, tpl);
+    shared.externalObjects := BackendInline.inlineVariables(shared.externalObjects, tpl);
+    shared.initialEqs := BackendInline.inlineEquationArray(shared.initialEqs, tpl);
+    shared.removedEqs := BackendInline.inlineEquationArray(shared.removedEqs, tpl);
+
+    outBackendDAE := BackendDAE.DAE(eqs, shared);
+  else
+    if Flags.isSet(Flags.FAILTRACE) then
+        Debug.traceln("BackendInline.inlineCallsBDAE failed");
+    end if;
+    fail();
+  end try;
+
+  // fix "tuple = tuple" expression after inline functions
+  outBackendDAE := BackendDAEOptimize.simplifyComplexFunction1(outBackendDAE, false);
+end inlineCallsBDAE;
+
+
+protected function inlineEquationSystemAppend
+  input BackendDAE.EqSystem eqs;
+  input Inline.Functiontuple tpl;
+  input BackendDAE.Shared ishared;
+  output BackendDAE.EqSystem oeqs = eqs;
+protected
+  BackendDAE.Shared shared = ishared;
+  BackendDAE.EqSystem new;
+  Boolean inlined=true;
+  BackendDAE.EquationArray eqnsArray;
+algorithm
+  //inlineVariables(oeqs.orderedVars, tpl);
+  (eqnsArray, new, inlined, shared) := inlineEquationArrayAppend(oeqs.orderedEqs, tpl, shared);
+  //inlineEquationArray(oeqs.removedEqs, tpl);
+  if inlined then
+    oeqs.orderedEqs := eqnsArray;
+    new := inlineEquationSystemAppend(new, tpl, shared);
+    oeqs := BackendDAEUtil.mergeEqSystems(new, oeqs);
+  end if;
+end inlineEquationSystemAppend;
+
+protected function inlineEquationArrayAppend "
+function: inlineEquationArray
+  inlines function calls in an equation array"
+  input BackendDAE.EquationArray inEquationArray;
+  input Inline.Functiontuple fns;
+  input BackendDAE.Shared iShared;
+  output BackendDAE.EquationArray outEquationArray = inEquationArray;
+  output BackendDAE.EqSystem outEqs;
+  output Boolean oInlined;
+  output BackendDAE.Shared shared = iShared;
+algorithm
+  try
+    (outEqs, oInlined, shared) := inlineEquationOptArrayAppend(outEquationArray, fns, shared);
+ else
+   oInlined := false;
+   outEqs := BackendDAEUtil.createEqSystem( BackendVariable.listVar({}), BackendEquation.listEquation({}));
+   if Flags.isSet(Flags.FAILTRACE) then
+      Debug.trace("BackendInline.inlineEquationArrayAppend failed\n");
+   end if;
+ end try;
+
+end inlineEquationArrayAppend;
+
+protected function inlineEquationOptArrayAppend
+"functio: inlineEquationrOptArray
+  inlines calls in a equation option"
+  input BackendDAE.EquationArray inEqnArray;
+  input Inline.Functiontuple fns;
+  input BackendDAE.Shared iShared;
+  output BackendDAE.EqSystem outEqs;
+  output Boolean oInlined = false;
+  output BackendDAE.Shared shared = iShared;
+protected
+  BackendDAE.Equation eqn;
+  Boolean inlined;
+  BackendDAE.EqSystem tmpEqs;
+algorithm
+  outEqs := BackendDAEUtil.createEqSystem(BackendVariable.listVar({}), BackendEquation.listEquation({}));
+  for i in 1:ExpandableArray.getLastUsedIndex(inEqnArray) loop
+    if ExpandableArray.occupied(i, inEqnArray) then
+      (eqn, tmpEqs, inlined, shared) := inlineEqAppend_debug(ExpandableArray.get(i, inEqnArray), fns, shared);
+      if inlined then
+        outEqs := BackendDAEUtil.mergeEqSystems(tmpEqs, outEqs);
+        ExpandableArray.update(i, eqn, inEqnArray);
+        oInlined := true;
+      end if;
+    end if;
+  end for;
+end inlineEquationOptArrayAppend;
+
+public function inlineEqAppend_debug "
+  inlines function calls in equations"
+  input BackendDAE.Equation inEquationOption;
+  input Inline.Functiontuple inElementList;
+  input BackendDAE.Shared iShared;
+  output BackendDAE.Equation outEquationOption;
+  output BackendDAE.EqSystem outEqs;
+  output Boolean inlined;
+  output BackendDAE.Shared shared = iShared;
+algorithm
+  outEqs := BackendDAEUtil.createEqSystem(BackendVariable.listVar({}), BackendEquation.listEquation({}));
+  (outEquationOption,outEqs,inlined,shared) := inlineEqAppend(inEquationOption,inElementList,outEqs,shared);
+
+  // debug
+  if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) and inlined then
+    print("Equation before inline: "+BackendDump.equationString(inEquationOption)+"\n");
+    BackendDump.dumpEqSystem(outEqs, "Tmp DAE after Inline Eqn: "+BackendDump.equationString(outEquationOption)+"\n");
+  end if;
+end inlineEqAppend_debug;
+
+protected function inlineEqAppend "
+  inlines function calls in equations"
+  input BackendDAE.Equation inEquation;
+  input Inline.Functiontuple fns;
+  input BackendDAE.EqSystem inEqs;
+  input BackendDAE.Shared iShared;
+  output BackendDAE.Equation outEquation;
+  output BackendDAE.EqSystem outEqs;
+  output Boolean inlined;
+  output BackendDAE.Shared shared = iShared;
+algorithm
+  (outEquation,outEqs,inlined) := matchcontinue inEquation
+    local
+      DAE.Exp e1,e2;
+      DAE.ElementSource source;
+      Boolean b1,b2,b3;
+      BackendDAE.EquationAttributes attr;
+      BackendDAE.Equation eqn;
+      Integer size;
+      list<DAE.Exp> explst;
+      DAE.ComponentRef cref;
+      BackendDAE.WhenEquation weq,weq_1;
+      list<DAE.Statement> stmts, stmts1;
+      DAE.Expand crefExpand;
+      list<list<BackendDAE.Equation>> eqnslst;
+      list<BackendDAE.Equation> eqns;
+
+    case BackendDAE.EQUATION(e1,e2,source,attr)
+      algorithm
+        (e1,source,outEqs,b1,shared) := inlineCallsAppend(e1,fns,source,inEqs,shared);
+        (e2,source,outEqs,b2,shared) := inlineCallsAppend(e2,fns,source,outEqs,shared);
+        b3 := b1 or b2;
+      then
+        (BackendEquation.generateEquation(e1,e2,source,attr),outEqs,b3);
+
+    case BackendDAE.COMPLEX_EQUATION(left=e1, right=e2, source=source, attr=attr)
+      algorithm
+        (e1,source,outEqs,b1,shared) := inlineCallsAppend(e1,fns,source,inEqs,shared);
+        (e2,source,outEqs,b2,shared) := inlineCallsAppend(e2,fns,source,outEqs,shared);
+        b3 := b1 or b2;
+        if b2 and Expression.isScalar(e1) and Expression.isTuple(e2) then
+          e2 := DAE.TSUB(e2, 1, Expression.typeof(e1));
+        end if;
+      then
+        (BackendEquation.generateEquation(e1,e2,source,attr),outEqs,b3);
+
+    case BackendDAE.ARRAY_EQUATION(left=e1, right=e2, source=source, attr=attr)
+      algorithm
+        (e1,source,outEqs,b1,shared) := inlineCallsAppend(e1,fns,source,inEqs,shared);
+        (e2,source,outEqs,b2,shared) := inlineCallsAppend(e2,fns,source,outEqs,shared);
+         b3 := b1 or b2;
+      then
+        (BackendEquation.generateEquation(e1,e2,source,attr),outEqs,b3);
+
+     case BackendDAE.SOLVED_EQUATION(cref,e2,source,attr)
+       algorithm
+       (e2,source,outEqs,b2,shared) := inlineCallsAppend(e2,fns,source,inEqs,shared);
+       then
+        (BackendDAE.SOLVED_EQUATION(cref,e2,source,attr),outEqs,b2);
+
+     case BackendDAE.RESIDUAL_EQUATION(e1,source,attr)
+       algorithm
+       (e1,source,outEqs,b1,shared) := inlineCallsAppend(e1,fns,source,inEqs,shared);
+     then
+       (BackendDAE.RESIDUAL_EQUATION(e1,source,attr),outEqs,b1);
+
+      case eqn as BackendDAE.ALGORITHM(size, DAE.ALGORITHM_STMTS(statementLst=stmts),source,crefExpand,attr)
+      algorithm
+        (stmts1,b1) := Inline.inlineStatements(stmts,fns,{},false);
+        if b1 then
+          eqn := BackendDAE.ALGORITHM(size,DAE.ALGORITHM_STMTS(stmts1),source,crefExpand,attr);
+        end if;
+      then
+        (eqn,inEqs,b1);
+
+     case eqn as BackendDAE.WHEN_EQUATION(size,weq,source,attr)
+      algorithm
+        (weq_1,source,b1) := inlineWhenEq(weq,fns,source);
+        if b1 then
+           eqn := BackendDAE.WHEN_EQUATION(size,weq_1,source,attr);
+        end if;
+      then
+        (eqn,inEqs, b1);
+
+     case eqn as BackendDAE.IF_EQUATION(explst,eqnslst,eqns,source,attr)
+      algorithm
+        (explst,source,b1) := Inline.inlineExps(explst,fns,source);
+        (eqnslst,b2) := inlineEqsLst(eqnslst,fns,{},false);
+        (eqns,b3) := inlineEqs(eqns,fns,{},false);
+        b3 := b1 or b2 or b3;
+        if b3 then
+          eqn := BackendDAE.IF_EQUATION(explst,eqnslst,eqns,source,attr);
+        end if;
+      then
+        (eqn, inEqs, b3);
+
+     else (inEquation,inEqs,false);
+
+  end matchcontinue;
+end inlineEqAppend;
+
+protected function inlineCallsAppend "
+function: inlineCalls
+  inlines calls in a DAE.Exp"
+  input DAE.Exp inExp;
+  input Inline.Functiontuple fns;
+  input DAE.ElementSource inSource;
+  input BackendDAE.EqSystem inEqs;
+  input BackendDAE.Shared iShared;
+  output DAE.Exp outExp;
+  output DAE.ElementSource outSource;
+  output BackendDAE.EqSystem outEqs;
+  output Boolean inlined;
+  output BackendDAE.Shared shared = iShared;
+algorithm
+  (outExp,outSource,outEqs,inlined) := matchcontinue inExp
+    local
+      DAE.Exp e,e1,e2;
+      DAE.ElementSource source;
+      Boolean b;
+
+    case e
+      algorithm
+        (e1,(_,outEqs,b,_)) := Expression.traverseExpBottomUp(e,inlineCallsWork,(fns,inEqs,false,false));
+        //source = DAEUtil.addSymbolicTransformation(b, inSource,DAE.OP_INLINE(DAE.PARTIAL_EQUATION(e),DAE.PARTIAL_EQUATION(e1)));
+        source := inSource;
+        e2 := e1;
+        //(DAE.PARTIAL_EQUATION(e2),source) = ExpressionSimplify.simplifyAddSymbolicOperation(DAE.PARTIAL_EQUATION(e1), source);
+        // debug
+        if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+          print("\ninExp: " + ExpressionBasics.printExpStr(inExp));
+          print("\noutExp: " + ExpressionBasics.printExpStr(e2));
+        end if;
+      then
+        (e2,source,outEqs,b);
+
+    else (inExp,inSource,inEqs,false);
+  end matchcontinue;
+end inlineCallsAppend;
+
+protected function inlineCallsWork
+"replaces an expression call with the statements from the function"
+  input DAE.Exp inExp;
+  input tuple<Inline.Functiontuple,BackendDAE.EqSystem,Boolean,Boolean> inTuple;
+  output DAE.Exp outExp;
+  output tuple<Inline.Functiontuple,BackendDAE.EqSystem,Boolean,Boolean> outTuple;
+algorithm
+  (outExp,outTuple) := matchcontinue (inExp,inTuple)
+    local
+      Inline.Functiontuple fns;
+      list<DAE.Element> fn;
+      Absyn.Path p;
+      list<DAE.Exp> args;
+      list<DAE.ComponentRef> outputCrefs;
+      DAE.Exp newExp;
+      DAE.InlineType inlineType;
+      Boolean b;
+      Option<SCode.Comment> comment;
+      String funcname;
+      BackendDAE.EqSystem eqSys, newEqSys;
+      Boolean insideIfExp;
+
+    case (DAE.IFEXP(), _)
+      then fail();
+
+    case (DAE.CALL(attr=DAE.CALL_ATTR(builtin=true)),_)
+      then (inExp,inTuple);
+
+    case (DAE.CALL(p,args,DAE.CALL_ATTR(inlineType=inlineType)),(fns,eqSys,_,false))
+    guard Inline.checkInlineType(inlineType,fns) and Flags.getConfigEnum(Flags.INLINE_METHOD)==2
+      algorithm
+        (fn,comment) := Inline.getFunctionBody(p,fns);
+        funcname := BackendUtil.modelicaStringToCStr(AbsynUtil.pathString(p), false);
+        if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+          print("Inline Function " +funcname+" type: "+DAEDump.dumpInlineTypeStr(inlineType)+"\n");
+          print("in : " + ExpressionBasics.printExpStr(inExp) + "\n");
+        end if;
+
+        // get inputs, body and output
+        (outputCrefs, newEqSys) := createEqnSysfromFunction(fn,args,funcname);
+        newExp := Expression.makeTuple(list( Expression.crefExp(cr) for cr in outputCrefs));
+        if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+          print("out: " + ExpressionBasics.printExpStr(newExp) + "\n");
+        end if;
+
+        // MSL 3.2.1 need GenerateEvents to disable this
+        if not Inline.hasGenerateEventsAnnotation(comment) then
+          BackendDAEUtil.traverseBackendDAEExpsEqSystemWithUpdate(newEqSys, addNoEvent, false);
+        end if;
+        newEqSys := BackendDAEUtil.mergeEqSystems(newEqSys, eqSys);
+      then
+        (newExp,(fns,newEqSys,true,false));
+
+    //fallback use old implementation
+    case (DAE.CALL(p,_,DAE.CALL_ATTR(inlineType=inlineType)),(fns,eqSys,b,insideIfExp))
+      algorithm
+        //TODO sace assertLst
+        (newExp, _) := Inline.inlineCall(inExp, {}, fns);
+
+        if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+          funcname := BackendUtil.modelicaStringToCStr(AbsynUtil.pathString(p), false);
+          print("\nBackendInline fallback replace implementation: " +funcname+" type: " +DAEDump.dumpInlineTypeStr(inlineType)+"\n");
+          print("in : " + ExpressionBasics.printExpStr(inExp) + "\n");
+          print("out: " + ExpressionBasics.printExpStr(newExp) + "\n");
+        end if;
+      then (newExp,(fns,eqSys,b,insideIfExp));
+
+    else (inExp,inTuple);
+  end matchcontinue;
+end inlineCallsWork;
+
+function addNoEvent
+  input DAE.Exp inExp;
+  input Boolean inB;
+  output DAE.Exp outExp;
+  output Boolean outB = inB;
+algorithm
+  outExp := Expression.addNoEventToRelationsAndConds(inExp);
+  outExp := Expression.addNoEventToEventTriggeringFunctions(outExp);
+end addNoEvent;
+
+protected function createReplacementVariables
+  input DAE.ComponentRef inCref;
+  input String funcName;
+  input BackendVarTransform.VariableReplacements inRepls;
+  output DAE.ComponentRef crVar;
+  output list<BackendDAE.Var> outVars = {};
+  output BackendVarTransform.VariableReplacements outRepls = inRepls;
+protected
+  DAE.Exp eVar, e;
+  list<DAE.Exp> arrExp;
+  list<DAE.ComponentRef> crefs, crefs1;
+  DAE.ComponentRef cr;
+  BackendDAE.Var var;
+algorithm
+  // create variable and expression from cref
+  var := BackendVariable.createTmpVar(inCref, funcName);
+  crVar := BackendVariable.varCref(var);
+  eVar := Expression.crefExp(crVar);
+
+  //TODO: handle record cases
+  false := Expression.isRecord(eVar);
+
+  // create top-level replacement
+  outRepls := BackendVarTransform.addReplacement(outRepls, inCref, eVar, NONE());
+
+  // handle array cases for replacements
+  crefs := ComponentReference.expandCref(inCref, false);
+  crefs1 := ComponentReference.expandCref(crVar, false);
+  try
+    arrExp := Expression.getArrayOrRangeContents(eVar);
+  else
+    arrExp := {eVar};
+  end try;
+
+  // error handling
+  if listLength(crefs) <> listLength(arrExp) then
+    if Flags.isSet(Flags.FAILTRACE) then
+      Debug.traceln("BackendInline.createReplacementVariables failed with array handling "+ExpressionBasics.printExpStr(eVar)+"\n");
+    end if;
+    fail();
+  end if;
+
+  // add every array scalar to replacements
+  for c in crefs loop
+    cr :: crefs1 := crefs1;
+    e :: arrExp := arrExp;
+    var.varName := cr;
+    outVars := var::outVars;
+    outRepls := BackendVarTransform.addReplacement(outRepls, c, e, NONE());
+  end for;
+  outVars := listReverse(outVars);
+end createReplacementVariables;
+
+protected function createEqnSysfromFunction
+  input list<DAE.Element> fns;
+  input list<DAE.Exp> inArgs;
+  input String funcname;
+  output list<DAE.ComponentRef> oOutput = {};
+  output BackendDAE.EqSystem outEqs;
+protected
+  list<DAE.Exp> args = inArgs;
+  BackendVarTransform.VariableReplacements repl;
+  list<DAE.ComponentRef> fnInputs = {};
+  list<tuple<DAE.ComponentRef, DAE.Exp>> argmap;
+  HashTableCG.HashTable checkcr;
+  DAE.ComponentRef cr;
+  list<BackendDAE.Equation> eqlst;
+algorithm
+  if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+    print("\ncreate EqnSys from function: "+funcname);
+  end if;
+  outEqs := BackendDAEUtil.createEqSystem( BackendVariable.listVar({}), BackendEquation.listEquation({}));
+  repl := BackendVarTransform.emptyReplacements();
+
+  for fn in fns loop
+  () := match fn
+    local
+      DAE.ComponentRef crVar;
+      list<DAE.Statement> st;
+      DAE.Exp eVar, eBind;
+      BackendDAE.Equation eq;
+      list<BackendDAE.Var> varLst;
+
+    // assume inArgs is syncron to fns.inputs
+    case DAE.VAR(componentRef=cr,direction=DAE.INPUT(),kind=DAE.VARIABLE())
+      algorithm
+        fnInputs := cr :: fnInputs;
+      then ();
+
+    //fns.outputs
+    case DAE.VAR(componentRef=cr,direction=DAE.OUTPUT(),kind=DAE.VARIABLE())
+    guard (not Expression.isRecordType(ComponentReference.crefTypeFull(cr))) and ComponentReference.crefDepth(cr) > 0
+      algorithm
+        // create variables
+        (crVar, varLst, repl) := createReplacementVariables(cr, funcname, repl);
+        outEqs := BackendVariable.addVarsDAE(varLst, outEqs);
+        // collect output variables
+        oOutput := crVar::oOutput;
+      then ();
+
+    case DAE.VAR(componentRef=cr,protection=DAE.PROTECTED(),binding=NONE())
+    guard not Expression.isRecordType(ComponentReference.crefTypeFull(cr))
+      algorithm
+        // create variables
+        (_, varLst, repl) := createReplacementVariables(cr, funcname, repl);
+        varLst := list(BackendVariable.setVarTS(_var, SOME(BackendDAE.AVOID())) for _var in varLst);
+        outEqs := BackendVariable.addVarsDAE(varLst, outEqs);
+    then ();
+
+    case DAE.VAR(componentRef=cr,protection=DAE.PROTECTED(),binding=SOME(eBind))
+    guard not Expression.isRecordType(ComponentReference.crefTypeFull(cr))
+      algorithm
+        // create variables
+        (crVar, varLst, repl) := createReplacementVariables(cr, funcname, repl);
+        // add variables
+        eVar := Expression.crefExp(crVar);
+        varLst := list(BackendVariable.setVarTS(_var, SOME(BackendDAE.AVOID())) for _var in varLst);
+        outEqs := BackendVariable.addVarsDAE(varLst, outEqs);
+        // add equation for binding
+        eq := BackendEquation.generateEquation(eVar,eBind);
+        outEqs := BackendEquation.equationAddDAE(eq, outEqs);
+      then ();
+
+    case DAE.ALGORITHM(algorithm_ = DAE.ALGORITHM_STMTS(st))
+      algorithm
+        eqlst := List.map(st, BackendEquation.statementEq);
+        outEqs := BackendEquation.equationsAddDAE(eqlst, outEqs);
+      then ();
+    end match;
+  end for;
+
+  // bring output variables in the right order
+  oOutput := listReverse(oOutput);
+
+  /* TODO: remove this check for a square system */
+  if (BackendDAEUtil.systemSize(outEqs) <> BackendVariable.daenumVariables(outEqs)) then
+    if Flags.isSet(Flags.FAILTRACE) then
+      Debug.trace("newBackendInline.createEqnSysfromFunction failed for function " + funcname + "with different sizes\n");
+      print(intString(BackendDAEUtil.systemSize(outEqs)) + " <> "  + intString(BackendVariable.daenumVariables(outEqs)));
+    end if;
+    fail();
+  end if;
+
+  // debug
+  if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+    print("\noriginal function body of: "+funcname);
+    BackendDump.printEqSystem(outEqs);
+    print("\nDump replacements: ");
+    BackendVarTransform.dumpReplacements(repl);
+  end if;
+
+  // scalarize array equations
+  outEqs.orderedEqs := BackendEquation.listEquation(InlineArrayEquations.getScalarArrayEqns(BackendEquation.equationList(outEqs.orderedEqs)));
+
+  // replace protected and output variables in function body
+  outEqs := BackendVarTransform.performReplacementsEqSystem(outEqs, repl);
+
+  // debug
+  if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+    print("\n replaced protected and output for: "+funcname);
+    BackendDump.printEqSystem(outEqs);
+  end if;
+
+
+  // replace inputs variables
+  argmap := List.zip(listReverse(fnInputs), args);
+  (argmap,checkcr) := Inline.extendCrefRecords(argmap, HashTableCG.emptyHashTable());
+  BackendDAEUtil.traverseBackendDAEExpsEqSystemWithUpdate(outEqs, replaceArgs, (argmap,checkcr,true,Inline.newArgMemo()));
+
+
+  // debug
+  if Flags.isSet(Flags.DUMPBACKENDINLINE_VERBOSE) then
+    print("\nreplaced input arguments for: "+funcname);
+    BackendDump.printEqSystem(outEqs);
+  end if;
+
+end createEqnSysfromFunction;
+
+protected function addReplacement
+  input DAE.ComponentRef iCr;
+  input DAE.Exp iExp;
+  input BackendVarTransform.VariableReplacements iRepl;
+  output BackendVarTransform.VariableReplacements oRepl;
+algorithm
+  oRepl := match iCr
+    local
+      DAE.Type tp;
+      BackendVarTransform.VariableReplacements repl;
+      list<DAE.ComponentRef> crefs;
+      list<DAE.Exp> arrExp;
+      DAE.Exp e;
+
+    case DAE.CREF_IDENT(identType=tp)
+      guard not Expression.isRecordType(tp) and not Expression.isArrayType(tp)
+    then BackendVarTransform.addReplacement(iRepl, iCr, iExp, NONE());
+
+    case DAE.CREF_IDENT(identType=tp)
+      guard Expression.isArrayType(tp)
+      algorithm
+        crefs := ComponentReference.expandCref(iCr, false);
+        repl := iRepl;
+        arrExp := Expression.getArrayOrRangeContents(iExp);
+        for c in crefs loop
+          e :: arrExp := arrExp;
+          repl := BackendVarTransform.addReplacement(repl, c, e, NONE());
+        end for;
+    then repl;
+   else fail();
+  end match;
+end addReplacement;
+
+protected function replaceArgs
+"finds DAE.CREF and replaces them with new exps if the cref is in the argmap"
+  input DAE.Exp inExp;
+  input Inline.ReplaceArgsTuple inTuple;
+  output DAE.Exp outExp;
+  output Inline.ReplaceArgsTuple outTuple;
+protected
+  Boolean ok;
+algorithm
+  (outExp,outTuple) := Expression.traverseExpBottomUp(inExp,Inline.replaceArgs,inTuple);
+  (_,_,ok,_) := outTuple;
+  if not ok then
+    if Flags.isSet(Flags.FAILTRACE) then
+      Debug.traceln("BackendInline.replaceArgs failed");
+    end if;
+    fail();
+  end if;
+end replaceArgs;
+
+annotation(__OpenModelica_Interface="backend");
+end BackendInline;

@@ -1,0 +1,7 @@
+[workspace]
+members = ["animation", "bindings"]
+resolver = "2"
+
+[workspace.dependencies]
+roxmltree = "=0.21.1"
+openmodelica_animation = { path = "animation" }

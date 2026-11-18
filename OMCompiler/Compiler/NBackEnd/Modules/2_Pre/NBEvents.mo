@@ -1,0 +1,2090 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NBEvents
+"file:        NBEvents.mo
+ package:     NBEvents
+ description: This file contains the functions for the event collection module.
+"
+
+public
+  import Module = NBModule;
+  import NSimGenericCall.SimIterator;
+
+protected
+  // OF imports
+  import Absyn.Path;
+
+  // NF
+  import Algorithm = NFAlgorithm;
+  import Builtin = NFBuiltin;
+  import Call = NFCall;
+  import ClockKind = NFClockKind;
+  import ComponentRef = NFComponentRef;
+  import Expression = NFExpression;
+  import ExpandExp = NFExpandExp;
+  import NFFunction.Function;
+  import Operator = NFOperator;
+  import Prefixes = NFPrefixes;
+  import SimplifyExp = NFSimplifyExp;
+  import Statement = NFStatement;
+  import Subscript = NFSubscript;
+  import Type = NFType;
+  import Variable = NFVariable;
+
+  // OB
+  import OldBackendDAE = BackendDAE;
+  import OldExpression = Expression;
+
+  // New Backend
+  import BackendDAE = NBackendDAE;
+  import BEquation = NBEquation;
+  import NBEquation.{Equation, Frame, Iterator, EqData, EquationAttributes, EquationKind, EquationPointers, IfEquationBody, WhenEquationBody};
+  import Solve = NBSolve;
+  import BVariable = NBVariable;
+  import NBVariable.{VarData, VariablePointers};
+
+  // SimCode
+  import OldSimIterator = BackendDAE.SimIterator;
+  import Block = NSimStrongComponent.Block;
+
+  // Old Simcode
+  import OldSimCode = SimCode;
+
+  // Util
+  import BackendUtil = NBBackendUtil;
+  import Config;
+  import StringUtil;
+
+// =========================================================================
+//                      MAIN ROUTINE, PLEASE DO NOT CHANGE
+// =========================================================================
+public
+  function main
+    "Wrapper function for any event collection function. This will be
+     called during simulation and gets the corresponding subfunction from
+     Config."
+    extends Module.wrapper;
+  protected
+    Module.eventsInterface func;
+  algorithm
+    func := getModule();
+
+    bdae := match bdae
+      local
+        VarData varData;
+        EqData eqData;
+        EventInfo eventInfo;
+
+      case BackendDAE.MAIN()
+        algorithm
+          (varData, eqData, eventInfo) := func(bdae.varData, bdae.eqData, bdae.eventInfo, bdae.funcMap);
+          bdae.varData := varData;
+          bdae.eqData := eqData;
+          bdae.eventInfo := eventInfo;
+        then bdae;
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+      then fail();
+    end match;
+  end main;
+
+  function getModule
+    "Returns the module function that was chosen by the user."
+    output Module.eventsInterface func;
+  protected
+    String flag = "default"; //Flags.getConfigString(Flags.ZERO_CROSSINGS)
+  algorithm
+    func := match flag
+      case "default" then (eventsDefault);
+      /* ... New detect states modules have to be added here */
+      else fail();
+    end match;
+  end getModule;
+
+// =========================================================================
+//                    TYPES, UNIONTYPES AND MEMBER FUNCTIONS
+// =========================================================================
+
+  uniontype EventInfo
+    record EVENT_INFO
+      UnorderedSet<TimeEvent> time_set                  "tracks compact time events (SINGLE or SAMPLE)";
+      UnorderedMap<Condition, CompositeEvent> time_map  "tracks full time events of the form $TEV_11 = ...";
+      UnorderedMap<Condition, StateEvent> state_map     "tracks full state events of the form $SEV_4 = ...";
+      Integer numberMathEvents                          "stores the number of math function that trigger events e.g. floor, ceil, integer, ...";
+      list<MathEvent> math_lst                          "math functions that trigger events, ordered by index";
+      list<SpatialDistribution> spatial_lst            "stores all spatial distribution calls";
+      list<tuple<Expression, list<SimIterator>>> delays "indexed delay() calls and the iterators their index depends on, each buffer gets a zero crossing";
+    end EVENT_INFO;
+
+    function toString
+      input EventInfo eventInfo;
+      output String str = "";
+    protected
+      list<TimeEvent> tev_lst;
+      list<tuple<Condition, CompositeEvent>> cev_lst;
+      list<tuple<Condition, StateEvent>> sev_lst;
+      function tplString<T1, T2>
+        input tuple<T1, T2> tpl;
+        input F1 f1;
+        input F2 f2;
+        output String str;
+      protected
+        T1 t1;
+        T2 t2;
+        partial function F1 input T1 t1; output String str; end F1;
+        partial function F2 input T2 t2; output String str; end F2;
+      algorithm
+        (t1, t2) := tpl;
+        str := f2(t2) + " = " + f1(t1);
+      end tplString;
+    algorithm
+      if not isEmpty(eventInfo) then
+        (tev_lst, cev_lst, sev_lst) := toLists(eventInfo);
+        str := StringUtil.headline_2("Event Info") + "\n";
+        str := str +  StringUtil.headline_4("Time Events") + List.toString(tev_lst, function TimeEvent.toString(printIndex = true), List.Style.NEWLINE) + "\n\n";
+        str := str +  StringUtil.headline_4("Composite Events") + List.toString(cev_lst, function tplString(f1 = Condition.toString, f2 = CompositeEvent.toString), List.Style.NEWLINE) + "\n\n";
+        str := str +  StringUtil.headline_4("State Events") + List.toString(sev_lst, function tplString(f1 = Condition.toString, f2 = StateEvent.toString), List.Style.NEWLINE) + "\n\n";
+      end if;
+    end toString;
+
+    function toLists
+      input EventInfo eventInfo;
+      output list<TimeEvent> tev_lst;
+      output list<tuple<Condition, CompositeEvent>> cev_lst;
+      output list<tuple<Condition, StateEvent>> sev_lst;
+    algorithm
+      tev_lst := List.sort(UnorderedSet.toList(eventInfo.time_set), TimeEvent.indexGt);
+      cev_lst := List.sort(UnorderedMap.toList(eventInfo.time_map), CompositeEvent.indexGt);
+      sev_lst := List.sort(UnorderedMap.toList(eventInfo.state_map), StateEvent.indexGt);
+    end toLists;
+
+    function create
+      input Bucket bucket;
+      input VariablePointers variables;
+      input Pointer<Integer> idx;
+      input list<SpatialDistribution> spatial_lst;
+      output EventInfo eventInfo;
+      output list<Pointer<Variable>> auxiliary_vars = {};
+      output list<Pointer<Equation>> auxiliary_eqns = {};
+    protected
+      Condition cond;
+      CompositeEvent cev;
+      StateEvent sev;
+    algorithm
+      // get auxiliary eqns and vars from composite events
+      for tpl in UnorderedMap.toList(bucket.time_map) loop
+        (cond, cev) := tpl;
+        (auxiliary_vars, auxiliary_eqns) := createAux(cond, cev.auxiliary, variables, idx, auxiliary_vars, auxiliary_eqns);
+      end for;
+
+      // get auxiliary eqns and vars from state events
+      for tpl in UnorderedMap.toList(bucket.state_map) loop
+        (cond, sev) := tpl;
+        (auxiliary_vars, auxiliary_eqns) := createAux(cond, sev.auxiliary, variables, idx, auxiliary_vars, auxiliary_eqns);
+      end for;
+
+      eventInfo := EVENT_INFO(
+        time_set          = bucket.time_set,
+        time_map          = bucket.time_map,
+        state_map         = bucket.state_map, // ToDo: StateEvent.updateIndices(stateEvents),
+        numberMathEvents  = bucket.math_index,
+        math_lst          = List.sort(UnorderedMap.valueList(bucket.math_map), MathEvent.indexGt),
+        spatial_lst      = spatial_lst,
+        delays            = {}
+      );
+
+      if Flags.isSet(Flags.DUMP_EVENTS) then
+        print(toString(eventInfo));
+        print(List.toStringCustom(auxiliary_eqns, function Equation.pointerToString(str = "  "), StringUtil.headline_4("Event Equations"), "", "\n", "\n\n"));
+      end if;
+    end create;
+
+    function createAux
+      input Condition cond;
+      input Pointer<Variable> aux_var;
+      input VariablePointers variables;
+      input Pointer<Integer> idx;
+      input output list<Pointer<Variable>> auxiliary_vars;
+      input output list<Pointer<Equation>> auxiliary_eqns;
+    protected
+      ComponentRef lhs_cref;
+      Pointer<Equation> aux_eqn;
+    algorithm
+      // if it has a statement index, it already has been created as a statement inside an algorithm (0 implies no index)
+      if cond.stmt_index == 0 then
+        // lower the subscripts (containing iterators)
+        lhs_cref := ComponentRef.mapSubscripts(BVariable.getVarName(aux_var), function Subscript.mapExp(
+          func = function BackendDAE.lowerComponentReferenceExp(variables = variables, complete = true)));
+        aux_eqn := Equation.makeAssignment(Expression.fromCref(lhs_cref), cond.exp, idx, "EVT", cond.iter, EquationAttributes.default(EquationKind.DISCRETE, false));
+        auxiliary_eqns := aux_eqn :: auxiliary_eqns;
+      end if;
+      // remove all subscripts from the variable name
+      BVariable.setVarName(aux_var, ComponentRef.stripSubscriptsAll(BVariable.getVarName(aux_var)));
+      auxiliary_vars := aux_var :: auxiliary_vars;
+    end createAux;
+
+    function createAuxStatements
+      input output list<Statement> new_stmts;
+      input Pointer<Bucket> bucket_ptr;
+      input VariablePointers variables;
+    protected
+      Bucket bucket = Pointer.access(bucket_ptr);
+      Statement new_stmt;
+      Condition cond;
+      ComponentRef aux;
+    algorithm
+      if isSome(bucket.aux_stmts) then
+        // add all new statements to the algorithm body
+        for tpl in Util.getOption(bucket.aux_stmts) loop
+          (cond, aux) := tpl;
+          aux               := ComponentRef.mapSubscripts(aux, function Subscript.mapExp(func =
+            function BackendDAE.lowerComponentReferenceExp(variables = variables, complete = true)));
+          new_stmt          := Statement.makeAssignment(Expression.fromCref(aux), cond.exp, ComponentRef.getSubscriptedType(aux), DAE.emptyElementSource);
+          new_stmts         := new_stmt :: new_stmts;
+        end for;
+        // remove the current statements because they have been added
+        bucket.aux_stmts   := NONE();
+        Pointer.update(bucket_ptr, bucket);
+      end if;
+    end createAuxStatements;
+
+    function empty
+      output EventInfo eventInfo;
+    algorithm
+      eventInfo := EVENT_INFO(
+        time_set          = UnorderedSet.new(TimeEvent.hash, TimeEvent.isEqual),
+        time_map          = UnorderedMap.new<CompositeEvent>(Condition.hash, Condition.isEqual),
+        state_map         = UnorderedMap.new<StateEvent>(Condition.hash, Condition.isEqual),
+        numberMathEvents  = 0,
+        math_lst          = {},
+        spatial_lst      = {},
+        delays            = {}
+      );
+    end empty;
+
+    function isEmpty
+      input EventInfo eventInfo;
+      output Boolean b;
+    algorithm
+      b := UnorderedSet.isEmpty(eventInfo.time_set) and UnorderedMap.isEmpty(eventInfo.time_map) and UnorderedMap.isEmpty(eventInfo.state_map) and eventInfo.numberMathEvents == 0;
+    end isEmpty;
+
+    function convert
+      input EventInfo eventInfo;
+      output list<OldBackendDAE.ZeroCrossing> zeroCrossings;
+      output list<OldBackendDAE.ZeroCrossing> relations     "the relations of the zero crossings, e.g. both of (a > b or c > d)";
+      output list<OldBackendDAE.TimeEvent> timeEvents;
+      output OldSimCode.SpatialDistributionInfo spatialInfo;
+      input UnorderedMap<ComponentRef, Block> equation_map;
+    protected
+      list<TimeEvent> tev_lst;
+      list<tuple<Condition, CompositeEvent>> cev_lst;
+      list<tuple<Condition, StateEvent>> sev_lst;
+      Integer math_base;
+      list<OldBackendDAE.ZeroCrossing> delay_zcs;
+    algorithm
+      // add composite at some point?
+      (tev_lst, cev_lst, sev_lst) := toLists(eventInfo);
+      // the zero crossings of math events are numbered after the ones of state events
+      math_base := sum(Condition.numRelations(Util.tuple21(sev_tpl)) for sev_tpl in sev_lst);
+      delay_zcs := delayZeroCrossings(eventInfo, math_base + listLength(eventInfo.math_lst) + 1);
+      zeroCrossings := List.flatten({list(StateEvent.convert(sev_tpl, equation_map) for sev_tpl in sev_lst),
+                                     list(MathEvent.convert(mev, math_base + i, equation_map) threaded for mev in eventInfo.math_lst, i in List.intRange(listLength(eventInfo.math_lst))),
+                                     delay_zcs});
+      relations := listAppend(List.flatten(list(StateEvent.convertRelations(sev_tpl, equation_map) for sev_tpl in sev_lst)), delay_zcs);
+      timeEvents := list(TimeEvent.convert(tev) for tev in tev_lst);
+      if listEmpty(eventInfo.spatial_lst) then
+        spatialInfo := OldSimCode.SPATIAL_DISTRIBUTION_INFO({}, 0);
+      else
+        spatialInfo := OldSimCode.SPATIAL_DISTRIBUTION_INFO(list(SpatialDistribution.convert(sd) for sd in eventInfo.spatial_lst), listLength(eventInfo.spatial_lst) - 1);
+      end if;
+    end convert;
+
+    function numZeroCrossings
+      input EventInfo eventInfo;
+      output Integer n = sum(Condition.size(cond) for cond in UnorderedMap.keyList(eventInfo.state_map))
+        + sum(MathEvent.numZeroCrossings(mev) for mev in eventInfo.math_lst) + numDelayBuffers(eventInfo);
+    end numZeroCrossings;
+
+    function numRelations
+      input EventInfo eventInfo;
+      output Integer n = sum(Condition.numRelations(cond) for cond in UnorderedMap.keyList(eventInfo.state_map)) + numDelayBuffers(eventInfo);
+    end numRelations;
+
+    function numDelayBuffers
+      input EventInfo eventInfo;
+      output Integer n = 0;
+    protected
+      Integer size;
+    algorithm
+      for delay in eventInfo.delays loop
+        (_, size) := SimIterator.flatIndex(Util.tuple22(delay));
+        n := n + size;
+      end for;
+    end numDelayBuffers;
+
+    function delayZeroCrossings
+      "$delayZeroCrossing(i, zc, delayTime) > 0 for the buffer i of each delay(), it flips the
+      sign of its own zero crossing zc when an event of the buffer reaches time - delayTime.
+      They come after all other zero crossings and relations."
+      input EventInfo eventInfo;
+      input Integer first_index "unique zero crossing index of the first one";
+      output list<OldBackendDAE.ZeroCrossing> zeroCrossings = {};
+    protected
+      Integer n = numDelayBuffers(eventInfo);
+      Integer zc_index = numZeroCrossings(eventInfo) - n;
+      Integer rel_index = numRelations(eventInfo) - n;
+      Integer i = 0, size;
+      Expression index, delayTime, slot;
+      list<SimIterator> iters;
+      DAE.Exp rel;
+    algorithm
+      for delay in eventInfo.delays loop
+        (Expression.CALL(call = Call.TYPED_CALL(arguments = {index, _, delayTime, _})), iters) := delay;
+        (slot, size) := SimIterator.flatIndex(iters, zc_index);
+        rel := DAE.RELATION(
+          DAE.CALL(Absyn.IDENT("$delayZeroCrossing"), {Expression.toDAE(index), Expression.toDAE(slot), Expression.toDAE(delayTime)}, DAE.callAttrBuiltinReal),
+          DAE.GREATER(DAE.T_REAL_DEFAULT), DAE.RCONST(0.0), rel_index, NONE());
+        zeroCrossings := OldBackendDAE.ZERO_CROSSING(first_index + i, rel, {}, if listEmpty(iters) then NONE() else SOME(list(SimIterator.convert(it) for it in iters))) :: zeroCrossings;
+        zc_index := zc_index + size;
+        rel_index := rel_index + size;
+        i := i + 1;
+      end for;
+      zeroCrossings := listReverse(zeroCrossings);
+    end delayZeroCrossings;
+
+    function mapExp
+      "applies func to the expressions of the state and math events with their iterators"
+      input output EventInfo eventInfo;
+      input MapFunc func;
+      partial function MapFunc
+        input output Expression exp;
+        input Iterator iter;
+      end MapFunc;
+    protected
+      UnorderedMap<Condition, StateEvent> state_map = UnorderedMap.new<StateEvent>(Condition.hash, Condition.isEqual);
+      Condition cond;
+      StateEvent sev;
+      list<MathEvent> math_lst = {};
+    algorithm
+      for tpl in UnorderedMap.toList(eventInfo.state_map) loop
+        (cond, sev) := tpl;
+        cond.exp := func(cond.exp, cond.iter);
+        UnorderedMap.add(cond, sev, state_map);
+      end for;
+      eventInfo.state_map := state_map;
+      for mev in eventInfo.math_lst loop
+        mev.exp := func(mev.exp, mev.iter);
+        math_lst := mev :: math_lst;
+      end for;
+      eventInfo.math_lst := listReverse(math_lst);
+    end mapExp;
+  end EventInfo;
+
+  uniontype TimeEvent
+    record SINGLE           "e.g. time > 0.5"
+      Integer index         "unique sample index";
+      Expression trigger    "single point in time that triggers it";
+      Iterator iter         "potential iterator";
+    end SINGLE;
+
+    record SAMPLE           "e.g. sample(1, 1)"
+      Integer index         "unique sample index";
+      Expression start      "first trigger point";
+      Expression interval   "equidistant intervals";
+      Iterator iter         "potential iterator";
+    end SAMPLE;
+
+    function toString
+      input TimeEvent timeEvent;
+      input Boolean printIndex = true "for hashing we want to supress index";
+      output String str;
+    protected
+      Iterator iter;
+    algorithm
+      (str, iter) := match timeEvent
+        case SINGLE() then ("time > " + Expression.toString(timeEvent.trigger), timeEvent.iter);
+        case SAMPLE() then ("sample(" + intString(timeEvent.index) + ", " + Expression.toString(timeEvent.start) + ", " + Expression.toString(timeEvent.interval) + ")", timeEvent.iter);
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+      if not Iterator.isEmpty(iter) then
+        str := str + " for {" + Iterator.toString(iter) + "}";
+      end if;
+      if printIndex then
+        str := "(" + intString(getIndex(timeEvent)) + ") " + str;
+      end if;
+    end toString;
+
+    function toStringList
+      input list<TimeEvent> events_lst;
+      output String str;
+    algorithm
+      str := StringUtil.headline_4("Time Events");
+      if listEmpty(events_lst) then
+        str := str + "\t<No Time Events>\n";
+      else
+        str := str + stringDelimitList(list(toString(te) for te in events_lst), "\n");
+      end if;
+    end toStringList;
+
+    function hash
+      input TimeEvent tev;
+      output Integer h = stringHashDjb2(toString(tev, false));
+    end hash;
+
+    function isEqual
+      input TimeEvent tev1;
+      input TimeEvent tev2;
+      output Boolean b;
+    algorithm
+      b := match (tev1, tev2)
+        case (SINGLE(), SINGLE()) then Expression.isEqual(tev1.trigger, tev2.trigger) and Iterator.isEqual(tev1.iter, tev2.iter);
+        case (SAMPLE(), SAMPLE()) then Expression.isEqual(tev1.start, tev2.start) and Expression.isEqual(tev1.interval, tev2.interval) and Iterator.isEqual(tev1.iter, tev2.iter);
+        else false;
+      end match;
+    end isEqual;
+
+    function numSlots
+      "number of sample slots, one per iteration"
+      input TimeEvent timeEvent;
+      output Integer s;
+    algorithm
+      s := match timeEvent
+        case SINGLE() then Iterator.size(timeEvent.iter);
+        case SAMPLE() then Iterator.size(timeEvent.iter);
+        else 1;
+      end match;
+    end numSlots;
+
+    function nextIndex
+      input UnorderedSet<TimeEvent> time_set;
+      output Integer index = sum(numSlots(tev) for tev in UnorderedSet.toList(time_set));
+    end nextIndex;
+
+    function eventIterator
+      "returns the iterator only if one of the expressions depends on it"
+      input Iterator iter;
+      input list<Expression> exps;
+      output Iterator event_iter = Iterator.EMPTY();
+    protected
+      list<ComponentRef> names;
+    algorithm
+      (names, _, _) := Iterator.getFrames(iter);
+      if not listEmpty(names) and List.any(exps, function Expression.contains(func = function BackendUtil.isIteratorOf(names = names))) then
+        event_iter := iter;
+      end if;
+    end eventIterator;
+
+    function callIndex
+      "the 1-based sample index for the sample call, for iterated events the
+      flattened iteration offset is added: base + ((i1-1)*n2 + (i2-1))"
+      input TimeEvent timeEvent;
+      output Expression index;
+    protected
+      Iterator iter = getIterator(timeEvent);
+      list<Subscript> subs;
+      list<Integer> sizes;
+      Expression offset = Expression.INTEGER(0);
+    algorithm
+      index := Expression.INTEGER(getIndex(timeEvent) + 1);
+      if not Iterator.isEmpty(iter) then
+        subs := Iterator.normalizedSubscripts(iter);
+        sizes := Iterator.sizes(iter);
+        for sub in subs loop
+          offset := Expression.MULTARY({offset, Expression.INTEGER(listHead(sizes))}, {}, Operator.makeMul(Type.INTEGER()));
+          offset := Expression.MULTARY({offset, Subscript.toExp(sub)}, {Expression.INTEGER(1)}, Operator.makeAdd(Type.INTEGER()));
+          sizes := listRest(sizes);
+        end for;
+        index := SimplifyExp.simplify(Expression.MULTARY({index, offset}, {}, Operator.makeAdd(Type.INTEGER())));
+      end if;
+    end callIndex;
+
+    function getIterator
+      input TimeEvent timeEvent;
+      output Iterator iter;
+    algorithm
+      iter := match timeEvent
+        case SINGLE() then timeEvent.iter;
+        case SAMPLE() then timeEvent.iter;
+        else Iterator.EMPTY();
+      end match;
+    end getIterator;
+
+    function indexGt
+      input TimeEvent tev1;
+      input TimeEvent tev2;
+      output Boolean b = getIndex(tev1) > getIndex(tev2);
+    end indexGt;
+
+    function create
+      input output Expression exp;
+      input output Bucket bucket;
+      input Iterator iter;
+      input Pointer<Equation> eqn;
+      input UnorderedMap<Path, Function> funcMap;
+      input Boolean createEqn;
+      output Boolean failed = false "returns true if time event list could not be created";
+    algorithm
+      (exp, bucket, failed) := match exp
+        local
+          Expression exp1, exp2;
+          Boolean b1, b2;
+
+        case Expression.LBINARY()
+          guard(Operator.getMathClassification(exp.operator) == NFOperator.MathClassification.LOGICAL)
+          algorithm
+            (exp1, bucket, b1) := create(exp.exp1, bucket, iter, eqn, funcMap, createEqn);
+            (exp2, bucket, b2) := create(exp.exp2, bucket, iter, eqn, funcMap, createEqn);
+            failed := (b1 or b2);
+            if not failed then
+              // we could simplify here
+              exp.exp1 := exp1;
+              exp.exp2 := exp2;
+            end if;
+        then (exp, bucket, failed);
+
+        else createSingleOrSample(exp, bucket, iter, eqn, funcMap);
+      end match;
+
+      if not failed then
+        (exp, bucket) := CompositeEvent.add(exp, iter, bucket, createEqn);
+      end if;
+    end create;
+
+    function createSingleOrSample
+      "The cases:
+      1. creates a single time event from a comparing binary expression which
+        has to only depend on time
+      2. creates a sample time event from a sample operator
+      3. fails for anything else
+      NOTE: create sample from sin and cos functions?"
+      input output Expression exp                 "has to be LBINARY() with comparing operator or a sample CALL()";
+      input output Bucket bucket                  "bucket containing the events";
+      input Iterator iter;
+      input Pointer<Equation> eqn;
+      input UnorderedMap<Path, Function> funcMap  "function map for differentiation (solve)";
+      output Boolean failed                       "true if it did not work to create a compact time event";
+    algorithm
+      (exp, failed) := match exp
+          local
+            Equation tmpEqn;
+            Solve.Status status;
+            Boolean can_trigger;
+            Solve.RelationInversion invert;
+            Call call;
+            Expression trigger, new_exp;
+            TimeEvent timeEvent;
+            Operator time_op;
+            Pointer<Boolean> containsTime = Pointer.create(false);
+
+        // check for "sample" call
+        case Expression.CALL() algorithm
+          (call, bucket, failed, _) := createSample(exp.call, bucket, iter);
+          exp.call := call;
+        then (exp, failed);
+
+        // try to extract single time event
+        case Expression.RELATION()
+          guard(Operator.getMathClassification(exp.operator) == NFOperator.MathClassification.RELATION)
+          algorithm
+            // create auxiliary equation and solve for TIME
+            tmpEqn := Pointer.access(Equation.makeAssignment(exp.exp1, exp.exp2, Pointer.create(0), NBVariable.TEMPORARY_STR, Iterator.EMPTY(), EquationAttributes.default(EquationKind.UNKNOWN, false)));
+            Equation.map(tmpEqn, function containsTimeTraverseExp(b = containsTime), SOME(function containsTimeTraverseCref(b = containsTime)));
+            if Pointer.access(containsTime) then
+              (tmpEqn, status, invert) := Solve.solveBody(tmpEqn, NFBuiltin.TIME_CREF, funcMap);
+              if status == NBSolve.Status.EXPLICIT and invert <> NBSolve.RelationInversion.UNKNOWN then
+                SOME(trigger) := Equation.getRHS(tmpEqn);
+                // only cases for RelationInversion == TRUE or FALSE can be present
+                time_op := if invert == NBSolve.RelationInversion.TRUE then Operator.invert(exp.operator) else exp.operator;
+                if Equation.isWhenEquation(eqn) then
+                  // if it is a when equation check if it can even trigger
+                  can_trigger := match time_op.op
+                    case NFOperator.Op.GREATER    then true;
+                    case NFOperator.Op.GREATEREQ  then true;
+                    else false;
+                  end match;
+                  // if it can trigger replace it by the sample call, otherwise just make the trigger false
+                  // an equal time event that already exists has to be reused with its index
+                  if can_trigger then
+                    timeEvent := getOrAdd(SINGLE(nextIndex(bucket.time_set), trigger, eventIterator(iter, {trigger})), bucket.time_set);
+                    new_exp := Expression.CALL(Call.makeTypedCall(
+                      fn          = NFBuiltinFuncs.SAMPLE,
+                      args        = {callIndex(timeEvent), trigger, Expression.makeMaxValue(Type.REAL())},
+                      variability = NFPrefixes.Variability.DISCRETE,
+                      purity      = NFPrefixes.Purity.PURE
+                    ));
+                  else
+                    new_exp := Expression.BOOLEAN(false);
+                  end if;
+                  failed := false;
+                elseif Equation.isAlgorithm(eqn) then
+                  // algorithms keep the relation (e.g. conditions of when statements)
+                  timeEvent := getOrAdd(SINGLE(nextIndex(bucket.time_set), trigger, eventIterator(iter, {trigger})), bucket.time_set);
+                  failed := false;
+                  new_exp := exp;
+                else
+                  // outside of when equations the relation has to keep its value between events, which only
+                  // the relations of state events do. A plain time comparison would change during integration.
+                  failed := true;
+                  new_exp := exp;
+                end if;
+              else
+                failed := true;
+                new_exp := exp;
+              end if;
+            else
+              failed := true;
+              new_exp := exp;
+            end if;
+        then (new_exp, failed);
+
+        else (exp, true);
+      end match;
+    end createSingleOrSample;
+
+    function createSample
+      input output Call call;
+      input output Bucket bucket;
+      input Iterator iter                 "potential iterator";
+      output Boolean failed;
+      output Boolean clocked;
+    algorithm
+      (failed, clocked) := match (AbsynUtil.pathLastIdent(Call.functionName(call)), Call.arguments(call))
+        local
+          Expression clock, start, interval;
+          TimeEvent timeEvent;
+
+        // don't create samples for clocks
+        case ("sample", {_, clock})    guard(Type.isClock(Expression.typeOf(clock))) then (false, true);
+
+        case ("sample", {start, interval}) algorithm
+          timeEvent := getOrAdd(SAMPLE(nextIndex(bucket.time_set), start, interval, eventIterator(iter, {start, interval})), bucket.time_set);
+          // add index to sample interface
+          call := Call.setArguments(call, {callIndex(timeEvent), start, interval});
+        then (false, false);
+
+        case ("sample", _) algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for sample operator: " + Call.toString(call)});
+        then fail();
+
+        // Maybe add funky sin/cos stuff here
+
+        else (true, false);
+      end match;
+    end createSample;
+
+    function createSampleTraverse
+      "used only for StateEvent traversal to encapsulate sample operators"
+      input output Expression exp         "has to be LBINARY() with comparing operator or a sample CALL()";
+      input output Bucket bucket          "bucket containing the events";
+      input Iterator iter                 "potential iterator";
+      input Pointer<Boolean> clocked      "true if its clocked and should not create an auxiliary";
+    protected
+      Boolean c;
+    algorithm
+      exp := match exp
+        local
+          Call call;
+        case Expression.CALL(call = call) algorithm
+          (call, bucket, _, c) := createSample(call, bucket, iter);
+          exp.call := call;
+          if c then Pointer.update(clocked, c); end if;
+        then exp;
+        else exp;
+      end match;
+    end createSampleTraverse;
+
+    function getOrAdd
+      "returns an equal time event if it already exists, otherwise adds and returns the new one"
+      input TimeEvent timeEvent;
+      input UnorderedSet<TimeEvent> time_set;
+      output TimeEvent result;
+    algorithm
+      result := match UnorderedSet.get(timeEvent, time_set)
+        case SOME(result) then result;
+        else algorithm
+          UnorderedSet.add(timeEvent, time_set);
+        then timeEvent;
+      end match;
+    end getOrAdd;
+
+    function getIndex
+      input TimeEvent timeEvent;
+      output Integer index;
+    algorithm
+      index := match timeEvent
+        case SINGLE() then timeEvent.index;
+        case SAMPLE() then timeEvent.index;
+      end match;
+    end getIndex;
+
+    function setIndex
+      input output TimeEvent timeEvent;
+      input Integer index;
+    algorithm
+      timeEvent := match timeEvent
+        case SINGLE() algorithm timeEvent.index := index; then timeEvent;
+        case SAMPLE() algorithm timeEvent.index := index; then timeEvent;
+        else timeEvent;
+      end match;
+    end setIndex;
+
+    function convert
+      input TimeEvent timeEvent;
+      output OldBackendDAE.TimeEvent oldTimeEvent;
+    algorithm
+      oldTimeEvent := match timeEvent
+        // treat single time events as sample time events with maximum integer as interval
+        case SINGLE() then OldBackendDAE.TimeEvent.SAMPLE_TIME_EVENT(
+          index       = timeEvent.index,
+          startExp    = Expression.toDAE(timeEvent.trigger),
+          intervalExp = Expression.toDAE(Expression.makeMaxValue(Type.REAL())),
+          iter        = convertEventIterator(timeEvent.iter));
+        case SAMPLE() then OldBackendDAE.TimeEvent.SAMPLE_TIME_EVENT(
+          index       = timeEvent.index,
+          startExp    = Expression.toDAE(timeEvent.start),
+          intervalExp = Expression.toDAE(timeEvent.interval),
+          iter        = convertEventIterator(timeEvent.iter));
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+    end convert;
+  end TimeEvent;
+
+  uniontype StateEvent
+    record STATE_EVENT
+      Integer index                         "index for simcode";
+      Pointer<Variable> auxiliary           "auxiliary variable representing the relation";
+      UnorderedSet<Pointer<Equation>> eqns  "equations where the function occurs";
+    end STATE_EVENT;
+
+    function toString
+      input StateEvent sev;
+      output String str = "(" + intString(sev.index) + ") " + BVariable.toString(Pointer.access(sev.auxiliary));
+    end toString;
+
+    function toStringList
+      input list<StateEvent> events_lst;
+      output String str;
+    algorithm
+      str := StringUtil.headline_4("State Events");
+      if listEmpty(events_lst) then
+        str := str + "\t<No State Events>\n";
+      else
+        str := str + stringDelimitList(list(toString(te) for te in events_lst), "\n");
+      end if;
+    end toStringList;
+
+    function indexGt
+      input tuple<Condition, StateEvent> tpl1;
+      input tuple<Condition, StateEvent> tpl2;
+      output Boolean b;
+    protected
+      StateEvent sev1, sev2;
+    algorithm
+      (_, sev1) := tpl1;
+      (_, sev2) := tpl2;
+      b := sev1.index > sev2.index;
+    end indexGt;
+
+    function fromStatement
+      input output Statement stmt;
+      input Pointer<Bucket> bucket_ptr;
+      input Pointer<Equation> eqn;
+      input VariablePointers variables;
+      input UnorderedMap<Path, Function> funcMap;
+      input list<Frame> frames = {};
+      input Boolean createEqn = false "create equations for the conditions instead of statements";
+    algorithm
+      stmt := match stmt
+        local
+          ComponentRef name;
+          Expression range;
+          list<Frame> new_frames;
+          Iterator iter;
+          Statement new_stmt;
+          list<Statement> new_stmts;
+
+        // don't do anything for asserts, they don't cause events
+        case Statement.ASSERT() then stmt;
+
+        case Statement.FOR(range = SOME(range)) algorithm
+          new_stmts := {};
+          name := ComponentRef.fromNode(stmt.iterator, Type.INTEGER());
+          name := BackendDAE.lowerComponentReference(name, variables);
+          new_frames := (name, range, NONE()) :: frames;
+          for elem in stmt.body loop
+            new_stmt := fromStatement(elem, bucket_ptr, eqn, variables, funcMap, new_frames, createEqn);
+            // the auxiliaries of the conditions have to be computed before the statement
+            new_stmts := EventInfo.createAuxStatements(new_stmts, bucket_ptr, variables);
+            new_stmts := new_stmt :: new_stmts;
+          end for;
+          stmt.body := listReverse(new_stmts);
+        then stmt;
+
+        else algorithm
+          iter := Iterator.fromFrames(listReverse(frames));
+          stmt := Statement.mapExp(stmt, function Expression.fakeMap(
+              func = function collectEventsTraverse(
+                bucket_ptr  = bucket_ptr,
+                iter        = iter,
+                eqn         = eqn,
+                funcMap     = funcMap,
+                createEqn   = createEqn, mathEvents = true)));
+        then stmt;
+      end match;
+    end fromStatement;
+
+    function create
+      input output Expression exp;
+      input output Bucket bucket;
+      input Iterator iter;
+      input Pointer<Equation> eqn;
+      input Boolean createEqn;
+    protected
+      Condition condition;
+      Option<StateEvent> sev_opt;
+      StateEvent sev;
+      Pointer<Variable> aux_var;
+      ComponentRef aux_cref = ComponentRef.EMPTY();
+      Pointer<Boolean> clocked = Pointer.create(false);
+    algorithm
+      // collect possible sample events from exp
+      (exp, bucket) := Expression.mapFold(exp, function TimeEvent.createSampleTraverse(iter = iter, clocked = clocked), bucket);
+
+      if createEqn then
+        // create an equation
+        condition := Condition.CONDITION(exp, iter, 0);
+      else
+        // create a statement inside algorithms
+        condition := Condition.CONDITION(exp, iter, bucket.stmt_index);
+        bucket.stmt_index := bucket.stmt_index + 1;
+      end if;
+
+      sev_opt := UnorderedMap.get(condition, bucket.state_map);
+      if isSome(sev_opt) then
+        // if the state event already exist update the equations it belongs to
+        SOME(sev) := sev_opt;
+        UnorderedSet.add(eqn, sev.eqns);
+        UnorderedMap.add(condition, sev, bucket.state_map);
+        // return the auxiliary instead of the zero crossing
+        aux_cref := BVariable.getVarName(sev.auxiliary);
+        exp := Expression.fromCref(aux_cref);
+      elseif not Pointer.access(clocked) then
+        // make a new auxiliary variable and return the expression which replaces the zero crossing
+        (aux_var, aux_cref) := BVariable.makeEventVar(NBVariable.STATE_EVENT_STR, UnorderedMap.size(bucket.state_map), Expression.typeOf(exp), iter);
+        exp := Expression.fromCref(aux_cref);
+
+        // add the new event to the map. sev.index is the BASE of a reserved, consecutive
+        // block of storedRelations[] slots: one per relation of the condition and scalar
+        // iteration (Condition.numRelations) -- not just +1 per distinct condition -- so a
+        // for-loop-wrapped relation (e.g. v_abc[i] > a for i in 1:3) gets one slot per
+        // iteration instead of every iteration colliding on the same slot (see
+        // StateEvent.convert, which reads this back out to build DAE.RELATION's
+        // optionExpisASUB), and (a > b or c > d) gets one slot per relation.
+        sev := STATE_EVENT(bucket.relation_index, aux_var, UnorderedSet.fromList({eqn}, Equation.hash, Equation.equalName));
+        condition := Condition.setRelationIndex(condition, sev.index);
+        bucket.relation_index := bucket.relation_index + Condition.numRelations(condition);
+        UnorderedMap.add(condition, sev, bucket.state_map);
+      end if;
+
+      if not (createEqn or Pointer.access(clocked)) then
+        bucket.aux_stmts := SOME((condition, aux_cref) :: Util.getOptionOrDefault(bucket.aux_stmts, {}));
+      end if;
+    end create;
+
+    function asubTuple
+      "for a SINGLE for-loop iterator with a literal-integer range (the common case, e.g.
+      1:3), builds the (iterator, istart, istep) tuple DAE.RELATION's optionExpisASUB
+      needs so CodegenCFunctions.tpl's zero-crossing template can compute a for-loop-body
+      relation's actual, per-iteration storedRelations[] slot at runtime as
+      rel.index + (iterator - istart)/istep, instead of every iteration colliding on the
+      relation's single base index (see StateEvent.create). Anything else (EMPTY, NESTED,
+      or a non-literal-integer range) is left unhandled (NONE()) -- matching the scope of
+      the analogous case in the old backend's FindZeroCrossings.mo, which likewise only
+      ever handles a single literal-integer DAE.RANGE iterator."
+      input Iterator iter;
+      output Option<tuple<DAE.Exp, Integer, Integer>> asub;
+    algorithm
+      asub := match iter
+        local
+          Expression start, step_exp;
+        case Iterator.SINGLE(range = Expression.RANGE(start = start as Expression.INTEGER(), step = SOME(step_exp as Expression.INTEGER())))
+          then SOME((Expression.toDAE(Expression.fromCref(iter.name)), start.value, step_exp.value));
+        case Iterator.SINGLE(range = Expression.RANGE(start = start as Expression.INTEGER(), step = NONE()))
+          then SOME((Expression.toDAE(Expression.fromCref(iter.name)), start.value, 1));
+        else NONE();
+      end match;
+    end asubTuple;
+
+    function convert
+      input tuple<Condition, StateEvent> sev_tpl;
+      input UnorderedMap<ComponentRef, Block> equation_map;
+      output OldBackendDAE.ZeroCrossing oldZc;
+    protected
+      Condition cond;
+      StateEvent sev;
+      Option<list<OldSimIterator>> iter;
+      list<ComponentRef> eqn_names;
+      list<Integer> eqn_indices;
+      DAE.Exp relExp;
+    algorithm
+      (cond, sev) := sev_tpl;
+      iter        := convertEventIterator(cond.iter);
+      eqn_names   := list(Equation.getEqnName(eqn) for eqn guard(not Equation.isDummy(Pointer.access(eqn))) in UnorderedSet.toList(sev.eqns));
+      eqn_indices := list(Block.getIndex(UnorderedMap.getSafe(name, equation_map, sourceInfo())) for name guard(UnorderedMap.contains(name, equation_map)) in eqn_names);
+      (relExp, _) := OldExpression.traverseExpBottomUp(Expression.toDAE(cond.exp), setRelationAsub, asubTuple(cond.iter));
+      oldZc := OldBackendDAE.ZERO_CROSSING(
+        index       = sev.index,
+        relation_   = relExp,
+        occurEquLst = eqn_indices,
+        iter        = iter
+      );
+    end convert;
+
+    function convertRelations
+      "The relations of the state event in the order of their storedRelations[] index.
+      A single relation or a condition without relations is the zero crossing itself."
+      input tuple<Condition, StateEvent> sev_tpl;
+      input UnorderedMap<ComponentRef, Block> equation_map;
+      output list<OldBackendDAE.ZeroCrossing> oldRels;
+    protected
+      Condition cond;
+      list<Expression> rels;
+      OldBackendDAE.ZeroCrossing zc;
+      DAE.Exp relExp;
+    algorithm
+      (cond, _) := sev_tpl;
+      zc := convert(sev_tpl, equation_map);
+      rels := Condition.relations(cond.exp);
+      oldRels := match (cond.exp, rels)
+        case (Expression.RELATION(), _) then {zc};
+        case (_, {}) then {zc};
+        else algorithm
+          oldRels := {};
+          for rel in rels loop
+            (relExp, _) := OldExpression.traverseExpBottomUp(Expression.toDAE(rel), setRelationAsub, asubTuple(cond.iter));
+            oldRels := OldBackendDAE.ZERO_CROSSING(
+              index       = relationIndex(rel),
+              relation_   = relExp,
+              occurEquLst = zc.occurEquLst,
+              iter        = zc.iter) :: oldRels;
+          end for;
+        then listReverse(oldRels);
+      end match;
+    end convertRelations;
+
+    function relationIndex
+      input Expression rel;
+      output Integer index;
+    algorithm
+      Expression.RELATION(index = index) := rel;
+    end relationIndex;
+
+    function setRelationAsub
+      "gives the relations with storedRelations[] slots the iterator offset of the condition"
+      input output DAE.Exp exp;
+      input output Option<tuple<DAE.Exp, Integer, Integer>> asub;
+    algorithm
+      exp := match exp
+        case DAE.RELATION() guard(exp.index >= 0) then DAE.RELATION(exp.exp1, exp.operator, exp.exp2, exp.index, asub);
+        else exp;
+      end match;
+    end setRelationAsub;
+  end StateEvent;
+
+  uniontype MathEvent
+    "A math function with discontinuities, e.g. floor(x) or mod(x, y). Like in the old backend it
+    gets the index of its mathEventsValuePre[] slots as last argument, its value only changes at
+    events and it is a zero crossing. Inside a for-equation the call gets one block of slots for
+    all iterations and the index depends on the iterators, the equation and the zero crossing
+    stay loops: index = first + slots * (flat zero based iteration index)."
+    record MATH_EVENT
+      Expression exp                        "the call with the index as last argument";
+      Iterator iter                         "iterator of the call";
+      Integer index                         "first mathEventsValuePre[] slot";
+      Integer size                          "number of iterations";
+      UnorderedSet<Pointer<Equation>> eqns  "equations where the function occurs";
+    end MATH_EVENT;
+
+    function isCandidate
+      "integer, floor and ceil with one argument, div and mod with two, that depend on a
+      continuous variable or time"
+      input Expression exp;
+      output Boolean b;
+    algorithm
+      b := match exp
+        case Expression.CALL() then
+          numSlots(exp) > 0 and (BackendUtil.containsContinuousVar(exp) or Expression.contains(exp, isTimeCref));
+        else false;
+      end match;
+    end isCandidate;
+
+    function numSlots
+      "mathEventsValuePre[] slots of the call, 0 if it is no math event. mod uses one more for
+      its internal floor."
+      input Expression exp;
+      output Integer n = 0;
+    protected
+      Integer nargs;
+      Function fn;
+      list<Expression> args;
+    algorithm
+      n := match exp
+        case Expression.CALL(call = Call.TYPED_CALL(fn = fn, arguments = args)) guard(Function.isBuiltin(fn)) algorithm
+          nargs := listLength(args);
+        then match AbsynUtil.pathLastIdent(Function.nameConsiderBuiltin(fn))
+          case "integer" guard(nargs == 1) then 1;
+          case "floor"   guard(nargs == 1) then 1;
+          case "ceil"    guard(nargs == 1) then 1;
+          case "div"     guard(nargs == 2) then 2;
+          case "mod"     guard(nargs == 2) then 3;
+          else 0;
+        end match;
+        else 0;
+      end match;
+    end numSlots;
+
+    function isTimeCref
+      input Expression exp;
+      output Boolean b;
+    algorithm
+      b := match exp
+        case Expression.CREF() then ComponentRef.isTime(exp.cref);
+        else false;
+      end match;
+    end isTimeCref;
+
+    function create
+      "returns the call with the index of an equal existing math event or a new one. Returns the
+      call unchanged if the iterator is not supported, it does not trigger events then."
+      input output Expression exp;
+      input output Bucket bucket;
+      input Iterator iter;
+      input Pointer<Equation> eqn;
+    protected
+      Condition key = Condition.CONDITION(exp, iter, 0);
+      MathEvent mev;
+      Call call;
+      Expression offset;
+      Integer size, slots;
+      Boolean supported;
+    algorithm
+      _ := match UnorderedMap.get(key, bucket.math_map)
+        case SOME(mev) algorithm
+          UnorderedSet.add(eqn, mev.eqns);
+          exp := mev.exp;
+        then ();
+        else algorithm
+          (offset, size, supported) := iterationOffset(iter);
+          // the wasm targets need a constant index, math functions in loops trigger no events there
+          supported := supported and (Iterator.isEmpty(iter) or not isWasmTarget());
+          if supported then
+            slots := numSlots(exp);
+            Expression.CALL(call = call) := exp;
+            call := Call.setArguments(call, listAppend(Call.arguments(call), {
+              SimplifyExp.simplify(Expression.MULTARY({Expression.INTEGER(bucket.math_index),
+                Expression.MULTARY({Expression.INTEGER(slots), offset}, {}, Operator.makeMul(Type.INTEGER()))}, {}, Operator.makeAdd(Type.INTEGER())))}));
+            mev := MATH_EVENT(Expression.CALL(call), iter, bucket.math_index, size, UnorderedSet.fromList({eqn}, Equation.hash, Equation.equalName));
+            UnorderedMap.add(key, mev, bucket.math_map);
+            bucket.math_index := bucket.math_index + slots * size;
+            exp := mev.exp;
+          end if;
+        then ();
+      end match;
+    end create;
+
+    function isWasmTarget
+      output Boolean b = Config.simCodeTarget() == "wasm-jit" or Config.simCodeTarget() == "wasm";
+    end isWasmTarget;
+
+    function iterationOffset
+      "zero based flat index of the current iteration and the number of iterations, the last
+      iterator is the fastest. Only for literal ranges with step 1 and without iterator maps."
+      input Iterator iter;
+      output Expression offset = Expression.INTEGER(0);
+      output Integer size = 1;
+      output Boolean supported = true;
+    protected
+      list<ComponentRef> names;
+      list<Expression> ranges;
+      list<Option<Iterator>> maps;
+      Integer start = 0, step = 1, stop = 0, n;
+    algorithm
+      (names, ranges, maps) := Iterator.getFrames(iter);
+      for tpl in List.zip3(names, ranges, maps) loop
+        supported := match tpl
+          case (_, Expression.RANGE(), NONE()) guard(Expression.isLiteral(Util.tuple32(tpl))) algorithm
+            (start, step, stop) := Expression.getIntegerRange(Util.tuple32(tpl), false);
+          then step == 1;
+          else false;
+        end match;
+        if not supported then
+          return;
+        end if;
+        n := max(stop - start + 1, 0);
+        // offset * n + (name - start)
+        offset := Expression.MULTARY({
+          Expression.MULTARY({offset, Expression.INTEGER(n)}, {}, Operator.makeMul(Type.INTEGER())),
+          Expression.fromCref(Util.tuple31(tpl)),
+          Expression.INTEGER(-start)}, {}, Operator.makeAdd(Type.INTEGER()));
+        size := size * n;
+      end for;
+    end iterationOffset;
+
+    function indexGt
+      input MathEvent mev1;
+      input MathEvent mev2;
+      output Boolean b = mev1.index > mev2.index;
+    end indexGt;
+
+    function numZeroCrossings
+      input MathEvent mev;
+      output Integer n = mev.size;
+    end numZeroCrossings;
+
+    function convert
+      input MathEvent mev;
+      input Integer index "unique zero crossing index";
+      input UnorderedMap<ComponentRef, Block> equation_map;
+      output OldBackendDAE.ZeroCrossing oldZc;
+    protected
+      list<ComponentRef> eqn_names;
+    algorithm
+      eqn_names := list(Equation.getEqnName(eqn) for eqn guard(not Equation.isDummy(Pointer.access(eqn))) in UnorderedSet.toList(mev.eqns));
+      oldZc := OldBackendDAE.ZERO_CROSSING(
+        index       = index,
+        relation_   = Expression.toDAE(mev.exp),
+        occurEquLst = list(Block.getIndex(UnorderedMap.getSafe(name, equation_map, sourceInfo())) for name guard(UnorderedMap.contains(name, equation_map)) in eqn_names),
+        iter        = convertEventIterator(mev.iter)
+      );
+    end convert;
+  end MathEvent;
+
+  uniontype CompositeEvent
+    record COMPOSITE_EVENT
+      Integer index;
+      Pointer<Variable> auxiliary;
+    end COMPOSITE_EVENT;
+
+    function toString
+      input CompositeEvent cev;
+      output String str = "(" + intString(cev.index) + ") " + BVariable.pointerToString(cev.auxiliary);
+    end toString;
+
+    function indexGt
+      input tuple<Condition, CompositeEvent> tpl1;
+      input tuple<Condition, CompositeEvent> tpl2;
+      output Boolean b;
+    protected
+      CompositeEvent cev1, cev2;
+    algorithm
+      (_, cev1) := tpl1;
+      (_, cev2) := tpl2;
+      b := cev1.index > cev2.index;
+    end indexGt;
+
+    function create
+      "Find special events of the form:  sample(t0, dt) and (f(x) > 0)
+      These events can only occur at the sample times. At that time the additional condition
+      is checked only once, no state event necessary!
+      NOTE: This does not work for SIMPLE_TIME, e.g. (time > 0.2) and (f(x) > 0)"
+      input output Expression exp;
+      input output Bucket bucket;
+      input Iterator iter;
+      input Boolean createEqn;
+      output Boolean failed = false "returns true if composite event list could not be created";
+    protected
+      list<ComponentRef> names;
+    algorithm
+      (names, _, _) := Iterator.getFrames(iter);
+      (exp, bucket, failed) := match exp
+        local
+          Expression exp1, exp2;
+          Call call;
+
+        // base case: sample is the left operand to AND
+        case Expression.LBINARY(exp1 = exp1 as Expression.CALL(call = call), operator = Operator.OPERATOR(op = NFOperator.Op.AND))
+          guard BackendUtil.isOnlyTimeDependent(exp1, names)
+          algorithm
+            (call, exp2, bucket, failed) := checkDirectComposite(call, exp.exp2, bucket, iter, createEqn);
+            if not failed then
+              exp1.call := call;
+              exp.exp1 := exp1;
+              if not referenceEq(exp2, exp.exp2) then
+                exp.exp2 := exp2;
+              end if;
+            end if;
+        then (exp, bucket, failed);
+
+        // base case: sample is the right operand to AND
+        case Expression.LBINARY(exp2 = exp2 as Expression.CALL(call = call), operator = Operator.OPERATOR(op = NFOperator.Op.AND))
+          guard BackendUtil.isOnlyTimeDependent(exp2, names)
+          algorithm
+            (call, exp1, bucket, failed) := checkDirectComposite(call, exp.exp1, bucket, iter, createEqn);
+            if not failed then
+              exp2.call := call;
+              exp.exp2 := exp2;
+              if not referenceEq(exp1, exp.exp1) then
+                exp.exp1 := exp1;
+              end if;
+            end if;
+        then (exp, bucket, failed);
+
+        // recursion: sample might be nested (all parent operators have to be AND)
+        // e.g. (sample(t0, dt) and f1(x)) and f2(x)
+        case Expression.LBINARY(operator = Operator.OPERATOR(op = NFOperator.Op.AND))
+          algorithm
+            (exp1, bucket, failed) := create(exp.exp1, bucket, iter, createEqn);
+            if not failed then
+              exp.exp1 := exp1;
+              (exp2, bucket, failed) := create(exp.exp2, bucket, iter, createEqn);
+              if not failed then
+                // TODO what if there is more than one sample()?
+                exp.exp2 := exp2;
+              end if;
+              failed := false; // we know we have a composite time event in the first half
+            else
+              (exp2, bucket, failed) := create(exp.exp2, bucket, iter, createEqn);
+              if not failed then
+                exp.exp2 := exp2;
+              end if;
+            end if;
+        then (exp, bucket, failed);
+
+        else (exp, bucket, true);
+      end match;
+
+      if not failed then
+        (exp, bucket) := add(exp, iter, bucket, createEqn);
+      end if;
+    end create;
+
+    function checkDirectComposite
+      "Checks if call is a sample call and if it is creates the appropriate events.
+      Also checks the rest exp for composite events, not sure if this is necessary."
+      input output Call call "sample call";
+      input output Expression exp;
+      input output Bucket bucket;
+      input Iterator iter;
+      input Boolean createEqn;
+      output Boolean failed;
+    protected
+      Boolean failed2;
+    algorithm
+      (call, bucket, failed, _) := TimeEvent.createSample(call, bucket, iter);
+      if not failed then
+        (exp, bucket, failed2) := create(exp, bucket, iter, createEqn);
+        if not failed2 then
+          // TODO what if there is more than one sample()? Can we simplify this?
+        end if;
+      end if;
+    end checkDirectComposite;
+
+    function add
+      input Expression cond;
+      input Iterator iter;
+      output Expression exp;
+      input output Bucket bucket;
+      input Boolean createEqn;
+    protected
+      Condition condition;
+      Option<CompositeEvent> cev_opt;
+      CompositeEvent cev;
+      Pointer<Variable> aux_var;
+      ComponentRef aux_cref;
+    algorithm
+      if createEqn then
+        // create an equation
+        condition := Condition.CONDITION(cond, iter, 0);
+      else
+        // create a statement inside algorithms
+        condition := Condition.CONDITION(cond, iter, bucket.stmt_index);
+        bucket.stmt_index := bucket.stmt_index + 1;
+      end if;
+
+      cev_opt := UnorderedMap.get(condition, bucket.time_map);
+      if isSome(cev_opt) then
+        // time event already exists, just get the identifier
+        SOME(cev) := cev_opt;
+        aux_cref := BVariable.getVarName(cev.auxiliary);
+        exp := Expression.fromCref(aux_cref);
+      else
+        // make a new auxiliary variable and return the expression which replaces the zero crossing
+        (aux_var, aux_cref) := BVariable.makeEventVar(NBVariable.TIME_EVENT_STR, UnorderedMap.size(bucket.time_map), Expression.typeOf(condition.exp), iter);
+        exp := Expression.fromCref(aux_cref);
+        // add the new event to the map
+        cev := CompositeEvent.COMPOSITE_EVENT(UnorderedMap.size(bucket.time_map), aux_var);
+        UnorderedMap.add(condition, cev, bucket.time_map);
+      end if;
+
+      if not createEqn then
+        bucket.aux_stmts := SOME((condition, aux_cref) :: Util.getOptionOrDefault(bucket.aux_stmts, {}));
+      end if;
+    end add;
+  end CompositeEvent;
+
+  uniontype Condition
+    record CONDITION
+      Expression exp;
+      Iterator iter;
+      Integer stmt_index;
+    end CONDITION;
+
+    function toString
+      input Condition cond;
+      output String str;
+    algorithm
+      str := Expression.toString(cond.exp);
+      if not Iterator.isEmpty(cond.iter) then
+        str := str + " for {" + Iterator.toString(cond.iter) + "}";
+      end if;
+      if not cond.stmt_index == 0 then
+        str := str + "(" +  intString(cond.stmt_index) + ")";
+      end if;
+    end toString;
+
+    function hash
+      input Condition cond;
+      output Integer h = stringHashDjb2(toString(cond));
+    end hash;
+
+    function isEqual
+      input Condition cond1;
+      input Condition cond2;
+      output Boolean b = Expression.isEqual(cond1.exp, cond2.exp) and Iterator.isEqual(cond1.iter, cond2.iter) and cond1.stmt_index == cond2.stmt_index;
+    end isEqual;
+
+    function size
+      input Condition cond;
+      output Integer s = Iterator.size(cond.iter);
+    end size;
+
+    function setRelationIndex
+      "Gives every relation of the condition, e.g. both of (a > b or c > d), a block of
+      storedRelations[] slots starting at index, one slot per iteration. The relations
+      then use hysteresis in the zero crossing and in the auxiliary equation."
+      input output Condition cond;
+      input Integer index;
+    algorithm
+      cond.exp := indexRelations(cond.exp, Condition.size(cond), Pointer.create(index));
+    end setRelationIndex;
+
+    function numRelations
+      "number of storedRelations[] slots of the condition. A condition without relations
+      still takes the slots of one relation."
+      input Condition cond;
+      output Integer n = Condition.size(cond) * max(1, listLength(Condition.relations(cond.exp)));
+    end numRelations;
+
+    function relations
+      "the relations of a condition in the order of their index"
+      input Expression exp;
+      output list<Expression> rels;
+    protected
+      Pointer<list<Expression>> acc = Pointer.create({});
+    algorithm
+      collectRelations(exp, acc);
+      rels := listReverse(Pointer.access(acc));
+    end relations;
+
+    function indexRelations
+      input output Expression exp;
+      input Integer size;
+      input Pointer<Integer> next;
+    algorithm
+      exp := match exp
+        case Expression.RELATION() algorithm
+          exp.index := Pointer.access(next);
+          Pointer.update(next, exp.index + size);
+        then exp;
+        // relations inside noEvent() do not cause events
+        case Expression.CALL() guard(Call.isNamed(exp.call, "noEvent")) then exp;
+        else Expression.mapShallow(exp, function indexRelations(size = size, next = next));
+      end match;
+    end indexRelations;
+
+    function collectRelations
+      "has to traverse in the same order as indexRelations"
+      input output Expression exp;
+      input Pointer<list<Expression>> acc;
+    algorithm
+      exp := match exp
+        case Expression.RELATION() algorithm
+          Pointer.update(acc, exp :: Pointer.access(acc));
+        then exp;
+        case Expression.CALL() guard(Call.isNamed(exp.call, "noEvent")) then exp;
+        else Expression.mapShallow(exp, function collectRelations(acc = acc));
+      end match;
+    end collectRelations;
+  end Condition;
+
+  function convertEventIterator
+    input Iterator iter;
+    output Option<list<OldSimIterator>> sim_iter;
+  algorithm
+    sim_iter := if Iterator.isEmpty(iter) then NONE() else SOME(list(SimIterator.convert(it) for it in SimIterator.fromIterator(iter)));
+  end convertEventIterator;
+
+  uniontype SpatialDistribution
+    record SPATIAL_DISTRIBUTION
+      Integer index                 "uniqueIndex";
+      Expression in0                "input 0";
+      Expression in1                "input 1";
+      Expression pos                "current pos";
+      Expression dir                "flow direction";
+      Expression initPnts           "initial grid points";
+      Expression initVals           "initial grid values";
+      Integer initSize              "number of initial points";
+      Option<Expression> condition  "guard condition of the enclosing if-branch, if any";
+    end SPATIAL_DISTRIBUTION;
+
+    function collect
+      input output Pointer<Equation> eqn_ptr;
+      input Option<Expression> condition;
+      input Pointer<list<SpatialDistribution>> spatial_lst;
+    protected
+      Equation eqn = Pointer.access(eqn_ptr), new_eqn;
+    algorithm
+      new_eqn := match eqn
+        // found an if-equation. capture the surrounding branch conditions
+        case Equation.IF_EQUATION() algorithm
+          eqn.body := collectIfBody(eqn.body, condition, spatial_lst);
+        then eqn;
+
+        // just collect the spatial distributions
+        else Equation.map(eqn, function collectExp(condition = condition, spatial_lst = spatial_lst), NONE(), Expression.fakeMap);
+      end match;
+
+      // update the equation if it changed
+      if not referenceEq(eqn, new_eqn) then
+        Pointer.update(eqn_ptr, new_eqn);
+      end if;
+    end collect;
+
+    function collectIfBody
+      input output IfEquationBody body;
+      input Option<Expression> condition;
+      input Pointer<list<SpatialDistribution>> spatial_lst;
+    protected
+      Expression cond_true, cond_false;
+    algorithm
+      (cond_true, cond_false) := updateCondition(condition, body.condition);
+      body.then_eqns          := list(collect(eqn, SOME(cond_true), spatial_lst)for eqn in body.then_eqns);
+      body.else_if            := Util.applyOption(body.else_if, function collectIfBody(condition = SOME(cond_false), spatial_lst = spatial_lst));
+    end collectIfBody;
+
+    function collectExp
+      input output Expression exp;
+      input Option<Expression> condition;
+      input Pointer<list<SpatialDistribution>> spatial_lst;
+    algorithm
+      exp := match exp
+        local
+          Expression cond_true, cond_false;
+          Call call;
+          list<SpatialDistribution> slst;
+          Integer index;
+          Expression in0, in1, pos, dir, initPnts, initVals;
+
+        // found an if-expression. capture the surrounding branch conditions
+        case Expression.IF() algorithm
+          (cond_true, cond_false) := updateCondition(condition, exp.condition);
+          // use fakeMap and not mapShallow to make sure the topmost expression is handled as well
+          exp.trueBranch := Expression.fakeMap(exp.trueBranch, function collectExp(condition = SOME(cond_true), spatial_lst = spatial_lst));
+          exp.falseBranch := Expression.fakeMap(exp.falseBranch, function collectExp(condition = SOME(cond_false), spatial_lst = spatial_lst));
+        then exp;
+
+        // found a spatial distribution
+        case Expression.CALL(call = call as Call.TYPED_CALL(arguments = {in0, in1, pos, dir, initPnts as Expression.ARRAY(), initVals}))
+        guard(AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)) == "spatialDistribution") algorithm
+          slst      := Pointer.access(spatial_lst);
+          index     := listLength(slst);
+          exp.call  := Call.setArguments(call, Expression.INTEGER(index) :: {in0, in1, pos, dir, initPnts, initVals});
+          Pointer.update(spatial_lst, SPATIAL_DISTRIBUTION(index, in0, in1, pos, dir, initPnts, initVals, arrayLength(initPnts.elements), condition) :: slst);
+        then exp;
+
+        // just traverse deeper
+        else Expression.mapShallow(exp, function collectExp(condition = condition, spatial_lst = spatial_lst));
+      end match;
+    end collectExp;
+
+    function updateCondition
+      "updates the condition with a new condition creating a true and a false branch condition"
+      input Option<Expression> condition;
+      input Expression new_cond;
+      output Expression cond_true;
+      output Expression cond_false;
+    protected
+      Expression cond;
+    algorithm
+      (cond_true, cond_false) := match condition
+        case SOME(cond) then (Expression.LBINARY(cond, Operator.makeAnd(Type.BOOLEAN()), new_cond),
+          Expression.LBINARY(cond, Operator.makeAnd(Type.BOOLEAN()), Expression.logicNegate(new_cond)));
+        else (new_cond, Expression.logicNegate(new_cond));
+      end match;
+    end updateCondition;
+
+    function convert
+      input SpatialDistribution sd;
+      output OldSimCode.SpatialDistribution osd;
+    algorithm
+      osd := OldSimCode.SPATIAL_DISTRIBUTION(
+        index     = sd.index,
+        in0       = Expression.toDAE(sd.in0),
+        in1       = Expression.toDAE(sd.in1),
+        pos       = Expression.toDAE(sd.pos),
+        dir       = Expression.toDAE(sd.dir),
+        initPnts  = Expression.toDAE(sd.initPnts),
+        initVals  = Expression.toDAE(sd.initVals),
+        initSize  = sd.initSize,
+        condition = if isSome(sd.condition) then SOME(Expression.toDAE(Util.getOption(sd.condition))) else NONE()
+      );
+    end convert;
+
+  end SpatialDistribution;
+
+
+// =========================================================================
+//                    PROTECTED UNIONTYPES AND FUNCTIONS
+// =========================================================================
+
+protected
+  uniontype Bucket
+    record BUCKET
+      UnorderedSet<TimeEvent> time_set                      "tracks compact time events (SINGLE or SAMPLE)";
+      UnorderedMap<Condition, CompositeEvent> time_map      "tracks full time events of the form $TEV_11 = ...";
+      UnorderedMap<Condition, StateEvent> state_map         "tracks full state events of the form $SEV_4 = ...";
+      Option<list<tuple<Condition, ComponentRef>>> aux_stmts "optional statement conditions in algorithms";
+      Integer stmt_index                                    "index to be used for unique statement auxiliaries";
+      Integer relation_index                                "next free storedRelations[] slot; unlike state_map's
+        size (one entry per distinct, possibly for-loop-wrapped condition), this is incremented by
+        Condition.size(condition) -- the condition's scalar iteration count -- so a for-loop-wrapped
+        relation (e.g. v_abc[i] > a for i in 1:3) reserves one storedRelations slot per iteration
+        instead of all iterations colliding on a single shared slot (see StateEvent.create/convert)";
+      UnorderedMap<Condition, MathEvent> math_map           "math functions that trigger events by their call without index and iterator";
+      Integer math_index                                    "next free mathEventsValuePre[] slot";
+    end BUCKET;
+  end Bucket;
+
+  function eventsDefault extends Module.eventsInterface;
+  protected
+    Bucket bucket = BUCKET(
+      time_set    = UnorderedSet.new(TimeEvent.hash, TimeEvent.isEqual),
+      time_map    = UnorderedMap.new<CompositeEvent>(Condition.hash, Condition.isEqual),
+      state_map   = UnorderedMap.new<StateEvent>(Condition.hash, Condition.isEqual),
+      aux_stmts   = NONE(),
+      stmt_index  = 1,
+      relation_index = 0,
+      math_map    = UnorderedMap.new<MathEvent>(Condition.hash, Condition.isEqual),
+      math_index  = 0);
+    Pointer<Bucket> bucket_ptr;
+    list<Pointer<Variable>> auxiliary_vars;
+    list<Pointer<Equation>> auxiliary_eqns;
+    Pointer<Integer> wc_cnt = Pointer.create(0);
+    list<Pointer<Variable>> wc_vars;
+    list<Pointer<Equation>> wc_eqns;
+    Pointer<list<SpatialDistribution>> spatial_lst = Pointer.create({});
+  algorithm
+    eventInfo := match (varData, eqData)
+      case (BVariable.VAR_DATA_SIM(), BEquation.EQ_DATA_SIM()) algorithm
+        // collect event info and replace all conditions with auxiliary variables
+        bucket_ptr := Pointer.create(bucket);
+        EquationPointers.mapPtr(eqData.simulation, function collectEvents(bucket_ptr = bucket_ptr, variables = varData.variables, funcMap = funcMap));
+        EquationPointers.mapPtr(eqData.clocked, function collectEvents(bucket_ptr = bucket_ptr, variables = varData.variables, funcMap = funcMap));
+        EquationPointers.mapPtr(eqData.removed, function collectEvents(bucket_ptr = bucket_ptr, variables = varData.variables, funcMap = funcMap));
+        // collect spatial distributions
+        EquationPointers.mapPtr(eqData.simulation, function SpatialDistribution.collect(condition = NONE(), spatial_lst = spatial_lst));
+        bucket := Pointer.access(bucket_ptr);
+
+        (eventInfo, auxiliary_vars, auxiliary_eqns) := EventInfo.create(bucket, varData.variables, eqData.uniqueIndex, Pointer.access(spatial_lst));
+
+        // after event collection, simplify any remaining complex when-equation conditions
+        // into plain discrete CREFs so that getBodyAttributes can process them.
+        // This handles boolean expressions like (not x.u) that were not turned into
+        // zero-crossings (e.g. purely discrete conditions).
+        (wc_vars, wc_eqns) := simplifyWhenConditions(eqData.simulation, eqData.uniqueIndex, wc_cnt);
+        auxiliary_vars := listAppend(wc_vars, auxiliary_vars);
+        auxiliary_eqns := listAppend(wc_eqns, auxiliary_eqns);
+        (wc_vars, wc_eqns) := simplifyWhenConditions(eqData.clocked, eqData.uniqueIndex, wc_cnt);
+        auxiliary_vars := listAppend(wc_vars, auxiliary_vars);
+        auxiliary_eqns := listAppend(wc_eqns, auxiliary_eqns);
+        // also for the removed equations, e.g. when equations that only have reinit
+        (wc_vars, wc_eqns) := simplifyWhenConditions(eqData.removed, eqData.uniqueIndex, wc_cnt);
+        auxiliary_vars := listAppend(wc_vars, auxiliary_vars);
+        auxiliary_eqns := listAppend(wc_eqns, auxiliary_eqns);
+
+        // add auxiliary variables
+        varData.variables := VariablePointers.addList(auxiliary_vars, varData.variables);
+        varData.unknowns  := VariablePointers.addList(auxiliary_vars, varData.unknowns);
+        varData.initials  := VariablePointers.addList(auxiliary_vars, varData.initials);
+        varData.discretes := VariablePointers.addList(auxiliary_vars, varData.discretes);
+
+        // add auxiliary equations
+        eqData.equations  := EquationPointers.addList(auxiliary_eqns, eqData.equations);
+        eqData.simulation := EquationPointers.addList(auxiliary_eqns, eqData.simulation);
+        eqData.initials   := EquationPointers.addList(auxiliary_eqns, eqData.initials);
+        eqData.discretes  := EquationPointers.addList(auxiliary_eqns, eqData.discretes);
+      then eventInfo;
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+      then fail();
+    end match;
+  end eventsDefault;
+
+  function collectEvents
+    "collects all events from an equation pointer."
+    input output Pointer<Equation> eqn_ptr;
+    input Pointer<Bucket> bucket_ptr;
+    input VariablePointers variables;
+    input UnorderedMap<Path, Function> funcMap;
+  protected
+    Equation eqn = Pointer.access(eqn_ptr), body_eqn;
+    Iterator iter;
+    Boolean createEqn = not Equation.isAlgorithm(eqn_ptr);
+    BEquation.MapFuncExp collector;
+    Algorithm alg;
+    list<Statement> new_stmts;
+  algorithm
+    // create the traverser function
+    iter := Equation.getForIterator(eqn);
+    collector := function collectEventsTraverse(
+          bucket_ptr  = bucket_ptr,
+          iter        = iter,
+          eqn         = eqn_ptr,
+          funcMap     = funcMap,
+          createEqn   = createEqn, mathEvents = true);
+
+    eqn := match eqn
+      case Equation.ALGORITHM(alg = alg) algorithm
+        new_stmts := {};
+        // an algorithm without outputs is not part of the simulation system,
+        // its conditions become equations of their own there
+        createEqn := listEmpty(alg.outputs);
+        for stmt in alg.statements loop
+          stmt := StateEvent.fromStatement(stmt, bucket_ptr, eqn_ptr, variables, funcMap, {}, createEqn);
+          new_stmts := EventInfo.createAuxStatements(new_stmts, bucket_ptr, variables);
+          new_stmts := stmt :: new_stmts;
+        end for;
+        // save all the new stuff in our algorithm
+        alg.statements  := listReverse(new_stmts);
+        eqn.alg         := Equation.setAlgorithmInputsOutputs(alg);
+        eqn.size        := sum(ComponentRef.size(out, true) for out in eqn.alg.outputs);
+      then eqn;
+
+      // For when equations only map the condition and not the body
+      case Equation.WHEN_EQUATION() algorithm
+        eqn.body := WhenEquationBody.mapCondition(eqn.body, collector, NONE(), Expression.fakeMap);
+      then eqn;
+
+      // Also don't do it for when equations in for-equations
+      case Equation.FOR_EQUATION(body = {body_eqn as Equation.WHEN_EQUATION()}) algorithm
+        body_eqn.body := WhenEquationBody.mapCondition(body_eqn.body, collector, NONE(), Expression.fakeMap);
+        eqn.body := {body_eqn};
+      then eqn;
+
+      // Map if equation body with this function to ensure that when equation bodies are not traversed
+      case Equation.IF_EQUATION() algorithm
+        eqn.body := IfEquationBody.mapEqnExpCref(eqn.body,
+          func        = function collectEvents(bucket_ptr = bucket_ptr, variables = variables, funcMap = funcMap),
+          funcExp     = collector,
+          funcCrefOpt = NONE(),
+          mapFunc     = Expression.fakeMap);
+      then eqn;
+
+      else Equation.map(eqn, collector, NONE(), Expression.fakeMap);
+    end match;
+
+    if not referenceEq(eqn, Pointer.access(eqn_ptr)) then
+      Pointer.update(eqn_ptr, eqn);
+    end if;
+  end collectEvents;
+
+  function collectEventsTraverse
+    "checks expressions if they are a zero crossing.
+    can be used on any expression with Exression.mapReverse
+    (reverse is necessary so the subexpressions are not traversed first)"
+    input output Expression exp;
+    input Pointer<Bucket> bucket_ptr;
+    input Iterator iter;
+    input Pointer<Equation> eqn;
+    input UnorderedMap<Path, Function> funcMap;
+    input Boolean createEqn;
+    input Boolean mathEvents = true "false inside reductions";
+  algorithm
+    exp := match exp
+      local
+        Bucket bucket;
+        ClockKind clk;
+        Expression condition, expanded;
+        Call call;
+        list<Frame> new_frames;
+        Boolean success;
+
+      // logical unarys: e.g. not a
+      // FIXME this is wrong for `not initial()`
+      case Expression.LUNARY() algorithm
+        (exp, bucket) := collectEventsCondition(exp, Pointer.access(bucket_ptr), iter, eqn, funcMap, createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+
+      // logical binarys: e.g. (a and b)
+      case Expression.LBINARY() algorithm
+        (exp, bucket) := collectEventsCondition(exp, Pointer.access(bucket_ptr), iter, eqn, funcMap, createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+
+      // relations: e.g. (a > b)
+      case Expression.RELATION() algorithm
+        (exp, bucket) := collectEventsCondition(exp, Pointer.access(bucket_ptr), iter, eqn, funcMap, createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+
+      // sample functions
+      case Expression.CALL() guard(Call.isNamed(exp.call, "sample")) algorithm
+        (exp, bucket) := collectEventsCondition(exp, Pointer.access(bucket_ptr), iter, eqn, funcMap, createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+
+      // samples in an array constructor, e.g. {sample(t0 + ts[i], p) for i in 1:n}, are expanded to have one
+      // time event each, their start can depend on the iterator
+      case Expression.CALL(call = Call.TYPED_ARRAY_CONSTRUCTOR()) guard(Expression.contains(exp, isSampleCall)) algorithm
+        (expanded, success) := ExpandExp.expand(exp);
+        if success then
+          expanded := collectEventsTraverse(expanded, bucket_ptr, iter, eqn, funcMap, createEqn, mathEvents);
+        else
+          expanded := Expression.mapShallow(exp, function collectEventsTraverse(bucket_ptr = bucket_ptr, iter = iter, eqn = eqn, funcMap = funcMap, createEqn = createEqn, mathEvents = mathEvents));
+        end if;
+      then expanded;
+
+      // event clocks
+      case Expression.CLKCONST(clk = clk as ClockKind.EVENT_CLOCK(condition = condition)) algorithm
+        clk.condition := collectEventsTraverse(condition, bucket_ptr, iter, eqn, funcMap, createEqn, mathEvents);
+        exp.clk := clk;
+      then exp;
+
+      // replace $PRE variables with auxiliaries
+      // necessary if the $PRE variable is a when condition (cannot check the pre of a pre variable)
+      case Expression.CALL(call = Call.TYPED_CALL(arguments = {Expression.CREF()})) guard(Call.isNamed(exp.call, "pre")) algorithm
+        (exp, bucket) := CompositeEvent.add(exp, iter, Pointer.access(bucket_ptr), createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+      case Expression.CREF() guard(BVariable.isPrevious(BVariable.getVarPointer(exp.cref, sourceInfo()))) algorithm
+        (exp, bucket) := CompositeEvent.add(exp, iter, Pointer.access(bucket_ptr), createEqn);
+        Pointer.update(bucket_ptr, bucket);
+      then exp;
+
+      // add the reduction iterators to the iterator used to build the condition
+      // ToDo: if they are not ranges we need to normalize them
+      case Expression.CALL(call = call as Call.TYPED_REDUCTION()) algorithm
+        new_frames := list((ComponentRef.fromNode(Util.tuple21(tpl), Type.INTEGER()), Util.tuple22(tpl), NONE()) for tpl in call.iters);
+        // the iterators of reductions are no iterators of the equation, no math events inside
+        call.exp := collectEventsTraverse(call.exp, bucket_ptr, Iterator.addFrames(iter, new_frames), eqn, funcMap, createEqn, false);
+        exp.call := call;
+      then exp;
+
+      // don't traverse noEvent() calls
+      case Expression.CALL() guard(Call.isNamed(exp.call, "noEvent")) then exp;
+
+      // don't traverse cref subscripts
+      case Expression.CREF() then exp;
+
+      // math functions that trigger events, e.g. floor(x), mod(x, y)
+      case Expression.CALL() guard(mathEvents and MathEvent.isCandidate(exp)) algorithm
+        expanded := Expression.mapShallow(exp, function collectEventsTraverse(bucket_ptr = bucket_ptr, iter = iter, eqn = eqn, funcMap = funcMap, createEqn = createEqn, mathEvents = mathEvents));
+        (expanded, bucket) := MathEvent.create(expanded, Pointer.access(bucket_ptr), iter, eqn);
+        Pointer.update(bucket_ptr, bucket);
+      then expanded;
+
+
+      else Expression.mapShallow(exp, function collectEventsTraverse(
+        bucket_ptr  = bucket_ptr,
+        iter        = iter,
+        eqn         = eqn,
+        funcMap     = funcMap,
+        createEqn   = createEqn,
+        mathEvents  = mathEvents));
+    end match;
+  end collectEventsTraverse;
+
+  function isTimeOrSample
+    input Expression exp;
+    output Boolean b = Expression.isTime(exp) or isSampleCall(exp);
+  end isTimeOrSample;
+
+  function isSampleCall
+    input Expression exp;
+    output Boolean b;
+  algorithm
+    b := match exp
+      case Expression.CALL() then Call.isNamed(exp.call, "sample");
+      else false;
+    end match;
+  end isSampleCall;
+
+  function collectEventsCondition
+    "collects an expression as a zero crossing.
+    has to be used with collectEventsTraverse to make sure that only
+    suitable expressions are checked."
+    input output Expression exp;
+    input output Bucket bucket;
+    input Iterator iter;
+    input Pointer<Equation> eqn;
+    input UnorderedMap<Path, Function> funcMap;
+    input Boolean createEqn;
+  protected
+    Boolean failed = true;
+    Expression original_exp;
+    list<ComponentRef> names;
+  algorithm
+    // iterators are only constant for time events, e.g. sample(t0[i], dt), not for conditions like i == 1
+    if Expression.contains(exp, isTimeOrSample) then
+      (names, _, _) := Iterator.getFrames(iter);
+    else
+      names := {};
+    end if;
+    // try to create time event or composite time event
+    if BackendUtil.isOnlyTimeDependent(exp, names) then
+      original_exp := exp;
+      (exp, bucket, failed) := TimeEvent.create(exp, bucket, iter, eqn, funcMap, createEqn);
+      // SINGLE time events from RELATION expressions (e.g. time > 0.5) must also register a
+      // StateEvent (zero-crossing) so that root-finding solvers like IDA can detect the
+      // discontinuity via IDARootInit.  The old backend always generated both a TimeEvent
+      // and a zero-crossing for such relations; replicate that behaviour here.
+      if not failed then
+        _ := match original_exp
+          case Expression.RELATION() algorithm
+            (_, bucket) := StateEvent.create(original_exp, bucket, iter, eqn, createEqn);
+          then ();
+          else ();
+        end match;
+      end if;
+    else
+      // state/composite events require at least one continuous real variable;
+      // skip purely discrete/integer conditions like (m == 1) with iterator m
+      if not BackendUtil.containsContinuousVar(exp) then
+        return;
+      end if;
+      (exp, bucket, failed) := CompositeEvent.create(exp, bucket, iter, createEqn);
+    end if;
+
+    // if it failed create state event
+    if failed then
+      (exp, bucket) := StateEvent.create(exp, bucket, iter, eqn, createEqn);
+    end if;
+  end collectEventsCondition;
+
+  function simplifyWhenConditions
+    "Post-processing step after event collection: any when-equation condition
+    that is not already a plain component reference (CREF) is extracted into a
+    new discrete Boolean auxiliary variable ($WC_n) with a DISCRETE assignment
+    equation.  This normalises the condition so that WhenEquationBody.getBodyAttributes
+    can always find a simple CREF, regardless of whether the original expression
+    involved zero-crossings or was a purely discrete boolean like (not x.u)."
+    input EquationPointers equations;
+    input Pointer<Integer> idx;
+    input Pointer<Integer> cnt "shared by all calls, the names of the auxiliary variables have to be unique";
+    output list<Pointer<Variable>> new_vars = {};
+    output list<Pointer<Equation>> new_eqns = {};
+  protected
+    Pointer<list<Pointer<Variable>>> vars_ptr = Pointer.create({});
+    Pointer<list<Pointer<Equation>>> eqns_ptr = Pointer.create({});
+  algorithm
+    EquationPointers.mapPtr(equations, function simplifyWhenConditionEqn(
+      idx = idx, cnt = cnt, vars_ptr = vars_ptr, eqns_ptr = eqns_ptr));
+    new_vars := Pointer.access(vars_ptr);
+    new_eqns := Pointer.access(eqns_ptr);
+  end simplifyWhenConditions;
+
+  function simplifyWhenConditionEqn
+    "Worker for simplifyWhenConditions: processes a single equation pointer."
+    input output Pointer<Equation> eqn_ptr;
+    input Pointer<Integer> idx;
+    input Pointer<Integer> cnt;
+    input Pointer<list<Pointer<Variable>>> vars_ptr;
+    input Pointer<list<Pointer<Equation>>> eqns_ptr;
+  protected
+    Equation eqn = Pointer.access(eqn_ptr);
+    Equation body_eqn;
+    Algorithm alg;
+  algorithm
+    eqn := match eqn
+      case Equation.WHEN_EQUATION() algorithm
+        eqn.body := simplifyWhenConditionBody(eqn.body, idx, cnt, vars_ptr, eqns_ptr);
+      then eqn;
+
+      case Equation.FOR_EQUATION(body = {body_eqn as Equation.WHEN_EQUATION()}) algorithm
+        body_eqn.body := simplifyWhenConditionBody(body_eqn.body, idx, cnt, vars_ptr, eqns_ptr, eqn.iter);
+        eqn.body := {body_eqn};
+      then eqn;
+
+      // when statements of algorithms need a plain condition variable for the edge detection
+      case Equation.ALGORITHM(alg = alg) algorithm
+        alg.statements := list(simplifyWhenConditionStmt(stmt, idx, cnt, vars_ptr, eqns_ptr) for stmt in alg.statements);
+        eqn.alg := Equation.setAlgorithmInputsOutputs(alg);
+      then eqn;
+
+      else eqn;
+    end match;
+
+    if not referenceEq(eqn, Pointer.access(eqn_ptr)) then
+      Pointer.update(eqn_ptr, eqn);
+    end if;
+  end simplifyWhenConditionEqn;
+
+  function simplifyWhenConditionStmt
+    "Replaces the non-CREF conditions of when statements, also the ones nested in if statements.
+    Loops are skipped, since the condition can depend on the iterator."
+    input output Statement stmt;
+    input Pointer<Integer> idx;
+    input Pointer<Integer> cnt;
+    input Pointer<list<Pointer<Variable>>> vars_ptr;
+    input Pointer<list<Pointer<Equation>>> eqns_ptr;
+  algorithm
+    stmt := match stmt
+      local
+        list<tuple<Expression, list<Statement>>> branches = {};
+        Expression cond;
+        list<Statement> body;
+
+      case Statement.WHEN() algorithm
+        for branch in stmt.branches loop
+          (cond, body) := branch;
+          cond := simplifyWhenConditionExp(cond, idx, cnt, vars_ptr, eqns_ptr);
+          branches := (cond, body) :: branches;
+        end for;
+        stmt.branches := listReverse(branches);
+      then stmt;
+
+      case Statement.IF() algorithm
+        for branch in stmt.branches loop
+          (cond, body) := branch;
+          body := list(simplifyWhenConditionStmt(s, idx, cnt, vars_ptr, eqns_ptr) for s in body);
+          branches := (cond, body) :: branches;
+        end for;
+        stmt.branches := listReverse(branches);
+      then stmt;
+
+      else stmt;
+    end match;
+  end simplifyWhenConditionStmt;
+
+  function simplifyWhenConditionBody
+    "Recursively walks a WhenEquationBody chain and extracts any non-CREF condition."
+    input output WhenEquationBody body;
+    input Pointer<Integer> idx;
+    input Pointer<Integer> cnt;
+    input Pointer<list<Pointer<Variable>>> vars_ptr;
+    input Pointer<list<Pointer<Equation>>> eqns_ptr;
+    input Iterator iter = Iterator.EMPTY() "surrounding for-loop iterator";
+  algorithm
+    body.condition := simplifyWhenConditionExp(body.condition, idx, cnt, vars_ptr, eqns_ptr, iter);
+    body.else_when := Util.applyOption(body.else_when,
+      function simplifyWhenConditionBody(idx = idx, cnt = cnt, vars_ptr = vars_ptr, eqns_ptr = eqns_ptr, iter = iter));
+  end simplifyWhenConditionBody;
+
+  function simplifyWhenConditionExp
+    "Replaces a non-CREF when-condition expression with a fresh $WC_n discrete
+    variable and records the assignment equation $WC_n = exp."
+    input output Expression cond;
+    input Pointer<Integer> idx;
+    input Pointer<Integer> cnt;
+    input Pointer<list<Pointer<Variable>>> vars_ptr;
+    input Pointer<list<Pointer<Equation>>> eqns_ptr;
+    input Iterator iter = Iterator.EMPTY() "surrounding for-loop iterator";
+  protected
+    Pointer<Variable> aux_var;
+    ComponentRef aux_cref;
+    Pointer<Equation> aux_eqn;
+    Integer i;
+    Iterator aux_iter;
+  algorithm
+    cond := match cond
+      // already a plain variable reference – nothing to do
+      case Expression.CREF() then cond;
+
+      // array of conditions (e.g. when {c1, c2} then) – recurse per element
+      case Expression.ARRAY() algorithm
+        cond.elements := Array.map(cond.elements,
+          function simplifyWhenConditionExp(idx = idx, cnt = cnt, vars_ptr = vars_ptr, eqns_ptr = eqns_ptr, iter = iter));
+      then cond;
+
+      // initial() is a special built-in allowed in when-conditions – leave it
+      case Expression.CALL() guard(Call.isNamed(cond.call, "initial")) then cond;
+
+      // any other expression: extract into $WC_n
+      else algorithm
+        i := Pointer.access(cnt);
+        Pointer.update(cnt, i + 1);
+        // a condition depending on the for-loop iterator needs one auxiliary per iteration
+        aux_iter := TimeEvent.eventIterator(iter, {cond});
+        (aux_var, aux_cref) := BVariable.makeEventVar(NBVariable.WHEN_CONDITION_STR, i,
+                                                       Expression.typeOf(cond), aux_iter);
+        aux_eqn := Equation.makeAssignment(Expression.fromCref(aux_cref), cond, idx, "WC",
+                                           aux_iter,
+                                           EquationAttributes.default(EquationKind.DISCRETE, false));
+        Pointer.update(vars_ptr, aux_var :: Pointer.access(vars_ptr));
+        Pointer.update(eqns_ptr, aux_eqn :: Pointer.access(eqns_ptr));
+        cond := Expression.fromCref(aux_cref);
+      then cond;
+    end match;
+  end simplifyWhenConditionExp;
+
+  function containsTimeTraverseExp
+    input output Expression exp;
+    input Pointer<Boolean> b;
+  algorithm
+    if not Pointer.access(b) and Expression.isTime(exp) then
+      Pointer.update(b, true);
+    end if;
+  end containsTimeTraverseExp;
+
+  function containsTimeTraverseCref
+    input output ComponentRef cref;
+    input Pointer<Boolean> b;
+  algorithm
+    if not Pointer.access(b) and ComponentRef.isTime(cref) then
+      Pointer.update(b, true);
+    end if;
+  end containsTimeTraverseCref;
+
+annotation(__OpenModelica_Interface="nbackend");
+end NBEvents;

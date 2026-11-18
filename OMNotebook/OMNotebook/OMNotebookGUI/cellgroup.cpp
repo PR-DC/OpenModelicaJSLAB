@@ -1,0 +1,589 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+/*!
+ * \file cellgroup.h
+ * \author Ingemar Axelsson and Anders Fernström
+ *
+ */
+
+
+//STD Headers
+#include <iostream>
+#include <exception>
+#include <stdexcept>
+
+//QT Headers
+#include <QtGlobal>
+#include <QtWidgets>
+#include <QTextEdit>
+
+//IAEX Headers
+#include "cellgroup.h"
+#include "cellcursor.h"
+
+
+namespace IAEX{
+
+  /*!
+   * \class CellGroup
+   * \author Ingemar Axelsson and Anders Fernström
+   *
+   *  \brief CellGroup implements the functionality to
+   *  be a Cell and contain a lot of subcells.
+   *
+   *
+   * \todo Reimplement as a composite instead. That is much much
+   * cleaner. Also look at CellWorkspace and rename CellContainer to
+   * CellDocument. CellWorkspace should dissappear.(Ingemar Axelsson)
+   *
+   * \todo Analyse class and find out what is different from the
+   * Cell class. Is it possible that cell and cellgroup should be
+   * integrated as one class?
+   * It should be easy to convert from a cell to a cellgroup. (Ingemar Axelsson)
+   */
+
+
+  /*!
+   * \author Ingemar Axelsson
+   *
+   * \brief The class constructor
+   */
+  CellGroup::CellGroup(QWidget *parent)
+    : Cell(parent),
+    closed_(false),
+    newIndex_(0)
+  {
+    setMainWidget(new QWidget(this));
+    layout_ = new QGridLayout(mainWidget());
+    layout_->setContentsMargins(0, 0, 0, 0);
+    layout_->setSpacing(0);
+
+    style_.setName( "cellgroup" );
+  }
+
+  /*!
+   * \author Ingemar Axelsson
+   *
+   * \brief The class destructor
+   */
+  CellGroup::~CellGroup()
+  {
+  }
+
+  /*!
+   * \author Ingemar Axelsson and Anders Fernström
+   * \date 2005-10-28 (update)
+   *
+   * \brief Set the cells style. If the cell is closed, set style
+   * on the first child (the cell thats displayed).
+   *
+   * 2005-10-28, changes style from QString to CellStyle /AF
+   *
+   * \param style The cell style that is to be applyed to the cell
+   */
+  void CellGroup::setStyle(CellStyle style)
+  {
+    if(closed_ && hasChilds())
+      child()->setStyle(style);
+  }
+
+  /*!
+   * \author Ingemar Axelsson and Anders Fernström
+   * \date 2005-10-28 (update)
+   *
+   * \brief Return the cells style. If the cell is closed, style
+   * is returned from the first child (the cell thats displayed).
+   * If the cell is opened this function returns a new CellStyle
+   * with the name 'cellgroup';
+   *
+   * 2005-10-28, changes style from QString to CellStyle /AF
+   *
+   * \return The cells style
+   */
+  CellStyle *CellGroup::style()
+  {
+    if(closed_ && hasChilds())
+      return child()->style();
+    else
+    {
+      return &style_;
+    }
+  }
+
+  /*!
+   * \author Anders Fernström
+   * \date 2005-11-30
+   *
+   * \brief hide() or show() the child cells of the groupcell,
+   * depending on the state of the groupcell (opened or closed).
+   * This must be done because otherwise qt layout will compress
+   * all child and display them in the smaller height set went the
+   * groupcell is closed.
+   */
+  void CellGroup::closeChildCells()
+  {
+    if( closed_ )
+    {
+      Cell *current = child();
+      if( current != 0 )
+      {
+        current = current->next();
+        while(current != 0)
+        {
+          current->hide();
+          current = current->next();
+        }
+      }
+    }
+    else
+    {
+      Cell *current = child();
+      if( current != 0 )
+      {
+        current = current->next();
+        while(current != 0)
+        {
+          current->show();
+          current = current->next();
+        }
+      }
+    }
+  }
+
+  /*!
+   * \author Ingemar Axelsson
+   */
+  bool CellGroup::isClosed() const
+  {
+    return closed_;
+  }
+
+  /*!
+   * \author Anders Fernström
+   * \date 2005-10-28
+   *
+   * \brief Function for telling if the user is allowed to change
+   * the text settings for the text inside the cell. User isn't
+   * allowed to change the text settings for cellgroups so this
+   * function always return false.
+   *
+   * \return False
+   */
+  bool CellGroup::isEditable() const
+  {
+    return false;
+  }
+
+  QTextDocument* CellGroup::document()
+  {
+    if ( isClosed() && hasChilds() )
+      return child()->document();
+
+    return nullptr;
+  }
+
+  /*!
+   * \author Anders Fernström
+   * \date 2005-08-24
+   *
+   * \brief Returns the first childs text editor, if the cell is closed. If
+   * the cell isn't closed, return 0.
+   *
+   * \return False
+   */
+  QTextEdit* CellGroup::textEdit()
+  {
+    if( isClosed() && hasChilds() )
+      return child()->textEdit();
+    else
+      return 0;
+  }
+
+  void CellGroup::cutText()
+  {
+    if (isClosed() && hasChilds())
+      child()->cutText();
+  }
+
+  void CellGroup::copyText()
+  {
+    if (isClosed() && hasChilds())
+      child()->copyText();
+  }
+
+  void CellGroup::pasteText()
+  {
+    if (isClosed() && hasChilds())
+      child()->pasteText();
+  }
+
+  bool CellGroup::findText(const QString &exp, QTextDocument::FindFlags options)
+  {
+    if (isClosed() && hasChilds()) {
+      return child()->findText(exp, options);
+    }
+
+    return false;
+  }
+
+  QTextCursor CellGroup::textCursor()
+  {
+    if (isClosed() && hasChilds()) {
+      return child()->textCursor();
+    }
+
+    return QTextCursor{};
+  }
+
+  void CellGroup::clearSelection()
+  {
+    if (isClosed() && hasChilds()) {
+      child()->clearSelection();
+    }
+  }
+
+  void CellGroup::moveCursor(QTextCursor::MoveOperation operation)
+  {
+    if (isClosed() && hasChilds()) {
+      child()->moveCursor(operation);
+    }
+  }
+
+  /*!
+   * \author Ingemar Axelsson
+   *
+   * \brief This function hides/shows the content of a groupcell.
+   *
+   * This member hides/shows the content of a cellgroup. The height of
+   * the cellgroup is calculated depending on wich case it is.
+   *
+   * \param closed tells if the cells should be visible or hidden.
+   *
+   *
+   * \todo Add some signals when this happens. It can be possible that
+   * someone will do some fun stuff when a cell is closing.(Ingemar Axelsson)
+   *
+   * \todo reimplement with removing and adding to the layout instead.(Ingemar Axelsson)
+   *
+   *
+   * \bug This function could create a segmentation fault in some
+   * special cases. Try to find them.
+   */
+  void CellGroup::setClosed(bool closed, bool update)
+  {
+    closed_ = closed;
+
+    if( hasChilds() )
+      child()->hideTreeView( closed );
+
+    treeView()->setClosed( closed );
+    setHeight( height() ); //Sends a signal
+
+
+
+    if( update )
+      emit cellOpened(this, closed_);
+  }
+
+  /*!
+   * \author Ingemar Axelsson
+   *
+   * \brief calculates the height of the cellgroup.
+   *
+   * Calculates the height of the cellgroup. The calculated height
+   * depends on the state of the group. Is the group closed then the
+   * height is just the first cell otherwise the height is a sum of
+   * the height of all cells.
+   *
+   * \returns height of cellgroup.
+   *
+   *
+   * \bug HeightVisitor does not return correct height value. I do
+   * not know why, so I implemented another way to traverse subcells
+   * and asking for heights.
+   */
+  int CellGroup::height()
+  {
+    static const int emptyGroupHeight = 20;  // pixels, bracket of an empty group
+    int height = 0;
+
+    if( closed_ && hasChilds() )
+    {
+      //Height of the first cell.
+      height = child()->height();
+    }
+    else
+    {
+      Cell *current = child();
+      int h = 0;
+      while(current != 0)
+      {
+        h += current->height();
+        current = current->next();
+      }
+
+      height = h;
+    }
+
+    // An empty group (all cells deleted) would get height 0, or only the height of the cursor
+    // while the cursor is inside it. Its bracket at the right margin would vanish. Keep a minimum
+    // height so that it is displayed like any other group.
+    bool onlyCursor = true;
+    for( Cell *c = child(); c != 0; c = c->next() )
+    {
+      if( !dynamic_cast<CellCursor *>( c ) )
+      {
+        onlyCursor = false;
+        break;
+      }
+    }
+
+    if( onlyCursor )
+      height = qMax( height, emptyGroupHeight );
+
+    return height;
+  }
+
+  /*!
+   * \author Ingemar Axelsson (and Anders Fernström)
+   * \date 2005-11-30 (update)
+   *
+   * \brief open and close the groupcell when double click on the
+   * treeview
+   *
+   * 2005-11-30 AF, added the call to 'closeChildCells()'
+   *
+   * \todo Should this be moved to treeview?(Ingemar Axelsson)
+   */
+  void CellGroup::mouseDoubleClickEvent(QMouseEvent *)
+  {
+    if( treeView()->testAttribute(Qt::WA_UnderMouse) )
+    {
+      closed_ = !closed_;
+      setClosed(closed_);
+      setSelected(false);
+      closeChildCells();
+    }
+    else
+    {
+      //Do nothing.
+    }
+  }
+
+  /*!
+   * \author Ingemar Axelsson
+   */
+  void CellGroup::adjustHeight()
+  {
+    setHeight( height() );
+  }
+
+  // ***************************************************************
+
+  void CellGroup::setFocus(bool focus)
+  {
+    if(hasChilds())
+      child()->setFocus(focus);
+  }
+
+  /*! \brief Decides if a visitor is allowed to visit the object.
+  *
+  * Traverses the structure in preorder.
+  *
+  * \todo Could the traversing order be decided in the visitor instead
+  * without to much dirt added to the code class? This is definitly not
+  * important.(Ingemar Axelsson)
+  *
+  * \todo Implement an Iterator for the cell structure. This could be
+  * nice.(Ingemar Axelsson)
+  *
+  */
+  void CellGroup::accept(Visitor &v)
+  {
+    v.visitCellGroupNodeBefore(this);
+
+    if(hasChilds())
+      child()->accept(v);
+
+    v.visitCellGroupNodeAfter(this);
+
+    if(hasNext())
+      next()->accept(v);
+  }
+
+
+  /*!
+  * \todo Try to get rid of the dependency of the doc() member. One
+  way should be to use the cursor when opening a document. Use the
+  cursors add functionality. Then this could be removed. The
+  dependency should only be in the cursor then.(Ingemar Axelsson)
+  */
+  void CellGroup::addChild(Cell *newCell)
+  {
+    newCell->setParentCell(this);
+
+    if(hasChilds())
+    {
+      Cell *previous = last();
+
+      newCell->setPrevious(previous);
+      newCell->setNext(0);
+
+      previous->setNext(newCell);
+      setLast(newCell);
+    }
+    else
+    { //First in line.
+      setChild(newCell);
+      setLast(newCell);
+      newCell->setNext(0);
+      newCell->setPrevious(0);
+    }
+
+    addCellWidget(newCell);
+  }
+
+  /*!
+  * \brief Removes a cell from a cellgroup. But does not delete the cell!
+  */
+  void CellGroup::removeChild(Cell *aCell)
+  {
+
+    //remove all widgets from parents layout.
+    Cell *par = aCell->parentCell();
+    par->removeCellWidgets();
+
+    Cell *prev = aCell->previous();
+    Cell *next = aCell->next();
+
+    if(aCell->parentCell()->child() == aCell)
+      aCell->parentCell()->setChild(aCell->next());
+
+    if(aCell->parentCell()->last() == aCell)
+      aCell->parentCell()->setLast(aCell->previous());
+
+    // Unlink the cell. The neighbours must be updated also if the removed cell was the first
+    // or the last one, otherwise they keep a pointer to the removed (and later deleted) cell.
+    if(next)
+      next->setPrevious(prev);
+
+    if(prev)
+      prev->setNext(next);
+    //Insert all widgets again.
+    par->addCellWidgets();
+  }
+
+  //Just add widget. Don't forget to repaint.
+  void CellGroup::addCellWidget(Cell *newCell)
+  {
+    newCell->setParent( mainWidget() );
+    newCell->move( QPoint(0,0) );
+    newCell->show();
+
+    connect(newCell, SIGNAL(heightChanged()),
+      this, SLOT(adjustHeight()), Qt::UniqueConnection);
+
+    removeCellWidgets();
+    addCellWidgets();
+  }
+
+  void CellGroup::removeCellWidgets()
+  {
+    Cell *current = child();
+
+    while(current != 0)
+    {
+      layout_->removeWidget(current);
+
+      current = current->next();
+    }
+  }
+
+  void CellGroup::addCellWidgets()
+  {
+    Cell *current = child();
+
+    // If only the cursor is left in the group, it is placed in the second row below an empty
+    // stretching row, i.e. at the bottom of the (minimum height) empty group.
+    bool onlyCursor = true;
+    for(Cell *c = current; c != 0; c = c->next())
+    {
+      if(!dynamic_cast<CellCursor *>(c))
+      {
+        onlyCursor = false;
+        break;
+      }
+    }
+
+    const int firstRow = (onlyCursor && current != 0) ? 1 : 0;
+    int i = firstRow;
+
+    // Rows keep their stretch factor, so reset them first (the row count never shrinks).
+    for(int r = 0; r < layout_->rowCount(); ++r)
+      layout_->setRowStretch(r, 0);
+
+    while(current != 0)
+    {
+      if(current->parentWidget() != mainWidget())
+      {
+        current->setParent( mainWidget() );
+        current->move( QPoint(0,0) );
+        current->show();
+
+        connect(current, SIGNAL(heightChanged()),
+          this, SLOT(adjustHeight()), Qt::UniqueConnection);
+      }
+
+      layout_->addWidget(current,i,0);
+      ++i;
+      current = current->next();
+    }
+
+    // Extra space (minimum height of an empty group) goes into one stretching row, so that the
+    // cursor is not centered: above the cursor if it is alone, otherwise below the cells.
+    layout_->setRowStretch(firstRow == 1 ? 0 : i, 1);
+
+    adjustHeight();
+  }
+
+  void CellGroup::viewExpression(bool) {
+  }
+
+  QString CellGroup::text() {
+    return QString();
+  }
+
+}

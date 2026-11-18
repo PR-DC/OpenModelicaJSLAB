@@ -1,0 +1,20 @@
+// name:     List2
+// keywords: Lists
+// status:   correct
+// suite: metamodelica
+//
+// List Testing
+//
+// cflags: +g=MetaModelica
+loadFile("List2.mo");getErrorString();
+setCommandLineOptions("-d=noevalfunc,gen");
+List2.func(5);
+getErrorString();
+
+// Result:
+// true
+// ""
+// true
+// 1
+// ""
+// endResult

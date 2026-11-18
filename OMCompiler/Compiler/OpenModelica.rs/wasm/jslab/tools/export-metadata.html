@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script>
+const { ipcRenderer } = require('electron');
+const path = require('path');
+const options = new URLSearchParams(location.search);
+const bundle_root = options.get('bundle');
+const { PRDC_OMJSL_CLIENT } = require(path.join(bundle_root, 'js/client'));
+var client = new PRDC_OMJSL_CLIENT(bundle_root);
+(async function() {
+  try {
+    var all = options.get('all') == '1';
+    var classes = await client.request('library-classes', { request: { parent: 'Modelica', recursive: true } });
+    var response = { success: true };
+    if(all || options.get('inventory') == '1') {
+      response.catalog = { version: 1, compiler: await client.status(), classes: {} };
+      for(const item of classes) response.catalog.classes[item.type] = item;
+    }
+    var blocks = classes.filter(function(item) { return !item.partial && ['block', 'model'].includes(item.restriction); });
+    if(all || options.get('schemas') == '1') {
+      response.schemas = {};
+      for(const item of blocks) {
+        response.schemas[item.type] = await client.request('component-schema', { request: { type: item.type } });
+        if(Object.keys(response.schemas).length % 100 == 0) ipcRenderer.send('JSLAB_MODELICA_EXPORT_PROGRESS',
+          'Properties: ' + Object.keys(response.schemas).length + '/' + blocks.length);
+      }
+      response.records = {};
+      var records = new Set(classes.filter(function(item) { return item.restriction == 'record'; }).map(item => item.type));
+      records.add('Complex');
+      Object.values(response.schemas).forEach(schema => schema.properties.forEach(property => records.add(property.type.replace(/^\./, ''))));
+      for(const type of records) {
+        response.records[type] = await client.request('component-schema', { request: { type: type, all_fields: true } });
+        if(response.records[type]) response.records[type].properties.forEach(property => records.add(property.type.replace(/^\./, '')));
+      }
+    }
+    if(all || options.get('graphics') == '1') {
+      response.graphics = {};
+      var graphical_classes = classes.filter(function(item) { return ['block', 'model'].includes(item.restriction); });
+      for(const item of graphical_classes) {
+        response.graphics[item.type] = await client.request('component-graphics', { request: { type: item.type } });
+        if(Object.keys(response.graphics).length % 100 == 0) ipcRenderer.send('JSLAB_MODELICA_EXPORT_PROGRESS',
+          'Graphics: ' + Object.keys(response.graphics).length + '/' + graphical_classes.length);
+      }
+    }
+    ipcRenderer.send('JSLAB_MODELICA_SCHEMA_EXPORT', response);
+  } catch(error) {
+    ipcRenderer.send('JSLAB_MODELICA_SCHEMA_EXPORT', { success: false, error: String(error && error.stack || error) });
+  } finally {
+    client.close();
+  }
+})();
+</script>

@@ -1,0 +1,1304 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NSimCode
+"file:        NSimCode.mo
+ package:     NSimCode
+ description: This file contains the main data type for the backend containing
+              all data. It further contains the lower and solve main function.
+"
+import SimCodeFunction;
+import AvlTreeCRToInt;
+import AvlTreePathFunction;
+import ComponentReference;
+import Flags;
+import HashTableCrefSimVar;
+import List;
+import Pointer;
+import PointerWeak;
+import UnorderedMap;
+import Util;
+import ProgramUtil;
+
+protected
+  // OF imports
+  import Absyn;
+  import AbsynUtil;
+  import DAE;
+  import HashTable;
+  import OldExpression = Expression;
+
+  // NF imports
+  import BuiltinCall = NFBuiltinCall;
+  import Call = NFCall;
+  import ComponentRef = NFComponentRef;
+  import ConvertDAE = NFConvertDAE;
+  import NFTyping.ExpOrigin;
+  import Expression = NFExpression;
+  import NFFunction.Function;
+  import NFFlatten.FunctionTree;
+  import NFInstNode.InstNode;
+  import Statement = NFStatement;
+  import Type = NFType;
+
+  // Old Backend imports
+  import OldBackendDAE = BackendDAE;
+
+  // Backend imports
+  import AliasInfo = NBStrongComponent.AliasInfo;
+  import BackendDAE = NBackendDAE;
+  import BackendUtil = NBBackendUtil;
+  import NBPartitioning.ClockedInfo;
+  import BEquation = NBEquation;
+  import NBEquation.{Equation, EquationPointer, EquationPointers, EqData, Iterator};
+  import NBEvents.EventInfo;
+  import NBInitialization;
+  import NBVariable.{VariablePointers, VarData};
+  import BVariable = NBVariable;
+  import DataReconciliation = NBDataReconciliation;
+  import Partition = NBPartition;
+  import NBResizable;
+
+  // SimCode imports
+  import SimCodeUtil = NSimCodeUtil;
+  import NSimJacobian.SimJacobian;
+  import SimGenericCall = NSimGenericCall;
+  import NSimGenericCall.SimIterator;
+  import SimPartition = NSimPartition;
+  import SimStrongComponent = NSimStrongComponent;
+  import NSimVar.{SimVar, SimVars, VarInfo, ExtObjInfo, ConvertMemo};
+
+  // Old SimCode imports
+  import HashTableCrIListArray;
+  import HashTableCrILst;
+  import HpcOmSimCode;
+  import OldSimCode = SimCode;
+  import OldSimCodeFunction = SimCodeFunction;
+  import OldSimCodeFunctionUtil = SimCodeFunctionUtil;
+  import SimCodeUtilShared;
+  import System;
+
+  // Util imports
+  import Error;
+  import StringUtil;
+
+  // Script imports
+
+public
+  uniontype SimCodeIndices
+    record SIM_CODE_INDICES
+      "Unique simulation code indices"
+      Integer uniqueIndex;
+
+      Integer realVarIndex;
+      Integer integerVarIndex;
+      Integer booleanVarIndex;
+      Integer stringVarIndex;
+      Integer enumerationVarIndex;
+
+      Integer realParamIndex;
+      Integer integerParamIndex;
+      Integer booleanParamIndex;
+      Integer stringParamIndex;
+      Integer enumerationParamIndex;
+
+      Integer realAliasIndex;
+      Integer integerAliasIndex;
+      Integer booleanAliasIndex;
+      Integer stringAliasIndex;
+      Integer enumerationAliasIndex;
+
+      Integer equationIndex;
+      Integer linearSystemIndex;
+      Integer nonlinearSystemIndex;
+
+      Integer jacobianIndex;
+      Integer residualIndex;
+      Integer implicitIndex; // this can be removed i think -> moved to solve
+      Integer extObjIndex;
+
+      UnorderedMap<AliasInfo, Integer> alias_map;
+      UnorderedMap<Identifier, Integer> generic_call_map;
+      Boolean resizable "the model has variables with resizable dimensions";
+    end SIM_CODE_INDICES;
+  end SimCodeIndices;
+
+  uniontype Identifier
+    record IDENTIFIER
+      Pointer<Equation> eqn;
+      ComponentRef var_cref;
+      Boolean resizable;
+    end IDENTIFIER;
+
+    function toString
+      input Identifier ident;
+      output String str = "cref: " + ComponentRef.toString(ident.var_cref) + "\neqn: " + Equation.pointerToString(ident.eqn) + "\n(resizable="+boolString(ident.resizable)+")";
+    end toString;
+
+    function hash
+      input Identifier ident;
+      output Integer i = stringHashDjb2(toString(ident));
+    end hash;
+
+    function isEqual
+      input Identifier ident1;
+      input Identifier ident2;
+      output Boolean b = Equation.equalName(ident1.eqn, ident2.eqn) and ComponentRef.isEqual(ident1.var_cref, ident2.var_cref);
+    end isEqual;
+  end Identifier;
+
+  function EMPTY_SIM_CODE_INDICES
+    output SimCodeIndices indices = SIM_CODE_INDICES(
+      1,
+      0,0,0,0,0,
+      0,0,0,0,0,
+      0,0,0,0,0,
+      1,0,0,
+      0,0,0,0,
+      UnorderedMap.new<Integer>(AliasInfo.hash, AliasInfo.isEqual),
+      UnorderedMap.new<Integer>(Identifier.hash, Identifier.isEqual),
+      false
+    );
+  end EMPTY_SIM_CODE_INDICES;
+
+  type DelayBuffers = tuple<Integer, list<SimIterator>> "first buffer of a delay() call and the iterators of its index";
+
+  uniontype SimCode
+    record SIM_CODE
+      ModelInfo modelInfo;
+      list<Expression> literals                         "shared literals";
+      list<SimCodeFunction.RecordDeclaration> recordDecls;
+      list<String> externalFunctionIncludes             "Names of all external functions that are called";
+      list<SimGenericCall> generic_loop_calls           "Generic for-loop and array calls";
+      list<SimStrongComponent.Block> independent        "state and strictly input dependent variables. they are not inserted into any partion";
+      list<SimStrongComponent.Block> allSim             "All simulation system blocks";
+      list<list<SimStrongComponent.Block>> ode          "Only ode blocks for integrator";
+      list<list<SimStrongComponent.Block>> algebraic    "Additional purely algebraic blocks";
+      list<SimPartition> clockedPartitions              "Clocked Partitions";
+      list<SimStrongComponent.Block> nominal            "Blocks for nominal value equations";
+      list<SimStrongComponent.Block> min                "Blocks for min value equations";
+      list<SimStrongComponent.Block> max                "Blocks for max value equations";
+      list<SimStrongComponent.Block> param              "Blocks for parameter equations";
+      list<SimStrongComponent.Block> no_ret             "Blocks for equations without return value";
+      list<SimStrongComponent.Block> algorithms         "Blocks for algorithms and asserts";
+      list<SimStrongComponent.Block> event_blocks       "Blocks for zero crossing functions";
+      list<SimStrongComponent.Block> jac_blocks         "Blocks for jacobian equations";
+      list<SimStrongComponent.Block> start              "Blocks for start value equations";
+      list<SimStrongComponent.Block> init               "Blocks for initial equations";
+      list<SimStrongComponent.Block> init_0             "Blocks for initial lambda 0 equations (homotopy)";
+      list<SimStrongComponent.Block> init_no_ret        "Blocks for initial equations without return value";
+      //list<DAE.Statement> algorithmAndEquationAsserts;
+      //list<StateSet> stateSets;
+      //list<DAE.Constraint> constraints;
+      //list<DAE.ClassAttributes> classAttributes;
+      list<ComponentRef> discreteVars                   "List of discrete variables";
+      ExtObjInfo extObjInfo;
+      OldSimCodeFunction.MakefileParams makefileParams;
+      list<tuple<Expression, list<SimIterator>>> delayedExps "indexed delay() calls and the iterators their index depends on";
+      list<SimJacobian> jacobians       "List of symbolic jacobians";
+      Option<OldSimCode.SimulationSettings> simulationSettingsOpt; // replace this with new struct
+      String fileNamePrefix;//, fullPathPrefix "Used in FMI where files are generated in a special directory";
+      //String fmuTargetName;
+      //HpcOmSimCode.HpcOmData hpcomData;
+      //AvlTreeCRToInt.Tree valueReferences "Used in FMI";
+      //maps each variable to an array of storage indices (with this information, arrays must not be unrolled) and a list for the array-dimensions
+      //if the variable is not part of an array (if it is a scalar value), then the array has size 1
+      //HashTableCrIListArray.HashTable varToArrayIndexMapping;
+      //*** a protected section *** not exported to SimCodeTV
+      //HashTableCrILst.HashTable varToIndexMapping;
+      UnorderedMap<ComponentRef, SimVar> simcode_map;
+      UnorderedMap<ComponentRef, SimStrongComponent.Block> equation_map;
+      //HashTable.HashTable crefToClockIndexHT "map variables to clock indices";
+      //Option<BackendMapping> backendMapping;
+      //FMI 2.0 data for model structure
+      //Option<FmiModelStructure> modelStructure;
+      //PartitionData partitionData;
+      EventInfo eventInfo;
+      Option<DaeModeData> daeModeData                   "Simulation system in case of DAEMode";
+    end SIM_CODE;
+
+    function toString
+      input SimCode simCode;
+      input output String str = "";
+    protected
+      Integer idx = 1;
+    algorithm
+      str := StringUtil.headline_1("SimCode " + str + "(" + simCode.fileNamePrefix + ")");
+      str := str + ModelInfo.toString(simCode.modelInfo);
+      str := str + ExtObjInfo.toString(simCode.extObjInfo);
+      if not listEmpty(simCode.init_0) then
+        str := str + SimStrongComponent.Block.listToString(simCode.init_0, "  ", "Initial Partition (Lambda = 0)") + "\n";
+      end if;
+      str := str + SimStrongComponent.Block.listToString(simCode.init, "  ", "Initial Partition") + "\n";
+      for blck_lst in simCode.ode loop
+        str := str + SimStrongComponent.Block.listToString(blck_lst, "  ", "ODE Partition " + intString(idx)) + "\n";
+        idx := idx + 1;
+      end for;
+      idx := 1;
+      for blck_lst in simCode.algebraic loop
+        str := str + SimStrongComponent.Block.listToString(blck_lst, "  ", "Algebraic Partition " + intString(idx)) + "\n";
+        idx := idx + 1;
+      end for;
+      str := str + SimStrongComponent.Block.listToString(simCode.event_blocks, "  ", "Event Partition") + "\n";
+      if not listEmpty(simCode.clockedPartitions) then
+        str := str + SimPartition.listToString(simCode.clockedPartitions, "  ", "Clocked Partitions") + "\n";
+      end if;
+      if not listEmpty(simCode.literals) then
+        str := str + StringUtil.headline_3("Shared Literals");
+        str := str + List.toString(simCode.literals, Expression.toString, List.Style.NEWLINE_INDENT) + "\n\n";
+      end if;
+      if not listEmpty(simCode.generic_loop_calls) then
+        str := str + StringUtil.headline_3("Generic Calls");
+        str := str + List.toString(simCode.generic_loop_calls, SimGenericCall.toString,  List.Style.NEWLINE_INDENT) + "\n\n";
+      end if;
+      if isSome(simCode.daeModeData) then
+        str := str + DaeModeData.toString(Util.getOption(simCode.daeModeData)) + "\n";
+      end if;
+      for jac in simCode.jacobians loop
+        str := str + SimJacobian.toString(jac);
+      end for;
+      str := str + EventInfo.toString(simCode.eventInfo);
+      //str := str + SimStrongComponent.Block.listToString(simCode.no_ret, "  ", "REMOVED / ALIAS / KNOWN") + "\n";
+    end toString;
+
+    function create
+      input BackendDAE bdae_in;
+      input Absyn.Path name;
+      input String fileNamePrefix;
+      input Option<OldSimCode.SimulationSettings> simSettingsOpt;
+      input Absyn.Program program "the instantiated program; passed in by the caller (e.g. from SymbolTable.getAbsyn) so NSimCode does not depend on the old backend's SymbolTable";
+      output SimCode simCode;
+      output AvlTreePathFunction.Tree oldFunctionTree;
+    protected
+      partial function mapExp
+        input output Expression exp;
+      end mapExp;
+      BackendDAE bdae = bdae_in;
+    algorithm
+      // derived dimensions of resizable arrays (N-1) get a size parameter each
+      if Flags.getConfigBool(Flags.RESIZABLE_ARRAYS) and not Flags.getConfigBool(Flags.SIM_CODE_SCALARIZE) then
+        bdae := match bdae
+          local
+            BackendDAE b;
+          case b as BackendDAE.MAIN() algorithm
+            b.varData := NBResizable.addDimensionParameters(b.varData);
+          then b;
+          else bdae;
+        end match;
+      end if;
+
+      simCode := match bdae
+        local
+          // auxillaries
+          VarData varData;
+          EqData eqData;
+          UnorderedMap<Absyn.Path, Function> funcMap;
+          VariablePointers residual_vars;
+          SimVars vars;
+          // old SimCode strcutures
+          list<String> libs, includeDirs, libPaths;
+          String directory, fileName;
+          OldSimCodeFunction.MakefileParams makefileParams;
+          list<OldSimCodeFunction.Function> functions;
+          list<OldSimCodeFunction.RecordDeclaration> recordDecls;
+          // New SimCode structures
+          ModelInfo modelInfo;
+          SimCodeIndices simCodeIndices;
+          UnorderedMap<Expression, Integer> literals_map = UnorderedMap.new<Integer>(Expression.hash, Expression.isEqual);
+          list<SimPartition> clockedPartitions;
+          Pointer<Integer> literals_idx;
+          list<Expression> literals;
+          list<String> externalFunctionIncludes;
+          list<SimGenericCall> generic_loop_calls;
+          list<SimStrongComponent.Block> independent, allSim = {}, nominal, min, max, param, no_ret, event_clocks, algorithms;
+          list<SimStrongComponent.Block> event_blocks = {}, jac_blocks;
+          list<SimStrongComponent.Block> init, init_0, init_no_ret, start;
+          list<list<SimStrongComponent.Block>> ode, algebraic;
+          list<SimStrongComponent.Block> linearLoops, nonlinearLoops;
+          list<ComponentRef> discreteVars;
+          ExtObjInfo extObjInfo;
+          list<SimJacobian> jacobians;
+          UnorderedMap<ComponentRef, SimVar> simcode_map;
+          UnorderedMap<ComponentRef, SimStrongComponent.Block> equation_map;
+          Option<DaeModeData> daeModeData;
+          SimJacobian jacA, jacB, jacC, jacD, jacF, jacH, jacAdjoint, jacLfg, jacMrf, jacR0;
+          mapExp collect_literals, index_delays;
+          UnorderedMap<Expression, DelayBuffers> delay_map = UnorderedMap.new<DelayBuffers>(Expression.hash, Expression.isEqual);
+          Pointer<Integer> delay_size = Pointer.create(0);
+          list<tuple<Expression, list<SimIterator>>> delayedExps;
+          EventInfo eventInfo;
+        case BackendDAE.MAIN(varData = varData as BVariable.VAR_DATA_SIM(), eqData = eqData as BEquation.EQ_DATA_SIM())
+          algorithm
+            // somehow this cannot be set at definition (metamodelica bug?)
+            simCodeIndices := EMPTY_SIM_CODE_INDICES();
+            simCodeIndices.resizable := varData.resizable;
+            funcMap := BackendDAE.getFunctionMap(bdae);
+
+            // get and replace all literals in functions
+            // Not a default on the declaration above: the bootstrap compiler
+            // does not record a package dependency for a call that only appears
+            // in a local's default, and this is NSimCode's sole use of Pointer,
+            // so the generated C would lose its #include.
+            literals_idx := Pointer.create(0);
+            collect_literals := function Expression.fakeMap(func = function Expression.replaceLiteral(map = literals_map, idx_ptr = literals_idx));
+            UnorderedMap.apply(funcMap, function Function.mapExp(mapFn = collect_literals, mapFnFields = collect_literals, mapParameters = true, mapBody = true));
+
+            // create sim vars before everything else
+            residual_vars                       := BackendDAE.getLoopResiduals(bdae);
+            (vars, simCodeIndices)              := SimVars.create(varData, residual_vars, simCodeIndices);
+            vars                                := SimVars.addDataReconciliation(vars, bdae.dataReconciliation);
+            (extObjInfo, vars, simCodeIndices)  := ExtObjInfo.create(varData.external_objects, vars, simCodeIndices);
+            simcode_map                         := SimCodeUtil.createSimCodeMap(vars, extObjInfo);
+
+            // create empty equation map and fill while creating the blocks
+            equation_map := UnorderedMap.new<SimStrongComponent.Block>(ComponentRef.hash, ComponentRef.isEqual);
+
+            independent := {};
+            nominal := {};
+            min := {};
+            max := {};
+            param := {};
+            algorithms := {};
+
+            // init before everything else!
+            (init, simCodeIndices) := SimStrongComponent.Block.createInitialBlocks(bdae.init, simCodeIndices, simcode_map, equation_map);
+            if isSome(bdae.init_0) then
+              (init_0, simCodeIndices) := SimStrongComponent.Block.createInitialBlocks(Util.getOption(bdae.init_0), simCodeIndices, simcode_map, equation_map);
+            else
+              init_0 := {};
+            end if;
+            (init_no_ret, simCodeIndices) := SimStrongComponent.Block.createNoReturnBlocks(NBInitialization.getNoReturnEquations(eqData.initials), simCodeIndices, NBPartition.Kind.INI, simcode_map, equation_map);
+
+            // start allSim with no return equations
+            (no_ret, simCodeIndices) := SimStrongComponent.Block.createNoReturnBlocks(eqData.removed, simCodeIndices, NBPartition.Kind.ODE, simcode_map, equation_map);
+            start := {};
+            discreteVars := {};
+            jacobians := {};
+
+            if isSome(bdae.dae) then
+              // DAEMode
+              ode := {};
+              algebraic := {};
+              (daeModeData, simCodeIndices) := DaeModeData.create(Util.getOption(bdae.dae), simCodeIndices, simcode_map, equation_map);
+            else
+              // Normal Simulation
+              daeModeData := NONE();
+              (ode, allSim, simCodeIndices)                     := SimStrongComponent.Block.createBlocks(bdae.ode, allSim, simCodeIndices, simcode_map, equation_map);
+              (algebraic, allSim, simCodeIndices)               := SimStrongComponent.Block.createBlocks(bdae.algebraic, allSim, simCodeIndices, simcode_map, equation_map);
+              (ode, allSim, event_blocks, simCodeIndices)       := SimStrongComponent.Block.createDiscreteBlocks(bdae.ode_event, ode, allSim, event_blocks, simCodeIndices, simcode_map, equation_map);
+              (algebraic, allSim, event_blocks, simCodeIndices) := SimStrongComponent.Block.createDiscreteBlocks(bdae.alg_event, algebraic, allSim, event_blocks, simCodeIndices, simcode_map, equation_map);
+            end if;
+
+            // create clocked partitions
+            (clockedPartitions, event_clocks, simCodeIndices) := SimStrongComponent.Block.createClockedBlocks(bdae.clocked, simCodeIndices, simcode_map, equation_map, bdae.clockedInfo);
+
+            // add no return equations (without clocks) to algebraics
+            if not listEmpty(no_ret) then
+              algebraic := listReverse(no_ret :: listReverse(algebraic));
+            end if;
+
+            // append event_clocks to no_return after adding them to algebraic
+            no_ret := listAppend(event_clocks, no_ret);
+
+            if not listEmpty(no_ret) then
+              // append them to the end, compiler won't let me do it unless i double reverse the lists
+              allSim    := listReverse(listAppend(no_ret, listReverse(allSim)));
+            end if;
+            // add all entwined equations to all sim
+            allSim := listAppend(List.flatten(list(SimStrongComponent.Block.collectEntwinedEquations(blck) for blck in allSim)), allSim);
+
+            // ToDo add event system
+
+            // ToDo:
+            // this has to be adapted at some point SimCodeFuntion needs to be translated
+            // to new simcode and literals have to be based on new Expressions.
+            // Will probably be mostly the same in all other regards
+            directory := ProgramUtil.getFileDir(AbsynUtil.pathToCref(name), program);
+            // The OB function tree is needed both here and when dumping the flat model,
+            // but converting it is destructive so return it to avoid doing it again.
+            oldFunctionTree := ConvertDAE.convertFunctionTree(FunctionTree.fromList(list(tpl for tpl guard(not hasExternalObjectArrayField(Util.tuple22(tpl))) in UnorderedMap.toList(funcMap))));
+            (libs, libPaths, externalFunctionIncludes, includeDirs, recordDecls, functions, _) := SimCodeUtilShared.createFunctions(program, oldFunctionTree);
+            makefileParams  := OldSimCodeFunctionUtil.createMakefileParams(includeDirs, libs, libPaths, false, false);
+            fileName        := System.basename(AbsynUtil.classFilename(ProgramUtil.getPathedClassInProgram(name, program)));
+
+            // min, max and nominal attributes that have to be evaluated after the parameters, they come
+            // before the parameters in the info file, so they need indices in that order
+            (min, max, nominal, simCodeIndices) := SimStrongComponent.Block.createAttributeBlocks(
+              {varData.states, varData.algebraics, varData.discretes, varData.discrete_states}, simCodeIndices, simcode_map, bdae.parameters);
+
+            // the bindings of the primary parameters are solved before the initialization, they come after the
+            // equations and before the Jacobians in the info file, so they need indices in that order
+            (param, simCodeIndices) := SimStrongComponent.Block.createParameterBlocks(bdae.parameters, simCodeIndices, simcode_map, equation_map);
+
+            (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := collectAlgebraicLoops(init, init_0, ode, algebraic, daeModeData, simCodeIndices, simcode_map);
+
+            if isSome(daeModeData) then
+              (jacA, jacAdjoint, simCodeIndices) := SimJacobian.createSimulationJacobian(Util.getOption(bdae.dae), simCodeIndices, simcode_map);
+              // should jacAdjoint be added aswell? -> for now no
+              daeModeData := DaeModeData.addJacobian(daeModeData, jacA);
+            else
+              (jacA, jacAdjoint, simCodeIndices) := SimJacobian.createSimulationJacobian(listAppend(bdae.ode, bdae.ode_event), simCodeIndices, simcode_map);
+            end if;
+
+            (jacB, simCodeIndices) := SimJacobian.empty("B", simCodeIndices);
+            (jacC, simCodeIndices) := SimJacobian.empty("C", simCodeIndices);
+            (jacD, simCodeIndices) := SimJacobian.empty("D", simCodeIndices);
+            (jacF, simCodeIndices) := SimJacobian.createDataReconciliationJacobian(bdae.dataReconciliation, simCodeIndices, simcode_map);
+            (jacH, simCodeIndices) := SimJacobian.empty("H", simCodeIndices);
+
+            (jacLfg, jacMrf, jacR0, simCodeIndices) := SimJacobian.createOptimizationJacobian(listAppend(bdae.ode, bdae.ode_event), simCodeIndices, simcode_map);
+
+            //jacobians := jacA :: jacB :: jacC :: jacD :: jacF :: jacH :: jacAdjoint :: jacobians;
+            jacobians := listReverse(jacR0 :: jacMrf :: jacLfg :: jacAdjoint :: jacH :: jacF :: jacD :: jacC :: jacB :: jacA :: jacobians);
+
+            // jacobian blocks only from simulation jacobians
+            jac_blocks := SimJacobian.getJacobiansBlocks({jacA, jacB, jacC, jacD, jacF, jacH, jacAdjoint, jacLfg, jacMrf, jacR0});
+            // (jac_blocks, simCodeIndices) := SimStrongComponent.Block.fixIndices(jac_blocks, {}, simCodeIndices);
+
+            (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := SimStrongComponent.Block.collectAlgebraicLoopsSingle(jac_blocks, linearLoops, nonlinearLoops, jacobians, simCodeIndices, simcode_map);
+
+            for jac in jacobians loop
+              if isSome(jac.jac_map) then
+                vars := SimVars.addSeedAndJacobianVars(vars, UnorderedMap.toList(Util.getOption(jac.jac_map)));
+                for var in UnorderedMap.valueList(Util.getOption(jac.jac_map)) loop
+                  UnorderedMap.tryAdd(var.name, var, simcode_map);
+                end for;
+              end if;
+            end for;
+
+            generic_loop_calls  := list(SimGenericCall.fromIdentifier(tpl) for tpl in UnorderedMap.toList(simCodeIndices.generic_call_map));
+
+            // number the delay() calls, equal calls share one buffer
+            index_delays        := function indexDelays(map = delay_map, size = delay_size, iters = {});
+            generic_loop_calls  := list(indexDelaysCall(call, delay_map, delay_size) for call in generic_loop_calls);
+            jacobians           := list(SimJacobian.mapGenericCalls(jac, function indexDelaysCall(map = delay_map, size = delay_size)) for jac in jacobians);
+            jacobians           := list(SimJacobian.mapExp(jac, index_delays) for jac in jacobians);
+            independent         := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in independent);
+            allSim              := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in allSim);
+            ode                 := list(list(indexDelaysBlock(blck, delay_map, delay_size) for blck in lst) for lst in ode);
+            algebraic           := list(list(indexDelaysBlock(blck, delay_map, delay_size) for blck in lst) for lst in algebraic);
+            clockedPartitions   := list(SimPartition.mapShallow(part, index_delays) for part in clockedPartitions);
+            no_ret              := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in no_ret);
+            algorithms          := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in algorithms);
+            event_blocks        := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in event_blocks);
+            jac_blocks          := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in jac_blocks);
+            init                := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in init);
+            init_0              := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in init_0);
+            init_no_ret         := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in init_no_ret);
+            linearLoops         := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in linearLoops);
+            nonlinearLoops      := list(indexDelaysBlock(blck, delay_map, delay_size) for blck in nonlinearLoops);
+            daeModeData         := Util.applyOption(daeModeData, function DaeModeData.mapShallow(func = index_delays));
+            eventInfo           := EventInfo.mapExp(bdae.eventInfo, function indexDelaysIter(map = delay_map, size = delay_size));
+            delayedExps         := list((indexDelay(Util.tuple21(tpl), delay_map, delay_size, Util.tuple22(Util.tuple22(tpl))), Util.tuple22(Util.tuple22(tpl))) for tpl in UnorderedMap.toList(delay_map));
+            eventInfo.delays    := delayedExps;
+
+            // replace literal expressions
+            generic_loop_calls  := list(SimGenericCall.mapShallow(call, collect_literals) for call in generic_loop_calls);
+            jacobians           := list(SimJacobian.mapExp(jac, collect_literals) for jac in jacobians);
+            independent         := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in independent);
+            allSim              := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in allSim);
+            ode                 := list(list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in lst) for lst in ode);
+            algebraic           := list(list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in lst) for lst in algebraic);
+            clockedPartitions   := list(SimPartition.mapShallow(part, collect_literals) for part in clockedPartitions);
+            nominal             := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in nominal);
+            min                 := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in min);
+            max                 := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in max);
+            param               := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in param);
+            no_ret              := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in no_ret);
+            algorithms          := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in algorithms);
+            event_blocks        := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in event_blocks);
+            jac_blocks          := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in jac_blocks);
+            start               := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in start);
+            init                := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in init);
+            init_0              := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in init_0);
+            init_no_ret         := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in init_no_ret);
+            linearLoops         := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in linearLoops);
+            nonlinearLoops      := list(SimStrongComponent.Block.mapShallow(blck, collect_literals) for blck in nonlinearLoops);
+            daeModeData         := Util.applyOption(daeModeData, function DaeModeData.mapShallow(func = collect_literals));
+            literals            := UnorderedMap.keyList(literals_map);
+
+            (modelInfo, simCodeIndices) := ModelInfo.create(vars, name, fileName, directory, functions, linearLoops, nonlinearLoops, eventInfo, bdae.clockedInfo,
+              List.sort(program.classes, AbsynUtil.classNameGreater), simCodeIndices);
+            modelInfo := ModelInfo.setRelatedBoundaryConditions(modelInfo, bdae.dataReconciliation);
+
+            simCode := SIM_CODE(
+              modelInfo                 = modelInfo,
+              literals                  = literals,
+              recordDecls               = recordDecls,
+              externalFunctionIncludes  = externalFunctionIncludes,
+              generic_loop_calls        = generic_loop_calls,
+              independent               = independent,
+              allSim                    = allSim,
+              ode                       = ode,
+              algebraic                 = algebraic,
+              clockedPartitions         = clockedPartitions,
+              nominal                   = nominal,
+              min                       = min,
+              max                       = max,
+              param                     = param,
+              no_ret                    = no_ret,
+              algorithms                = algorithms,
+              event_blocks              = event_blocks,
+              jac_blocks                = jac_blocks,
+              start                     = start,
+              init                      = init,
+              init_0                    = init_0,
+              init_no_ret               = init_no_ret,
+              discreteVars              = discreteVars,
+              extObjInfo                = extObjInfo,
+              makefileParams            = makefileParams,
+              delayedExps               = delayedExps,
+              jacobians                 = jacobians,
+              simulationSettingsOpt     = simSettingsOpt,
+              fileNamePrefix            = fileNamePrefix,
+              simcode_map               = simcode_map,
+              equation_map              = equation_map,
+              eventInfo                 = eventInfo,
+              daeModeData               = daeModeData
+            );
+        then simCode;
+
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+    end create;
+
+    function convert
+      input SimCode simCode;
+      output OldSimCode.SimCode oldSimCode;
+    protected
+      OldSimCode.ModelInfo modelInfo;
+      list<DAE.ComponentRef> discreteModelVars = {};
+      list<OldBackendDAE.ZeroCrossing> zeroCrossings;
+      list<OldBackendDAE.ZeroCrossing> relations     "== zeroCrossings for the most part (only eq pointer different?)";
+      list<OldBackendDAE.TimeEvent> timeEvents;
+      OldSimCode.SpatialDistributionInfo spatialInfo;
+      HashTableCrIListArray.HashTable varToArrayIndexMapping;
+      HashTableCrILst.HashTable varToIndexMapping;
+      OldSimCode.HashTableCrefToSimVar crefToSimVarHT "hidden from typeview - used by cref2simvar() for cref -> SIMVAR lookup available in templates.";
+      HashTable.HashTable crefToClockIndexHT "map variables to clock indices";
+      list<SimVar> residualVars;
+      ConvertMemo memo;
+    algorithm
+      memo := SimVar.newConvertMemo(UnorderedMap.size(simCode.simcode_map));
+      modelInfo := ModelInfo.convert(simCode.modelInfo, memo);
+      (zeroCrossings, relations, timeEvents, spatialInfo) := EventInfo.convert(simCode.eventInfo, simCode.equation_map);
+
+      (varToArrayIndexMapping, varToIndexMapping) := SimCodeUtilShared.createVarToArrayIndexMapping(modelInfo);
+      crefToSimVarHT := SimCodeUtil.convertSimCodeMap(simCode.simcode_map, memo);
+      // do we still need the following for DAE mode?
+      if isSome(simCode.daeModeData) then
+        SOME(DAE_MODE_DATA(residualVars = residualVars)) := simCode.daeModeData;
+        crefToSimVarHT:= List.fold(SimVar.SimVar.convertList(residualVars), HashTableCrefSimVar.addSimVarToHashTable, crefToSimVarHT);
+      end if;
+      crefToClockIndexHT := HashTable.emptyHashTable();
+      for cref in simCode.discreteVars loop
+        discreteModelVars := ComponentRef.toDAE(cref) :: discreteModelVars;
+      end for;
+
+      oldSimCode := OldSimCode.SIMCODE(
+        modelInfo                     = modelInfo,
+        literals                      = list(Expression.toDAE(lit) for lit in simCode.literals),
+        recordDecls                   = simCode.recordDecls, // ToDo: convert this to new structures
+        externalFunctionIncludes      = simCode.externalFunctionIncludes,
+        generic_loop_calls            = list(SimGenericCall.convert(gc) for gc in simCode.generic_loop_calls),
+        localKnownVars                = SimStrongComponent.Block.convertList(simCode.independent),
+        allEquations                  = SimStrongComponent.Block.convertList(simCode.allSim),
+        odeEquations                  = SimStrongComponent.Block.convertListList(simCode.ode),
+        algebraicEquations            = SimStrongComponent.Block.convertListList(simCode.algebraic),
+        clockedPartitions             = list(SimPartition.convertBase(part) for part in simCode.clockedPartitions),
+        initialEquations              = SimStrongComponent.Block.convertList(simCode.init),
+        initialEquations_lambda0      = SimStrongComponent.Block.convertList(simCode.init_0),
+        removedInitialEquations       = SimStrongComponent.Block.convertList(simCode.init_no_ret),
+        startValueEquations           = SimStrongComponent.Block.convertList(simCode.start),
+        nominalValueEquations         = SimStrongComponent.Block.convertList(simCode.nominal),
+        minValueEquations             = SimStrongComponent.Block.convertList(simCode.min),
+        maxValueEquations             = SimStrongComponent.Block.convertList(simCode.max),
+        parameterEquations            = SimStrongComponent.Block.convertList(simCode.param),
+        removedEquations              = SimStrongComponent.Block.convertList(simCode.no_ret),
+        algorithmAndEquationAsserts   = SimStrongComponent.Block.convertList(simCode.algorithms),
+        equationsForZeroCrossings     = SimStrongComponent.Block.convertList(simCode.event_blocks),
+        jacobianEquations             = SimStrongComponent.Block.convertList(simCode.jac_blocks),
+        stateSets                     = {}, // ToDo: add this once state sets are supported
+        constraints                   = {}, // ToDo: add this once constraints are supported
+        classAttributes               = {}, // ToDo: add this once class attributes are supported
+        zeroCrossings                 = zeroCrossings,
+        relations                     = relations,
+        timeEvents                    = timeEvents,
+        discreteModelVars             = discreteModelVars,
+        extObjInfo                    = ExtObjInfo.convert(simCode.extObjInfo), // ToDo: add this once external object info is supported
+        makefileParams                = simCode.makefileParams, // ToDo: convert this to new structures
+        delayedExps                   = convertDelayedExps(simCode.delayedExps),
+        spatialInfo                   = spatialInfo,
+        jacobianMatrices              = list(SimJacobian.convert(jac) for jac in simCode.jacobians),
+        simulationSettingsOpt         = simCode.simulationSettingsOpt, // replace with new struct later on
+        fileNamePrefix                = simCode.fileNamePrefix,
+        fullPathPrefix                = "", // FMI stuff
+        fmuTargetName                 = "", // FMI stuff
+        hpcomData                     = HpcOmSimCode.emptyHpcomData,
+        valueReferences               = AvlTreeCRToInt.EMPTY(), // change to this with fmu: if isFMU then getValueReferenceMapping(modelInfo) else AvlTreeCRToInt.EMPTY(),
+        varToArrayIndexMapping        = varToArrayIndexMapping,
+        varToIndexMapping             = varToIndexMapping,
+        crefToSimVarHT                = crefToSimVarHT,
+        crefToClockIndexHT            = crefToClockIndexHT,
+        backendMapping                = NONE(), // This needs to be added?
+        modelStructure                = NONE(), // FMI stuff
+        fmiSimulationFlags            = NONE(), // FMI stuff
+        partitionData                 = OldSimCode.PARTITIONDATA(-1,{},{},{}),
+        daeModeData                   = if isSome(simCode.daeModeData) then SOME(DaeModeData.convert(Util.getOption(simCode.daeModeData))) else NONE(),
+        scalarized                    = Flags.getConfigBool(Flags.SIM_CODE_SCALARIZE),
+        fmiFigures                    = {},
+        paramDeps                     = OldSimCode.PARAM_DEPS(false, {}, {}));
+    end convert;
+
+    function indexDelay
+      "delay(expr, delayTime, delayMax) -> delay(index, expr, delayTime, delayMax) with the
+      index of its buffer. Equal calls share one, in for-loops each iteration of the iterators
+      the call depends on gets its own. Use with Expression.map."
+      input output Expression exp;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size "number of buffers";
+      input list<SimIterator> iters "iterators of the enclosing for-loop";
+    algorithm
+      exp := match exp
+        local
+          Call call;
+          Integer index, n;
+          list<SimIterator> delay_iters, old_iters;
+          list<ComponentRef> names;
+          Expression index_exp;
+          Boolean supported;
+
+        case Expression.CALL(call = call as Call.TYPED_CALL(arguments = {_, _, _})) guard(isDelay(exp)) algorithm
+          delay_iters := list(it for it guard Expression.contains(exp, function BackendUtil.isIteratorOf(names = SimIterator.names(it))) in iters);
+          delay_iters := List.sort(delay_iters, iteratorNameGt);
+          names := List.flatten(list(SimIterator.names(it) for it in delay_iters));
+          (_, n, supported) := SimIterator.flatIndex(delay_iters);
+          if not supported or Expression.contains(exp, function isOtherIterator(names = names)) then
+            Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed because delay() is not supported in this for-loop: " + Expression.toString(exp)});
+            fail();
+          end if;
+          index := match UnorderedMap.get(exp, map)
+            case SOME((index, old_iters))
+              guard(List.toString(delay_iters, SimIterator.toString) == List.toString(old_iters, SimIterator.toString))
+            then index;
+            case NONE() algorithm
+              index := Pointer.access(size);
+              UnorderedMap.add(exp, (index, delay_iters), map);
+              Pointer.update(size, index + n);
+            then index;
+            else algorithm
+              Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed because delay() occurs in for-loops with different ranges: " + Expression.toString(exp)});
+            then fail();
+          end match;
+          (index_exp, _) := SimIterator.flatIndex(delay_iters, index);
+          exp.call := Call.setArguments(call, index_exp :: call.arguments);
+        then exp;
+
+        else exp;
+      end match;
+    end indexDelay;
+
+    function indexDelays
+      "Numbers the delay() calls in exp like indexDelay, also inside array
+      constructors and reductions."
+      input output Expression exp;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size;
+      input list<SimIterator> iters;
+    algorithm
+      exp := match exp
+        local
+          Call call;
+
+        case Expression.CALL(call = call as Call.TYPED_ARRAY_CONSTRUCTOR())
+          algorithm
+            call.exp := indexDelays(call.exp, map, size, listAppend(callIterators(call.iters), iters));
+            exp.call := call;
+          then exp;
+
+        case Expression.CALL(call = call as Call.TYPED_REDUCTION())
+          algorithm
+            call.exp := indexDelays(call.exp, map, size, listAppend(callIterators(call.iters), iters));
+            exp.call := call;
+          then exp;
+
+        else indexDelay(Expression.mapShallow(exp, function indexDelays(map = map, size = size, iters = iters)), map, size, iters);
+      end match;
+    end indexDelays;
+
+    function indexDelaysBlock
+      input output SimStrongComponent.Block blck;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size;
+    algorithm
+      blck := match blck
+        case SimStrongComponent.Block.ALGORITHM()
+          algorithm
+            blck.stmts := list(indexDelaysStmt(stmt, map, size, {}) for stmt in blck.stmts);
+          then blck;
+        else SimStrongComponent.Block.mapShallow(blck, function indexDelays(map = map, size = size, iters = {}));
+      end match;
+    end indexDelaysBlock;
+
+    function indexDelaysStmt
+      input output Statement stmt;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size;
+      input list<SimIterator> iters;
+    protected
+      list<SimIterator> body_iters;
+    algorithm
+      stmt := Statement.mapExpShallow(stmt, function indexDelays(map = map, size = size, iters = iters));
+      () := match stmt
+        case Statement.FOR()
+          algorithm
+            body_iters := match stmt.range
+              local
+                Expression range;
+              case SOME(range) then listAppend(callIterators({(stmt.iterator, range)}), iters);
+              else iters;
+            end match;
+            stmt.body := list(indexDelaysStmt(s, map, size, body_iters) for s in stmt.body);
+          then ();
+
+        case Statement.IF()
+          algorithm
+            stmt.branches := list((Util.tuple21(b), list(indexDelaysStmt(s, map, size, iters) for s in Util.tuple22(b))) for b in stmt.branches);
+          then ();
+
+        case Statement.WHEN()
+          algorithm
+            stmt.branches := list((Util.tuple21(b), list(indexDelaysStmt(s, map, size, iters) for s in Util.tuple22(b))) for b in stmt.branches);
+          then ();
+
+        case Statement.WHILE()
+          algorithm
+            stmt.body := list(indexDelaysStmt(s, map, size, iters) for s in stmt.body);
+          then ();
+
+        else ();
+      end match;
+    end indexDelaysStmt;
+
+    function callIterators
+      "Iterators that delay() can depend on. indexDelay reports a delay() that
+      depends on one of the others."
+      input list<tuple<InstNode, Expression>> iters;
+      output list<SimIterator> sim_iters;
+    algorithm
+      sim_iters := SimIterator.fromIterator(Iterator.fromFrames(list(
+        (ComponentRef.makeIterator(Util.tuple21(it), Type.INTEGER()), Util.tuple22(it), NONE()) for it guard isSupportedRange(Util.tuple22(it)) in iters)));
+    end callIterators;
+
+    function isSupportedRange
+      input Expression range;
+      output Boolean b;
+    algorithm
+      b := match range
+        case Expression.RANGE() then true;
+        case Expression.ARRAY() then range.literal;
+        else false;
+      end match;
+    end isSupportedRange;
+
+    function indexDelaysCall
+      input output SimGenericCall call;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size;
+    algorithm
+      call := SimGenericCall.mapShallow(call, function Expression.map(func = function indexDelay(map = map, size = size, iters = SimGenericCall.getIterators(call))));
+    end indexDelaysCall;
+
+    function indexDelaysIter
+      input output Expression exp;
+      input Iterator iter;
+      input UnorderedMap<Expression, DelayBuffers> map;
+      input Pointer<Integer> size;
+    protected
+      list<SimIterator> iters = if Iterator.isEmpty(iter) or not Expression.contains(exp, isDelay) then {} else SimIterator.fromIterator(iter);
+    algorithm
+      exp := Expression.map(exp, function indexDelay(map = map, size = size, iters = iters));
+    end indexDelaysIter;
+
+    function isDelay
+      input Expression exp;
+      output Boolean b;
+    algorithm
+      b := match exp
+        local
+          Call call;
+        case Expression.CALL(call = call as Call.TYPED_CALL()) then AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)) == "delay";
+        else false;
+      end match;
+    end isDelay;
+
+    function isOtherIterator
+      input Expression exp;
+      input list<ComponentRef> names;
+      output Boolean b = Expression.isIterator(exp) and not BackendUtil.isIteratorOf(exp, names);
+    end isOtherIterator;
+
+    function iteratorNameGt
+      input SimIterator iter1;
+      input SimIterator iter2;
+      output Boolean b = stringCompare(ComponentRef.toString(listHead(SimIterator.names(iter1))), ComponentRef.toString(listHead(SimIterator.names(iter2)))) > 0;
+    end iteratorNameGt;
+
+    function convertDelayedExps
+      input list<tuple<Expression, list<SimIterator>>> delayedExps;
+      output OldSimCode.DelayedExpression oldDelayedExps;
+    protected
+      list<tuple<Integer, tuple<DAE.Exp, DAE.Exp, DAE.Exp>>> lst = {};
+      list<tuple<DAE.Exp, tuple<DAE.Exp, DAE.Exp, DAE.Exp>, list<OldBackendDAE.SimIterator>>> loops = {};
+      Integer size = 0, n;
+      Expression index, e, delayTime, delayMax;
+      list<SimIterator> iters;
+    algorithm
+      for tpl in delayedExps loop
+        (Expression.CALL(call = Call.TYPED_CALL(arguments = {index, e, delayTime, delayMax})), iters) := tpl;
+        if listEmpty(iters) then
+          lst := (Expression.integerValue(index), (Expression.toDAE(e), Expression.toDAE(delayTime), Expression.toDAE(delayMax))) :: lst;
+        else
+          loops := (Expression.toDAE(index), (Expression.toDAE(e), Expression.toDAE(delayTime), Expression.toDAE(delayMax)), list(SimIterator.convert(it) for it in iters)) :: loops;
+        end if;
+        (_, n) := SimIterator.flatIndex(iters);
+        size := size + n;
+      end for;
+      oldDelayedExps := OldSimCode.DELAYED_EXPRESSIONS(listReverse(lst), size, listReverse(loops));
+    end convertDelayedExps;
+
+    function getDirectoryAndLibs
+      input SimCode simCode;
+      output String directory;
+      output list<String> libs;
+    algorithm
+      (directory, libs) := match simCode
+        case SIM_CODE(modelInfo = MODEL_INFO(directory = directory), makefileParams = OldSimCodeFunction.MAKEFILE_PARAMS(libs = libs)) then (directory, libs);
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+    end getDirectoryAndLibs;
+
+  protected
+    function hasExternalObjectArrayField
+      "record constructors with external object array fields have no C representation.
+      they are only collected because of record bindings that get split into fields."
+      input Function fn;
+      output Boolean b;
+    algorithm
+      b := Function.isDefaultRecordConstructor(fn) and List.any(listAppend(fn.inputs, fn.locals),
+        hasExternalObjectArrayType);
+    end hasExternalObjectArrayField;
+
+    function hasExternalObjectArrayType
+      input InstNode node;
+      output Boolean b;
+    protected
+      Type ty = InstNode.getType(node);
+    algorithm
+      b := Type.isArray(ty) and Type.isExternalObject(Type.arrayElementType(ty));
+    end hasExternalObjectArrayType;
+
+    function collectAlgebraicLoops
+      "Collects algebraic loops from all systems (ode, init, init_0, dae, ...).
+      ToDo: Add other systems once implemented!"
+      input list<SimStrongComponent.Block> init;
+      input list<SimStrongComponent.Block> init_0;
+      input list<list<SimStrongComponent.Block>> ode;
+      input list<list<SimStrongComponent.Block>> algebraic;
+      input Option<DaeModeData> daeModeData;
+      output list<SimStrongComponent.Block> linearLoops = {};
+      output list<SimStrongComponent.Block> nonlinearLoops = {};
+      output list<SimJacobian> jacobians = {};
+      input output SimCodeIndices simCodeIndices;
+      input UnorderedMap<ComponentRef, SimVar> simcode_map;
+    protected
+      list<list<SimStrongComponent.Block>> dae_mode_blcks;
+    algorithm
+      (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := SimStrongComponent.Block.collectAlgebraicLoops({init, init_0}, linearLoops, nonlinearLoops, jacobians, simCodeIndices, simcode_map);
+      (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := SimStrongComponent.Block.collectAlgebraicLoops(ode, linearLoops, nonlinearLoops, jacobians, simCodeIndices, simcode_map);
+      (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := SimStrongComponent.Block.collectAlgebraicLoops(algebraic, linearLoops, nonlinearLoops, jacobians, simCodeIndices, simcode_map);
+      if isSome(daeModeData) then
+        SOME(DAE_MODE_DATA(blcks = dae_mode_blcks)) := daeModeData;
+        (linearLoops, nonlinearLoops, jacobians, simCodeIndices) := SimStrongComponent.Block.collectAlgebraicLoops(dae_mode_blcks, linearLoops, nonlinearLoops, jacobians, simCodeIndices, simcode_map);
+      end if;
+    end collectAlgebraicLoops;
+  end SimCode;
+
+  uniontype ModelInfo
+    record MODEL_INFO
+      Absyn.Path name;
+      String description;
+      String version;
+      String author;
+      String license;
+      String copyright;
+      String directory;
+      String fileName;
+      SimVars vars;
+      VarInfo varInfo;
+      list<SimCodeFunction.Function> functions;
+      list<String> labels;
+      list<String> resourcePaths "Paths of all resources used by the model. Used in FMI2 to package resources in the FMU.";
+      list<Absyn.Class> sortedClasses;
+      //Files files "all the files from SourceInfo and DAE.ElementSource";
+      Integer nClocks;
+      Integer nSubClocks;
+      Integer nSpatialDistributions;
+      Boolean hasLargeLinearEquationSystems; // True if model has large linear eq. systems that are crucial for performance.
+      list<SimStrongComponent.Block> linearLoops;
+      list<SimStrongComponent.Block> nonlinearLoops;
+      //list<UnitDefinition> unitDefinitions "export unitDefintion in modelDescription.xml";
+      Boolean resizable                           "the model has variables with resizable dimensions";
+    end MODEL_INFO;
+
+    function toString
+      input ModelInfo modelInfo;
+      output String str;
+    algorithm
+      str := SimVars.toString(modelInfo.vars);
+    end toString;
+
+    function create
+      input SimVars vars;
+      input Absyn.Path name;
+      input String fileName;
+      input String directory;
+      input list<OldSimCodeFunction.Function> functions;
+      input list<SimStrongComponent.Block> linearLoops;
+      input list<SimStrongComponent.Block> nonlinearLoops;
+      input EventInfo eventInfo;
+      input ClockedInfo clockedInfo;
+      input list<Absyn.Class> sortedClasses "where the runtime resolves modelica:// URIs";
+      output ModelInfo modelInfo;
+      input output SimCodeIndices simCodeIndices;
+    protected
+      VarInfo info;
+    algorithm
+      info := VarInfo.create(vars, eventInfo, simCodeIndices);
+      modelInfo := MODEL_INFO(
+        name                            = name,
+        description                     = "",
+        version                         = "",
+        author                          = "",
+        license                         = "",
+        copyright                       = "",
+        directory                       = directory,
+        fileName                        = fileName,
+        vars                            = vars,
+        varInfo                         = info,
+        functions                       = functions,
+        labels                          = {},
+        resourcePaths                   = {},
+        sortedClasses                   = sortedClasses,
+        nClocks                         = ClockedInfo.baseClockCount(clockedInfo),
+        nSubClocks                      = ClockedInfo.subClockCount(clockedInfo),
+        nSpatialDistributions           = listLength(eventInfo.spatial_lst),
+        hasLargeLinearEquationSystems   = true,
+        linearLoops                     = linearLoops,
+        nonlinearLoops                  = nonlinearLoops,
+        resizable                       = simCodeIndices.resizable);
+    end create;
+
+    function setSeedVars
+      input output ModelInfo modelInfo;
+      input list<SimVar> seedVars;
+    algorithm
+      modelInfo := match modelInfo
+        local
+          SimVars vars;
+        case MODEL_INFO(vars = vars) algorithm
+          vars.seedVars := seedVars;
+          modelInfo.vars := vars;
+        then modelInfo;
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+    end setSeedVars;
+
+    function setRelatedBoundaryConditions
+      input output ModelInfo modelInfo;
+      input Option<DataReconciliation.ReconciliationData> data_opt;
+    algorithm
+      modelInfo := match (modelInfo, data_opt)
+        local
+          VarInfo varInfo;
+          DataReconciliation.ReconciliationData data;
+        case (MODEL_INFO(varInfo = varInfo as VarInfo.VAR_INFO()), SOME(data as DataReconciliation.RECONCILIATION_DATA())) algorithm
+          varInfo.numRelatedBoundaryConditions := data.relatedBoundaryConditions;
+          modelInfo.varInfo := varInfo;
+        then modelInfo;
+        else modelInfo;
+      end match;
+    end setRelatedBoundaryConditions;
+
+    function convert
+      input ModelInfo modelInfo;
+      input ConvertMemo memo;
+      output OldSimCode.ModelInfo oldModelInfo;
+    protected
+      OldSimCode.VarInfo varInfo;
+    algorithm
+      varInfo := VarInfo.convert(modelInfo.varInfo);
+      oldModelInfo := OldSimCode.MODELINFO(
+        name                            = modelInfo.name,
+        description                     = modelInfo.description,
+        version                         = modelInfo.version,
+        author                          = modelInfo.author,
+        license                         = modelInfo.license,
+        copyright                       = modelInfo.copyright,
+        directory                       = modelInfo.directory,
+        fileName                        = modelInfo.fileName,
+        varInfo                         = VarInfo.convert(modelInfo.varInfo),
+        vars                            = SimVar.SimVars.convert(modelInfo.vars, memo),
+        functions                       = modelInfo.functions,
+        labels                          = modelInfo.labels,
+        resourcePaths                   = modelInfo.resourcePaths,
+        sortedClasses                   = modelInfo.sortedClasses,
+        //Files files "all the files from SourceInfo and DAE.ElementSource";
+        nClocks                         = modelInfo.nClocks,
+        nSubClocks                      = modelInfo.nSubClocks,
+        nSpatialDistributions           = modelInfo.nSpatialDistributions,
+        hasLargeLinearEquationSystems   = modelInfo.hasLargeLinearEquationSystems,
+        linearSystems                   = SimStrongComponent.Block.convertList(modelInfo.linearLoops),
+        nonLinearSystems                = SimStrongComponent.Block.convertList(modelInfo.nonlinearLoops),
+        unitDefinitions                 = {}, // ToDo: add this once unit definitions are supported
+        resizable                       = modelInfo.resizable
+      );
+    end convert;
+  end ModelInfo;
+
+  uniontype DaeModeData
+    "contains data that belongs to the dae mode"
+    record DAE_MODE_DATA
+      list<list<SimStrongComponent.Block>> blcks "daeMode blocks";
+      Option<SimJacobian> sparsityPattern "contains the sparsity pattern for the daeMode";
+      list<SimVar> residualVars "variable used to calculate residuals of a DAE form, they are of type real";
+      list<SimVar> algebraicVars;
+      list<SimVar> auxiliaryVars;
+      DaeModeConfig modeCreated;
+    end DAE_MODE_DATA;
+
+    function mapShallow
+      input output DaeModeData data;
+      input expFunc func;
+      partial function expFunc
+        input output Expression exp;
+      end expFunc;
+    algorithm
+      data := match data
+        case DAE_MODE_DATA() algorithm
+          data.blcks := list(list(SimStrongComponent.Block.mapShallow(blck, func) for blck in lst) for lst in data.blcks);
+        then data;
+        else data;
+      end match;
+    end mapShallow;
+
+    function toString
+      input DaeModeData data;
+      output String str = "";
+    protected
+      Integer idx = 1;
+    algorithm
+      for blck_lst in data.blcks loop
+        str := str + SimStrongComponent.Block.listToString(blck_lst, "  ", "DAE Partition " + intString(idx));
+        idx := idx + 1;
+      end for;
+      if isSome(data.sparsityPattern) then
+        str := str + "\n" + SimJacobian.toString(Util.getOption(data.sparsityPattern));
+      end if;
+    end toString;
+
+    function create
+      input list<Partition.Partition> systems;
+      output Option<DaeModeData> data;
+      input output SimCodeIndices simCodeIndices;
+      input UnorderedMap<ComponentRef, SimVar> simcode_map;
+      input UnorderedMap<ComponentRef, SimStrongComponent.Block> equation_map;
+    protected
+      list<list<SimStrongComponent.Block>> blcks;
+      list<SimVar> residualVars;
+    algorithm
+      (blcks, residualVars, simCodeIndices) := SimStrongComponent.Block.createDAEModeBlocks(systems, simCodeIndices, simcode_map, equation_map);
+      data := SOME(DAE_MODE_DATA(blcks, NONE(), residualVars, {}, {}, DaeModeConfig.ALL));
+    end create;
+
+    function addJacobian
+      input output Option<DaeModeData> data;
+      input SimJacobian daeModeJac;
+    algorithm
+      data := match data
+        local
+          DaeModeData dmd;
+        case SOME(dmd) algorithm
+          dmd.sparsityPattern := SOME(daeModeJac);
+        then SOME(dmd);
+        else NONE();
+      end match;
+    end addJacobian;
+
+    function convert
+      input DaeModeData data;
+      output OldSimCode.DaeModeData oldData;
+    protected
+      list<list<OldSimCode.SimEqSystem>> simEqSystems = {};
+    algorithm
+      /* is this not needed?
+      for sys_lst in listReverse(SimStrongComponent.Block.convertListList(data.blcks)) loop
+        simEqSystems := List.map(sys_lst, replaceDerCrefSES) :: simEqSystems;
+      end for;
+      */
+      simEqSystems := SimStrongComponent.Block.convertListList(data.blcks);
+      oldData := OldSimCode.DAEMODEDATA(
+        daeEquations    = simEqSystems,
+        sparsityPattern = Util.applyOption(data.sparsityPattern, SimJacobian.convert),
+        residualVars    = SimVar.SimVar.convertList(data.residualVars),
+        algebraicVars   = SimVar.SimVar.convertList(data.algebraicVars),
+        auxiliaryVars   = SimVar.SimVar.convertList(data.auxiliaryVars),
+        modeCreated     = convertMode(data.modeCreated));
+    end convert;
+
+  protected
+    function convertMode
+      input DaeModeConfig mode;
+      output OldSimCode.DaeModeConfig oldMode;
+    algorithm
+      oldMode := match mode
+        case DaeModeConfig.ALL      then OldSimCode.ALL_EQUATIONS();
+        case DaeModeConfig.DYNAMIC  then OldSimCode.DYNAMIC_EQUATIONS();
+      end match;
+    end convertMode;
+
+    function createSparsityJacobian
+      input output Option<DaeModeData> daeModeDataOpt;
+      input output ModelInfo modelInfo;
+      input list<Partition.Partition> systems;
+      output SimJacobian jacobian;
+      input output UnorderedMap<ComponentRef, SimVar> simcode_map;
+      input output SimCodeIndices simCodeIndices;
+    algorithm
+      daeModeDataOpt := match daeModeDataOpt
+        local
+          DaeModeData daeModeData;
+
+        case SOME(daeModeData)
+          algorithm
+            // get sparsity pattern jacobian and update the hashtable and the jacobian
+            // update to UnorderedMap once reactivated
+/*
+            simulationHT := HashTableSimCode.addList(daeModeData.residualVars, simulationHT);
+            if isSome(daeModeData.sparsityPattern) then
+              SOME(jac) := daeModeData.sparsityPattern;
+              simulationHT := HashTableSimCode.addList(jac.seedVars, simulationHT);
+              modelInfo := ModelInfo.setSeedVars(modelInfo, jac.seedVars);
+              daeModeData.algebraicVars := rewriteAlgebraicVarsIdx(modelInfo.vars.algVars, simulationHT);
+              daeModeData.auxiliaryVars := {}; // this needs to be updated in the future
+              //(daeModeJac, simCodeIndices) := SimJacobian.fromSystemsSparsity(systems, daeModeData.sparsityPattern, simulationHT, simCodeIndices);
+              daeModeData.sparsityPattern := daeModeJac;
+              jacobian := Util.getOption(daeModeJac);
+
+            else
+*/
+              (jacobian, simCodeIndices) := SimJacobian.empty("A", simCodeIndices);
+//            end if;
+        then SOME(daeModeData);
+
+        else
+          algorithm
+            Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+        then fail();
+      end match;
+    end createSparsityJacobian;
+
+    function rewriteAlgebraicVarsIdx
+      input list<SimVar> simulationAlgVars;
+      input UnorderedMap<ComponentRef, SimVar> simcode_map;
+      output list<SimVar> daeModeAlgVars = {};
+    protected
+      ComponentRef seedCref, cref;
+    algorithm
+      seedCref := ComponentRef.fromNode(InstNode.VAR_NODE(NBVariable.SEED_STR + "_A", PointerWeak.downgrade(Pointer.createImmutable(NBVariable.DUMMY_VARIABLE))), Type.UNKNOWN());
+      for var in listReverse(simulationAlgVars) loop
+        cref := ComponentRef.append(var.name, seedCref);
+        print("Searching for: " + ComponentRef.toString(cref) + "\n");
+        var.index := SimVar.getIndex(cref, simcode_map);
+        daeModeAlgVars := var :: daeModeAlgVars;
+      end for;
+    end rewriteAlgebraicVarsIdx;
+
+    function replaceDerCrefSES
+      input output OldSimCode.SimEqSystem sys;
+    algorithm
+      sys := match sys
+        local
+          OldSimCode.SimEqSystem qual;
+
+        case qual as OldSimCode.SES_RESIDUAL() algorithm
+          (qual.exp, _) := OldExpression.traverseExpTopDown(qual.exp, replaceDerCref, 0);
+        then qual;
+
+        case qual as OldSimCode.SES_SIMPLE_ASSIGN() algorithm
+          (qual.exp, _) := OldExpression.traverseExpTopDown(qual.exp, replaceDerCref, 0);
+        then qual;
+      end match;
+    end replaceDerCrefSES;
+
+    function replaceDerCref
+      "this is very bad. temporary fix please remove.
+      the old structure needs a der() call instead of $DER variable for DAEMode."
+      input output DAE.Exp exp;
+      output Boolean b;
+      input output Integer i;
+    algorithm
+      (exp, b) := match exp
+        local
+          DAE.ComponentRef cref;
+
+        case DAE.CREF(componentRef = DAE.CREF_QUAL(ident="$DER",componentRef=cref))
+        then (DAE.CALL(Absyn.IDENT("der"), {DAE.CREF(cref, ComponentReference.crefTypeFull(cref))}, DAE.callAttrBuiltinReal), false);
+
+        else (exp, true);
+      end match;
+    end replaceDerCref;
+  end DaeModeData;
+
+  type DaeModeConfig = enumeration(ALL, DYNAMIC);
+
+  annotation(__OpenModelica_Interface="nbackend");
+end NSimCode;

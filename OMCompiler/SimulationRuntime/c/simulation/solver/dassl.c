@@ -1,0 +1,1279 @@
+/*
+ * This file belongs to the OpenModelica Run-Time System
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC), c/o Linköpings
+ * universitet, Department of Computer and Information Science, SE-58183 Linköping, Sweden. All rights
+ * reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF THE BSD NEW LICENSE OR THE
+ * AGPL VERSION 3 LICENSE OR THE OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8. ANY
+ * USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES RECIPIENT'S
+ * ACCEPTANCE OF THE BSD NEW LICENSE OR THE OSMC PUBLIC LICENSE OR THE AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium) Public License
+ * (OSMC-PL) are obtained from OSMC, either from the above address, from the URLs:
+ * http://www.openmodelica.org or https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica, and in the OpenModelica distribution. GNU
+ * AGPL version 3 is obtained from: https://www.gnu.org/licenses/licenses.html#GPL. The BSD NEW
+ * License is obtained from: http://www.opensource.org/licenses/BSD-3-Clause.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY
+ * SET FORTH IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF
+ * OSMC-PL.
+ *
+ */
+#include <float.h>
+#include <math.h>
+#include <string.h>
+#include <setjmp.h>
+#include <time.h>
+
+#include "openmodelica.h"
+#include "openmodelica_func.h"
+#include "simulation_data.h"
+
+#include "gc/omc_gc.h"
+#include "util/context.h"
+#include "simulation/jacobian_util.h"
+#include "util/omc_error.h"
+
+#include "../arrayIndex.h"
+#include "epsilon.h"
+#include "external_input.h"
+#include "model_help.h"
+#include "omc_math.h"
+#include "simulation/options.h"
+#include "simulation/results/simulation_result.h"
+#include "simulation/simulation_runtime.h"
+#include "solver_main.h"
+
+#include "dassl.h"
+
+#define UNUSED(x) (void)(x)   /* Surpress compiler warnings for unused function input */
+#define DASSL_FIRST_STEP_RESTARTS 3
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* experimental flag for SKF TLM Master Solver Interface
+ *  - it's used with -noEquidistantTimeGrid flag.
+ *  - it's set to 1 if the continuous system is evaluated
+ *    when dassl finished a step, otherwise it's 0.
+ */
+int RHSFinalFlag;
+
+/* provides a dummy Jacobian to be used with DASSL */
+static int dummy_Jacobian(double *t, double *y, double *yprime,double *deltaD,
+                          double *delta, double *cj, double *h, double *wt,
+                          double *rpar, int* ipar) {
+  return 0;
+}
+
+/* provides a dummy zero crossing function to be used with DASSL */
+static int dummy_zeroCrossing(int *neqm, double *t, double *y, double *yp,
+                              int *ng, double *gout, double *rpar, int* ipar) {
+  return 0;
+}
+
+/* provides a dumm precondition function to be used with DASSL */
+static int dummy_precondition(int *neq, double *t, double *y, double *yprime,
+                              double *savr, double *pwk, double *cj,
+                              double *wt, double *wp, int *iwp, double *b,
+                              double eplin, int* ires, double *rpar, int* ipar){
+    return 0;
+}
+
+/* Function prototypes */
+static int callJacobian(double *t, double *y, double *yprime, double *deltaD,
+                        double *pd, double *cj, double *h, double *wt,
+                        double *rpar, int* ipar);
+
+int jacA_num(double *t, double *y, double *yprime, double *deltaD,
+             double *pd, double *cj, double *h, double *wt,
+             double *rpar, int* ipar);
+
+int jacA_numColored(double *t, double *y, double *yprime,
+                    double *deltaD, double *pd, double *cj, double *h,
+                    double *wt, double *rpar, int* ipar);
+
+int jacA_sym(double *t, double *y, double *yprime, double *deltaD,
+             double *pd, double *cj, double *h, double *wt,
+             double *rpar, int* ipar);
+
+int jacA_symColored(double *t, double *y, double *yprime,
+                   double *deltaD, double *pd, double *cj, double *h,
+                   double *wt, double *rpar, int* ipar);
+
+void  DDASKR(
+    int (*res) (double *t, double *y, double *yprime, double* cj, double *delta, int *ires, double *rpar, int* ipar),
+    int *neq,
+    double *t,
+    double *y,
+    double *yprime,
+    double *tout,
+    int *info,
+    double *rtol,
+    double *atol,
+    int *idid,
+    double *rwork,
+    int *lrw,
+    int *iwork,
+    int *liw,
+    double *rpar,
+    int *ipar,
+    int (*jac) (double *t, double *y, double *yprime, double *deltaD, double *delta, double *cj, double *h, double *wt, double *rpar, int* ipar),
+    int (*psol) (int *neq, double *t, double *y, double *yprime, double *savr, double *pwk, double *cj, double *wt, double *wp, int *iwp, double *b, double eplin, int* ires, double *rpar, int* ipar),
+    int (*g) (int *neqm, double *t, double *y, double *yp, int *ng, double *gout, double *rpar, int* ipar),
+    int *ng,
+    int *jroot
+);
+
+static int continue_DASSL(int* idid, double* tolarence);
+static int dasslStuck(DASSL_DATA* dasslData, double t);
+
+/* function for calculating state values on residual form */
+static int functionODE_residual(double *t, double *y, double *yd, double* cj,
+                                double *delta, int *ires, double *rpar, int *ipar);
+
+/* function for calculating zeroCrossings */
+static int function_ZeroCrossingsDASSL(int *neqm, double *t, double *y,
+                                       double *yp, int *ng, double *gout,
+                                       double *rpar, int* ipar);
+
+
+/*
+ * \brief Read the states' nominal values into the absolute tolerances.
+ *
+ * Re-read by updateSolverNominals once initialization has computed the nominals
+ * that are parameter expressions.
+ */
+void dassl_setNominals(DATA* data, DASSL_DATA *dasslData)
+{
+  int i;
+  char name[2048];
+  const array_index_t *ix;
+  const STATIC_REAL_DATA *var;
+
+  infoStreamPrint(OMC_LOG_SOLVER, 1, "The relative tolerance is %g. Following absolute tolerances are used for the states: ", data->simulationInfo->tolerance);
+  for(i=0; i<dasslData->N; ++i)
+  {
+    const modelica_real nominal = getPositiveNominalFromScalarIdx(data->simulationInfo, data->modelData, VAR_KIND_STATE, i);
+    dasslData->nominal[i] = nominal;
+    dasslData->rtol[i] = data->simulationInfo->tolerance;
+    dasslData->atol[i] = data->simulationInfo->tolerance * dasslData->nominal[i];
+    if (OMC_ACTIVE_STREAM(OMC_LOG_SOLVER_V)) {
+      ix = &data->simulationInfo->realVarsReverseIndex[i];
+      var = &data->modelData->realVarsData[ix->array_idx];
+      printArrayElementName(name, sizeof(name), var->info.name, &var->dimension, ix->dim_idx, FALSE);
+      infoStreamPrint(OMC_LOG_SOLVER_V, 0, "%d. %s -> %g", i+1, name, dasslData->atol[i]);
+    }
+  }
+  messageClose(OMC_LOG_SOLVER);
+}
+
+/*
+ * \brief Configure DASSL solver
+ *
+ * Allocate memory for intern data of `dasslData`.
+ * Configures DASSL:
+ *   - Set relative and absolute tolerance
+ *   - Set maximum step size, initial step size
+ *   - Set maximum integration order
+ *   - Set time grid
+ *   - Set method for jacobian computation
+ *   - Set root finding method
+ *   - Set event handling and restart option
+ *
+ */
+int dassl_initial(DATA* data, threadData_t *threadData,
+                  SOLVER_INFO* solverInfo, DASSL_DATA *dasslData)
+{
+  /* work arrays for DASSL */
+  unsigned int i;
+  long N;
+  SIMULATION_DATA tmpSimData = {0};
+
+  dasslData->residualFunction = functionODE_residual;
+  N = data->modelData->nStates;
+
+  dasslData->N = N;
+
+  RHSFinalFlag = 0;
+
+  dasslData->liw = 40 + N;
+  dasslData->lrw = 60 + ((maxOrder + 4) * N) + (N * N)  + (3*data->modelData->nZeroCrossings);
+  dasslData->rwork = (double*) calloc(dasslData->lrw, sizeof(double));
+  assertStreamPrint(threadData, 0 != dasslData->rwork,"out of memory");
+  dasslData->iwork = (int*)  calloc(dasslData->liw, sizeof(int));
+  assertStreamPrint(threadData, 0 != dasslData->iwork,"out of memory");
+  dasslData->ng = (int) data->modelData->nZeroCrossings;
+  dasslData->jroot = (int*)  calloc(data->modelData->nZeroCrossings, sizeof(int));
+  dasslData->rpar = (double**) malloc(3*sizeof(double*));
+  dasslData->ipar = (int*) malloc(sizeof(int));
+  dasslData->ipar[0] = OMC_ACTIVE_STREAM(OMC_LOG_JAC);
+  assertStreamPrint(threadData, 0 != dasslData->ipar,"out of memory");
+  dasslData->atol = (double*) malloc(N*sizeof(double));
+  dasslData->rtol = (double*) malloc(N*sizeof(double));
+  dasslData->nominal = (double*) malloc(N*sizeof(double));
+  dasslData->info = (int*) calloc(infoLength, sizeof(int));
+  assertStreamPrint(threadData, 0 != dasslData->info,"out of memory");
+
+  dasslData->idid = 0;
+  dasslData->tinySteps = 0;
+
+  dasslData->ysave = (double*) malloc(N*sizeof(double));
+  dasslData->delta_hh = (double*) malloc(N*sizeof(double));
+  dasslData->newdelta = (double*) malloc(N*sizeof(double));
+  dasslData->stateDer = (double*) calloc(N, sizeof(double));
+  dasslData->states = (double*) malloc(N*sizeof(double));
+
+  data->simulationInfo->currentContext = CONTEXT_ALGEBRAIC;
+
+  /* ### start configuration of dassl ### */
+  infoStreamPrint(OMC_LOG_SOLVER, 1, "Configuration of the dassl code:");
+
+
+
+  dasslData->jacNominalFactor = omc_flag[FLAG_JACOBIAN_NOMINAL_FACTOR]
+      ? atof(omc_flagValue[FLAG_JACOBIAN_NOMINAL_FACTOR]) : 1.0;
+
+  /* set nominal values of the states for absolute tolerances */
+  dasslData->info[1] = 1;
+  dassl_setNominals(data, dasslData);
+
+
+  /* let dassl return at every internal step */
+  dasslData->info[2] = 1;
+
+
+  /* define maximum step size dassl is allowed to go */
+  if (omc_flag[FLAG_MAX_STEP_SIZE])
+  {
+    double maxStepSize = atof(omc_flagValue[FLAG_MAX_STEP_SIZE]);
+
+    assertStreamPrint(threadData, maxStepSize >= DASSL_STEP_EPS, "Selected maximum step size %e is too small.", maxStepSize);
+
+    dasslData->rwork[1] = maxStepSize;
+    dasslData->info[6] = 1;
+    infoStreamPrint(OMC_LOG_SOLVER, 0, "maximum step size %g", dasslData->rwork[1]);
+  }
+  else
+  {
+    infoStreamPrint(OMC_LOG_SOLVER, 0, "maximum step size not set");
+  }
+
+
+  /* define initial step size, which is dassl is used every time it restarts */
+  if (omc_flag[FLAG_INITIAL_STEP_SIZE])
+  {
+    double initialStepSize = atof(omc_flagValue[FLAG_INITIAL_STEP_SIZE]);
+
+    assertStreamPrint(threadData, initialStepSize >= DASSL_STEP_EPS, "Selected initial step size %e is too small.", initialStepSize);
+
+    dasslData->rwork[2] = initialStepSize;
+    dasslData->info[7] = 1;
+    infoStreamPrint(OMC_LOG_SOLVER, 0, "initial step size %g", dasslData->rwork[2]);
+  }
+  else
+  {
+    infoStreamPrint(OMC_LOG_SOLVER, 0, "initial step size not set");
+  }
+
+
+  /* define maximum integration order of dassl */
+  if (omc_flag[FLAG_MAX_ORDER])
+  {
+    int maxOrder = atoi(omc_flagValue[FLAG_MAX_ORDER]);
+
+    assertStreamPrint(threadData, maxOrder >= 1 && maxOrder <= 5, "Selected maximum order %d is out of range (1-5).", maxOrder);
+
+    dasslData->iwork[2] = maxOrder;
+    dasslData->info[8] = 1;
+  }
+  infoStreamPrint(OMC_LOG_SOLVER, 0, "maximum integration order %d", dasslData->info[8]?dasslData->iwork[2]:maxOrder);
+
+
+  /* if FLAG_NOEQUIDISTANT_GRID is set, choose dassl step method */
+  if (omc_flag[FLAG_NOEQUIDISTANT_GRID])
+  {
+    dasslData->dasslSteps = 1; /* TRUE */
+    solverInfo->solverNoEquidistantGrid = TRUE;
+  }
+  else
+  {
+    dasslData->dasslSteps = 0; /* FALSE */
+  }
+  infoStreamPrint(OMC_LOG_SOLVER, 0, "use equidistant time grid %s", dasslData->dasslSteps?"NO":"YES");
+
+  /* check if Flags FLAG_NOEQUIDISTANT_OUT_FREQ or FLAG_NOEQUIDISTANT_OUT_TIME are set */
+  if (dasslData->dasslSteps){
+    if (omc_flag[FLAG_NOEQUIDISTANT_OUT_FREQ])
+    {
+      dasslData->dasslStepsFreq = atoi(omc_flagValue[FLAG_NOEQUIDISTANT_OUT_FREQ]);
+    }
+    else if (omc_flag[FLAG_NOEQUIDISTANT_OUT_TIME])
+    {
+      dasslData->dasslStepsTime = atof(omc_flagValue[FLAG_NOEQUIDISTANT_OUT_TIME]);
+      dasslData->rwork[1] = dasslData->dasslStepsTime;
+      dasslData->info[6] = 1;
+      infoStreamPrint(OMC_LOG_SOLVER, 0, "maximum step size %g", dasslData->rwork[1]);
+    } else {
+      dasslData->dasslStepsFreq = 1;
+      dasslData->dasslStepsTime = 0.0;
+    }
+
+    if  (omc_flag[FLAG_NOEQUIDISTANT_OUT_FREQ] && omc_flag[FLAG_NOEQUIDISTANT_OUT_TIME]){
+      warningStreamPrint(OMC_LOG_STDOUT, 0, "The flags are  \"noEquidistantOutputFrequency\" "
+                                     "and \"noEquidistantOutputTime\" are in opposition "
+                                     "to each other. The flag \"noEquidistantOutputFrequency\" superiors.");
+     }
+     infoStreamPrint(OMC_LOG_SOLVER, 0, "as the output frequency control is used: %d", dasslData->dasslStepsFreq);
+     infoStreamPrint(OMC_LOG_SOLVER, 0, "as the output frequency time step control is used: %f", dasslData->dasslStepsTime);
+  }
+
+  /* Choose and initialize the ODE Jacobian. The mapping from the `-jacobian` flag to
+   * the forward / adjoint / bidirectional Jacobian is shared with IDA and GBODE. */
+  dasslData->dasslJacobian = getRequestedJacobianMethod(threadData);
+  JACOBIAN* jacobian = initSymbolicOdeJacobian(data, threadData, &dasslData->dasslJacobian, FALSE);
+
+  /* default use a user sub-routine for JAC */
+  dasslData->info[4] = 1;
+
+  /* set up the appropriate function pointer */
+  switch (dasslData->dasslJacobian){
+    case COLOREDNUMJAC:
+      data->simulationInfo->jacobianEvals = jacobian->sparsePattern->maxColors;
+      dasslData->jacobianFunction = jacA_numColored;
+      break;
+    case BICOLOREDSYMJAC:
+      data->simulationInfo->jacobianEvals = jacobian->sparsePattern->maxColors
+          + jacobian->adjointJacobian->sparsePattern->maxColors;
+      dasslData->jacobianFunction = jacA_symColored;
+      break;
+    case COLOREDSYMJAC:
+    case COLOREDSYMJACADJ:
+      data->simulationInfo->jacobianEvals = jacobian->sparsePattern->maxColors;
+      dasslData->jacobianFunction = jacA_symColored;
+      break;
+    case SYMJAC:
+      dasslData->jacobianFunction = jacA_sym;
+      break;
+    case NUMJAC:
+      dasslData->jacobianFunction =  jacA_num;
+      break;
+    case INTERNALNUMJAC:
+      dasslData->jacobianFunction =  dummy_Jacobian;
+      /* no user sub-routine for JAC */
+      dasslData->info[4] = 0;
+      break;
+    default:
+      throwStreamPrint(threadData,"unrecognized jacobian calculation method %s", (const char*)omc_flagValue[FLAG_JACOBIAN]);
+      break;
+  }
+  infoStreamPrint(OMC_LOG_SOLVER, 0, "jacobian is calculated by %s", JACOBIAN_METHOD_DESC[dasslData->dasslJacobian]);
+
+  /* if FLAG_NO_ROOTFINDING is set, choose dassl with out internal root finding */
+  if(omc_flag[FLAG_NO_ROOTFINDING])
+  {
+    dasslData->dasslRootFinding = 0;
+    dasslData->zeroCrossingFunction = dummy_zeroCrossing;
+    dasslData->ng = 0;
+  }
+  else
+  {
+    solverInfo->solverRootFinding = 1;
+    dasslData->dasslRootFinding = 1;
+    dasslData->zeroCrossingFunction = function_ZeroCrossingsDASSL;
+  }
+  infoStreamPrint(OMC_LOG_SOLVER, 0, "dassl uses internal root finding method %s", dasslData->dasslRootFinding?"YES":"NO");
+
+
+  /* if FLAG_NO_RESTART is set, choose dassl step method */
+  if (omc_flag[FLAG_NO_RESTART])
+  {
+    dasslData->dasslAvoidEventRestart = 1; /* TRUE */
+  }
+  else
+  {
+    dasslData->dasslAvoidEventRestart = 0; /* FALSE */
+  }
+  infoStreamPrint(OMC_LOG_SOLVER, 0, "dassl performs an restart after an event occurs %s", dasslData->dasslAvoidEventRestart?"NO":"YES");
+
+  /* ### end configuration of dassl ### */
+
+  messageClose(OMC_LOG_SOLVER);
+  return 0;
+}
+
+
+/*
+ * \brief Deallocates `DASSL_DATA`
+ */
+int dassl_deinitial(DATA* data, DASSL_DATA *dasslData)
+{
+  unsigned int i;
+
+  /* free work arrays for DASSL */
+  free(dasslData->rwork);
+  free(dasslData->iwork);
+  free(dasslData->jroot);
+  free(dasslData->rpar);
+  free(dasslData->ipar);
+  free(dasslData->atol);
+  free(dasslData->rtol);
+  free(dasslData->nominal);
+  free(dasslData->info);
+  free(dasslData->ysave);
+  free(dasslData->delta_hh);
+  free(dasslData->newdelta);
+  free(dasslData->stateDer);
+  free(dasslData->states);
+
+  /* Free Jacobians */
+  freeSymbolicOdeJacobian(data);
+
+  free(dasslData);
+
+  return 0;
+}
+
+int printJacobianMatrix(int logLevel, const char* name, double* matrix, DATA* data, int n, double time)
+{
+  int row, col;
+
+  infoStreamPrint(logLevel, 1, "%s at time=%g", name, time);
+  for (col = 0; col < n; ++col)
+  {
+    const char* colName = data->modelData->realVarsData[col].info.name;
+    for (row = 0; row < n; ++row)
+    {
+      const char* rowName = data->modelData->realVarsData[row].info.name;
+      const int idx = col * n + row;
+      infoStreamPrint(logLevel, 0,
+                      "J(row=%d:'%s', col=%d:'%s') = %.16g [flat=%d]",
+                      row, rowName, col, colName, matrix[idx], idx);
+    }
+  }
+  messageClose(logLevel);
+
+  return 0;
+}
+
+
+/**********************************************************************************************
+ * DASSL with synchronous treating of when equation
+ *   - without integrated ZeroCrossing method.
+ *   + ZeroCrossing are handled outside DASSL.
+ *   + if no event occurs outside DASSL performs a warm-start
+ **********************************************************************************************/
+int dassl_step(DATA* data, threadData_t *threadData, SOLVER_INFO* solverInfo)
+{
+  double tout = 0;
+  double tStepStart = 0;
+  int i = 0;
+  unsigned int ui = 0;
+  int retVal = 0;
+  int saveJumpState;
+  static unsigned int dasslStepsOutputCounter = 1;
+  int return_from_small_step = 0;
+  int firstStepRestarts = 0;
+  int workRetries = 0;
+
+  DASSL_DATA *dasslData = (DASSL_DATA*) solverInfo->solverData;
+
+  SIMULATION_DATA *sData = data->localData[0];
+  SIMULATION_DATA *sDataOld = data->localData[1];
+
+  modelica_real* states = sData->realVars;
+  modelica_real* stateDer = dasslData->stateDer;
+
+
+  MODEL_DATA *mData = (MODEL_DATA*) data->modelData;
+
+  if (measure_time_flag) rt_tick(SIM_TIMER_SOLVER);
+
+  memcpy(stateDer, data->localData[1]->realVars + data->modelData->nStates, sizeof(double)*data->modelData->nStates);
+
+  dasslData->rpar[0] = (double*) (void*) data;
+  dasslData->rpar[1] = (double*) (void*) dasslData;
+  dasslData->rpar[2] = (double*) (void*) threadData;
+  dasslData->rootFailed = 0;
+
+  saveJumpState = threadData->currentErrorStage;
+  threadData->currentErrorStage = ERROR_INTEGRATOR;
+
+  /* try */
+  OMC_TRY_INTERNAL(simulationJumpBuffer)
+
+  assertStreamPrint(threadData, 0 != dasslData->rpar, "could not passed to DDASKR");
+
+  /* If an event is triggered and processed restart dassl. */
+  if(!dasslData->dasslAvoidEventRestart && (solverInfo->didEventStep || 0 == dasslData->idid))
+  {
+    /* obtain reset */
+    dasslData->info[0] = 0;
+    dasslData->idid = 0;
+
+  }
+
+  /* Calculate steps until TOUT is reached */
+  if (dasslData->dasslSteps)
+  {
+    /* If dasslsteps is selected, the dassl run to stopTime or next sample event */
+    if (data->simulationInfo->nextSampleEvent < data->simulationInfo->stopTime)
+    {
+      tout = data->simulationInfo->nextSampleEvent;
+    }
+    else
+    {
+      tout = data->simulationInfo->stopTime;
+    }
+  }
+  else
+  {
+    tout = solverInfo->currentTime + solverInfo->currentStepSize;
+  }
+
+  /* Never step past the next time event: what the model computes beyond it
+   * continues the left limit and is no part of the solution. */
+  if (data->simulationInfo->nextSampleEvent < DBL_MAX &&
+      (0 == dasslData->info[0] || data->simulationInfo->nextSampleEvent >= dasslData->rwork[3]))
+  {
+    dasslData->info[3] = 1;
+    dasslData->rwork[0] = fmax(data->simulationInfo->nextSampleEvent, tout);
+  }
+  else
+  {
+    dasslData->info[3] = 0;
+  }
+
+  /* Check that tout is not less than timeValue
+   * else will dassl get in trouble. If that is the case we skip the current step.
+     Also check if step size is smaller than DASSL_STEP_EPS or DASSL_STEP_EPS times simulation interval */
+  if ((solverInfo->currentStepSize < DASSL_STEP_EPS) ||
+      (solverInfo->currentStepSize < DASSL_STEP_EPS*(data->simulationInfo->stopTime - data->simulationInfo->startTime)) )
+  {
+    infoStreamPrint(OMC_LOG_DASSL, 0, "Desired step size %e too small.", solverInfo->currentStepSize);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "Interpolate linear");
+
+    /*euler step*/
+    for(i = 0; i < data->modelData->nStates; i++)
+    {
+      sData->realVars[i] = sDataOld->realVars[i] + stateDer[i] * solverInfo->currentStepSize;
+    }
+    sData->timeValue = solverInfo->currentTime + solverInfo->currentStepSize;
+    data->callback->functionODE(data, threadData);
+    solverInfo->currentTime = sData->timeValue;
+
+    return_from_small_step = 1;
+  }
+  else
+  {
+    do
+    {
+      infoStreamPrint(OMC_LOG_DASSL, 1, "new step at time = %.15g", solverInfo->currentTime);
+
+      /* rhs final flag is FALSE during for dassl evaluation */
+      RHSFinalFlag = 0;
+
+      if (measure_time_flag) rt_accumulate(SIM_TIMER_SOLVER);
+      /* read input vars */
+      externalInputUpdate(data);
+      data->callback->input_function(data, threadData);
+      if (measure_time_flag) rt_tick(SIM_TIMER_SOLVER);
+
+      tStepStart = solverInfo->currentTime;
+      DDASKR(dasslData->residualFunction, (int*) &dasslData->N,
+              &solverInfo->currentTime, states, stateDer, &tout,
+              dasslData->info, dasslData->rtol, dasslData->atol, &dasslData->idid,
+              dasslData->rwork, &dasslData->lrw, dasslData->iwork, &dasslData->liw,
+              (double*) (void*) dasslData->rpar, dasslData->ipar, callJacobian, dummy_precondition,
+              dasslData->zeroCrossingFunction, (int*) &dasslData->ng, dasslData->jroot);
+      dasslData->info[7] = omc_flag[FLAG_INITIAL_STEP_SIZE] ? 1 : 0;
+
+      /* A step landing on TSTOP returns there even past TOUT; called again from
+       * the old T, DDASKR interpolates back to TOUT. */
+      if (dasslData->idid == 2 && solverInfo->currentTime > tout)
+      {
+        solverInfo->currentTime = tStepStart;
+        dasslData->idid = 1;
+        messageClose(OMC_LOG_DASSL);
+        continue;
+      }
+
+      /* closing new step message */
+      messageClose(OMC_LOG_DASSL);
+
+      /* set ringbuffer time to current time */
+      sData->timeValue = solverInfo->currentTime;
+
+      /* rhs final flag is TRUE during for output evaluation */
+      RHSFinalFlag = 1;
+
+      if(dasslData->idid == -1 && workRetries++ < SOLVER_WORK_RETRIES)
+      {
+        fflush(stderr);
+        fflush(stdout);
+        warningStreamPrint(OMC_LOG_SOLVER, 0, "##DASSL## has done too much work with small steps at time = %.15g. Continuing to solve anyway.", solverInfo->currentTime);
+        dasslData->info[0] = 1; /* try again */
+        if (solverInfo->currentTime <= data->simulationInfo->stopTime)
+          continue;
+      }
+      else if(dasslData->idid == -7 && dasslData->iwork[10] == 0 && firstStepRestarts < DASSL_FIRST_STEP_RESTARTS)
+      {
+        /* DASKR gives up after ten corrector failures, each quartering H, so a
+         * first step needing a smaller H is never taken: restart from the H it
+         * reached (RWORK(3)). */
+        firstStepRestarts++;
+        infoStreamPrint(OMC_LOG_DASSL, 0, "The corrector could not converge on the first step. Restarting with initial step size %g.", dasslData->rwork[2]);
+        dasslData->info[0] = 0;
+        dasslData->info[7] = 1;
+        dasslData->idid = 1;
+        continue;
+      }
+      else if(dasslData->idid < 0)
+      {
+        fflush(stderr);
+        fflush(stdout);
+        retVal = continue_DASSL(&dasslData->idid, &data->simulationInfo->tolerance);
+        warningStreamPrint(OMC_LOG_STDOUT, 0, "can't continue. time = %f", sData->timeValue);
+        break;
+      }
+      else if(dasslStuck(dasslData, solverInfo->currentTime))
+      {
+        retVal = -1;
+        break;
+      }
+      if(dasslData->idid == 5)
+      {
+        threadData->currentErrorStage = ERROR_EVENTSEARCH;
+      }
+
+      /* emit step, if dasslsteps is selected */
+      if (dasslData->dasslSteps)
+      {
+        if (omc_flag[FLAG_NOEQUIDISTANT_OUT_FREQ]){
+          /* output every n-th time step */
+          if (dasslStepsOutputCounter >= dasslData->dasslStepsFreq){
+            dasslStepsOutputCounter = 1; /* next line set it to one */
+            break;
+          }
+          dasslStepsOutputCounter++;
+        } else if (omc_flag[FLAG_NOEQUIDISTANT_OUT_TIME]){
+          /* output when time>=k*timeValue */
+          if (solverInfo->currentTime > dasslStepsOutputCounter * dasslData->dasslStepsTime){
+            dasslStepsOutputCounter++;
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+
+    } while(dasslData->idid == 1 && !OMC_ERROR_RAISED());
+
+    states = dasslData->states;
+  }
+  /* After a failed root function, DDASKR searches on stale values and its root
+   * is none: the step fails and performSimulation retries it. */
+  if (OMC_ERROR_RAISED() && !dasslData->rootFailed) { OMC_ERROR_CLEAR(); }
+
+  OMC_CATCH_INTERNAL(simulationJumpBuffer)
+  threadData->currentErrorStage = saveJumpState;
+
+  if (return_from_small_step) {
+    /* need to do this outside the try-catch macro */
+    return 0;
+  }
+
+  /* if a state event occurs than no sample event does need to be activated  */
+  if (data->simulationInfo->sampleActivated && solverInfo->currentTime < data->simulationInfo->nextSampleEvent)
+  {
+    data->simulationInfo->sampleActivated = 0;
+  }
+
+
+  /* save dassl stats */
+  // TODO: Who thought this is an acceptable way to log stats in iwork? Never heard of structs?
+  solverInfo->solverStatsTmp.nStepsTaken              = dasslData->iwork[10];
+  solverInfo->solverStatsTmp.nCallsODE                = dasslData->iwork[11];
+  solverInfo->solverStatsTmp.nCallsJacobian           = dasslData->iwork[12];
+  solverInfo->solverStatsTmp.nErrorTestFailures       = dasslData->iwork[13];
+  solverInfo->solverStatsTmp.nConvergenceTestFailures = dasslData->iwork[14];
+
+  if(OMC_ACTIVE_STREAM(OMC_LOG_DASSL))
+  {
+    infoStreamPrint(OMC_LOG_DASSL, 1, "dassl call statistics: ");
+    infoStreamPrint(OMC_LOG_DASSL, 0, "value of idid: %d", (int)dasslData->idid);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "current time value: %0.4g", solverInfo->currentTime);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "current integration time value: %0.4g", dasslData->rwork[3]);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "step size H to be attempted on next step: %0.4g", dasslData->rwork[2]);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "step size used on last successful step: %0.4g", dasslData->rwork[6]);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "the order of the method used on the last step: %d", dasslData->iwork[7]);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "the order of the method to be attempted on the next step: %d", dasslData->iwork[8]);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "number of steps taken so far: %d", solverInfo->solverStatsTmp.nStepsTaken);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "number of calls of functionODE() : %d", solverInfo->solverStatsTmp.nCallsODE);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "number of calculation of jacobian : %d", solverInfo->solverStatsTmp.nCallsJacobian);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "total number of convergence test failures: %d", solverInfo->solverStatsTmp.nConvergenceTestFailures);
+    infoStreamPrint(OMC_LOG_DASSL, 0, "total number of error test failures: %d", solverInfo->solverStatsTmp.nErrorTestFailures);
+    messageClose(OMC_LOG_DASSL);
+  }
+
+  infoStreamPrint(OMC_LOG_DASSL, 0, "Finished DASSL step.");
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_SOLVER);
+
+  return retVal;
+}
+
+#define DASSL_STUCK_STEPS 1000
+
+/* A run of accepted steps that are each only a few hundred ulp of time long.
+ * DASKR accepts them, so without this the simulation never ends. */
+static int dasslStuck(DASSL_DATA* dasslData, double t)
+{
+  const double tiny = 1000 * DBL_EPSILON * fmax(fabs(t), 1.0);
+  const char *suppressed;
+
+  if (dasslData->rwork[6] >= tiny) {
+    dasslData->tinySteps = 0;
+    return 0;
+  }
+  if (0 == dasslData->tinySteps++) {
+    omc_clear_last_suppressed_error();
+  }
+  if (dasslData->tinySteps < DASSL_STUCK_STEPS) {
+    return 0;
+  }
+  errorStreamPrint(OMC_LOG_STDOUT, 1, "The integrator is stuck at time %.15g: its last %d steps were each shorter than %g, too short to move time forward. The model is probably singular or discontinuous here.", t, DASSL_STUCK_STEPS, tiny);
+  suppressed = omc_last_suppressed_error();
+  if (suppressed[0]) {
+    infoStreamPrint(OMC_LOG_STDOUT, 0, "The last error a nonlinear solver recovered from: %s", suppressed);
+  }
+  messageClose(OMC_LOG_STDOUT);
+  return 1;
+}
+
+static int continue_DASSL(int* idid, double* atol)
+{
+  int retValue = -1;
+
+  switch(*idid)
+  {
+  case 1:
+  case 2:
+  case 3:
+    /* 1-4 means success */
+    break;
+  case -1:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "DDASKR has done too much work with small steps.");
+    retValue = -1;
+    break;
+  case -2:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "The error tolerances are too stringent");
+    retValue = -2;
+    break;
+  case -3:
+    /* wbraun: don't throw at this point let the solver handle it */
+    /* throwStreamPrint("DDASKR: THE LAST STEP TERMINATED WITH A NEGATIVE IDID value"); */
+    retValue = -3;
+    break;
+  case -6:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "DDASSL had repeated error test failures on the last attempted step.");
+    retValue = -6;
+    break;
+  case -7:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "The corrector could not converge.");
+    retValue = -7;
+    break;
+  case -8:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "The matrix of partial derivatives is singular.");
+    retValue = -8;
+    break;
+  case -9:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "The corrector could not converge. There were repeated error test failures in this step.");
+    retValue = -9;
+    break;
+  case -10:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "A Modelica assert prevents the integrator to continue. For more information use -lv LOG_SOLVER");
+    retValue = -10;
+    break;
+  case -11:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "IRES equal to -2 was encountered and control is being returned to the calling program.");
+    retValue = -11;
+    break;
+  case -12:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "DDASSL failed to compute the initial YPRIME.");
+    retValue = -12;
+    break;
+  case -33:
+    warningStreamPrint(OMC_LOG_STDOUT, 0, "The code has encountered trouble from which it cannot recover.");
+    retValue = -33;
+    break;
+  }
+
+  return retValue;
+}
+
+/**
+ * @brief ODE residual function.
+ *
+ * Compute difference between old and new state derivatives.
+ *
+ * @param t       Independent variable (time).
+ * @param y       Array with state variables, size dasslData->N.
+ * @param yd      Array with state derivatives, size dasslData->N.
+ * @param cj      Unused, specified by DDASKR interface but can be ignored.
+ * @param delta   Output: state derivatives - yd
+ * @param ires    If not successfull set to -1 on exit.
+ * @param rpar    Struct storing user data.
+ *                Type {DATA*, DASSL_DATA*, threadData_t*}
+ *                TODO: Why is this of type double* and not void*? I guess DDASKR needs it in this specific format...
+ * @param ipar    Unused, specified by DDASKR interface.
+ * @return int    Return 0.
+ */
+static int functionODE_residual(double *t, double *y, double *yd, double* cj,
+                                double *delta, int *ires, double *rpar, int *ipar)
+{
+  UNUSED(cj); UNUSED(ipar); /* Silence compíler warnings */
+
+  DATA* data = (DATA*)((double**)rpar)[0];
+  DASSL_DATA* dasslData = (DASSL_DATA*)((double**)rpar)[1];
+  threadData_t *threadData = (threadData_t*)((double**)rpar)[2];
+
+  double timeBackup;
+  long i;
+  int saveJumpState;
+  int success = 0;
+
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_SOLVER);
+  if (measure_time_flag) rt_tick(SIM_TIMER_RESIDUALS);
+
+  if (data->simulationInfo->currentContext == CONTEXT_ALGEBRAIC)
+  {
+    setContext(data, *t, CONTEXT_ODE);
+  }
+  printCurrentStatesVector(OMC_LOG_DASSL_STATES, y, data, *t);
+  printVector(OMC_LOG_DASSL_STATES, "yd", yd, data->modelData->nStates, *t);
+
+  timeBackup = data->localData[0]->timeValue;
+  data->localData[0]->timeValue = *t;
+
+  saveJumpState = threadData->currentErrorStage;
+  threadData->currentErrorStage = ERROR_INTEGRATOR;
+
+  /* try */
+  OMC_TRY_INTERNAL(simulationJumpBuffer)
+
+  /* read input vars */
+  externalInputUpdate(data);
+  /* eval input vars */
+  data->callback->input_function(data, threadData);
+
+  /* Compute state derivatives */
+  // TODO: Why is y not used to update states in data->localData[0]->realVars before computing state derivatives?
+  data->callback->functionODE(data, threadData);
+
+  /* Difference between old and currend state derivatives */
+  for(i=0; i < data->modelData->nStates; i++)
+  {
+    delta[i] = data->localData[0]->realVars[data->modelData->nStates + i] - yd[i];
+  }
+  printVector(OMC_LOG_DASSL_STATES, "dd", delta, data->modelData->nStates, *t);
+  if (OMC_ERROR_RAISED()) { OMC_ERROR_CLEAR(); } else { success = 1; }
+  OMC_CATCH_INTERNAL(simulationJumpBuffer)
+
+  if (!success) {
+    *ires = -1;
+  }
+
+  threadData->currentErrorStage = saveJumpState;
+
+  data->localData[0]->timeValue = timeBackup;
+
+  if (data->simulationInfo->currentContext == CONTEXT_ODE){
+    unsetContext(data);
+  }
+
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_RESIDUALS);
+  if (measure_time_flag) rt_tick(SIM_TIMER_SOLVER);
+
+  return 0;
+}
+
+static int function_ZeroCrossingsDASSL(int *neqm, double *t, double *y, double *yp,
+                                       int *ng, double *gout, double *rpar, int* ipar)
+{
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  DASSL_DATA* dasslData = (DASSL_DATA*)(void*)((double**)rpar)[1];
+  threadData_t *threadData = (threadData_t*)(void*)((double**)rpar)[2];
+
+  double timeBackup;
+  int saveJumpState;
+
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_SOLVER);
+  if (measure_time_flag) rt_tick(SIM_TIMER_EVENT);
+
+  if (data->simulationInfo->currentContext == CONTEXT_ALGEBRAIC)
+  {
+    setContext(data, *t, CONTEXT_EVENTS);
+  }
+
+  saveJumpState = threadData->currentErrorStage;
+  threadData->currentErrorStage = ERROR_EVENTSEARCH;
+
+  timeBackup = data->localData[0]->timeValue;
+  data->localData[0]->timeValue = *t;
+
+  /* read input vars */
+  externalInputUpdate(data);
+  data->callback->input_function(data, threadData);
+  /* eval needed equations*/
+  data->callback->function_ZeroCrossingsEquations(data, threadData);
+
+  data->callback->function_ZeroCrossings(data, threadData, gout);
+  dasslData->rootFailed |= OMC_ERROR_RAISED();
+
+  threadData->currentErrorStage = saveJumpState;
+  data->localData[0]->timeValue = timeBackup;
+
+  if (data->simulationInfo->currentContext == CONTEXT_EVENTS){
+    unsetContext(data);
+  }
+
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_EVENT);
+  if (measure_time_flag) rt_tick(SIM_TIMER_SOLVER);
+
+  return 0;
+}
+
+/* \fn jacA_symColored(double *t, double *y, double *yprime, double *deltaD, double *pd, double *cj, double *h, double *wt,
+   double *rpar, int* ipar)
+ *
+ * This function calculates the Jacobian matrix symbolically, exploiting the coloring.
+ *
+ * It handles all three symbolic evaluation modes transparently, since evalJacobian()
+ * dispatches on the properties of the selected Jacobian:
+ *   coloredSymbolical        -> forward (column) evaluation
+ *   coloredSymbolicalAdjoint -> adjoint (row) evaluation
+ *   bicoloredSymbolical      -> bidirectional (column + row) evaluation
+ */
+int jacA_symColored(double *t, double *y, double *yprime, double *delta,
+                    double *matrixA, double *cj, double *h, double *wt,
+                    double *rpar, int *ipar)
+{
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  threadData_t *threadData = (threadData_t*)(void*)((double**)rpar)[2];
+  JACOBIAN* jac = getSymbolicOdeJacobian(data);
+  evalJacobian(data, threadData, jac, NULL, matrixA, TRUE);
+
+  return 0;
+}
+
+/* \fn jacA_sym(double *t, double *y, double *yprime, double *deltaD, double *pd, double *cj, double *h, double *wt,
+   double *rpar, int* ipar)
+ *
+ *
+ * This function calculates symbolically the jacobian matrix.
+ */
+int jacA_sym(double *t, double *y, double *yprime, double *delta,
+             double *matrixA, double *cj, double *h, double *wt, double *rpar,
+             int *ipar)
+{
+
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  threadData_t *threadData = (threadData_t*)(void*)((double**)rpar)[2];
+
+  const int index = data->callback->INDEX_JAC_A;
+  JACOBIAN* jac = &(data->simulationInfo->analyticJacobians[index]);
+  unsigned int columns = jac->sizeCols;
+  unsigned int rows = jac->sizeRows;
+  unsigned int i, j;
+
+  /* Evaluate constant equations if available */
+  if (jac->constantEqns != NULL) {
+      jac->constantEqns(data, threadData, jac, NULL);
+  }
+
+  for(i=0; i < columns; i++)
+  {
+    jac->seedVars[i] = 1.0;
+    data->callback->functionJacA_column(data, threadData, jac, NULL);
+
+    for(j = 0; j < rows; j++)
+    {
+      matrixA[i*columns+j] = jac->resultVars[j];
+    }
+
+    jac->seedVars[i] = 0.0;
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Calculate Jacobian matrix numericaly.
+ *
+ * Calculate Jacobian matrix using forward finite differences.
+ *
+ * @param t         Independent variable (time).
+ * @param y         Array with state variables, size dasslData->N.
+ * @param yprime    Array with state derivatives, size dasslData->N.
+ * @param delta     Previous f(t,y) - dy, Array of size dasslData->N.
+ * @param matrixA   On output contains values of Jacobian matrix
+ *                  J = (∂F)/(∂y).
+ *                  Array of size dasslData->N*dasslData->N, storing matrix in row-major order.
+ * @param cj        Specified by library interface. Given to residualFunction, which ignores it.
+ * @param h         Step size of DASSL solver.
+ * @param wt        Array with error weights, size dasslData->N.
+ * @param rpar      Struct storing user data.
+ *                  Type: {DATA*, DASSL_DATA*, threadData_t*}
+ * @param ipar      Specified by library interface. Given to residualFunction, which ignores it.
+ * @return int      Return 0.
+ */
+int jacA_num(double *t, double *y, double *yprime, double *delta,
+             double *matrixA, double *cj, double *h, double *wt, double *rpar,
+             int *ipar)
+{
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  DASSL_DATA* dasslData = (DASSL_DATA*)(void*)((double**)rpar)[1];
+  threadData_t* threadData = (threadData_t*)(void*)((double**)rpar)[2];
+
+  double delta_hh, delta_hhh, deltaInv;
+  double ysave;
+  int ires;
+  int col, row;
+
+  /* set context for the start values extrapolation of non-linear algebraic loops */
+  setContext(data, *t, CONTEXT_JACOBIAN);
+
+  for(col=dasslData->N-1; col >= 0; col--)
+  {
+    delta_hhh = *h * yprime[col];
+    delta_hh = numericalJacobianStep(y[col], delta_hhh, fabs(1. / wt[col]),
+                                     dasslData->jacNominalFactor * dasslData->nominal[col]);
+    delta_hh = (delta_hhh >= 0 ? delta_hh : -delta_hh);
+    delta_hh = y[col] + delta_hh - y[col];    // Due to floating-point arithmetic rounding errors can result in: delta_hh != y[i] + delta_hh - y[i]
+    deltaInv = 1. / delta_hh;
+    ysave = y[col];
+    y[col] += delta_hh;
+
+    (*dasslData->residualFunction)(t, y, yprime, cj, dasslData->newdelta, &ires, rpar, ipar);
+    // TODO: What if residualFunction failed (ires=-1)?
+
+    increaseJacContext(data);
+
+    for(row = dasslData->N-1; row >= 0 ; row--)
+    {
+      matrixA[col*dasslData->N + row] = (dasslData->newdelta[row] - delta[row]) * deltaInv;
+      // -I*cj will be added in callJacobian()
+    }
+    y[col] = ysave;
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Calculate colored Jacobian matrix numericaly.
+ *
+ * Calculate Jacobian matrix using forward finite differences and use coloring.
+ *
+ * @param t         Independent variable (time).
+ * @param y         Array with state variables, size dasslData->N.
+ * @param yprime    Array with state derivatives, size dasslData->N.
+ * @param delta     Previous f(t,y) - dy, Array of size dasslData->N.
+ * @param matrixA   On output contains values of Jacobian matrix
+ *                  J = (∂F)/(∂y).
+ *                  Array of size dasslData->N*dasslData->N, storing matrix in row-major order.
+ * @param cj        Specified by library interface. Given to residualFunction, which ignores it.
+ * @param h         Step size of DASSL solver.
+ * @param wt        Array with error weights, size dasslData->N.
+ * @param rpar      Struct storing user data.
+ *                  Type: {DATA*, DASSL_DATA*, threadData_t*}
+ * @param ipar      Specified by library interface. Given to residualFunction, which ignores it.
+ * @return int      Return 0.
+ */
+int jacA_numColored(double *t, double *y, double *yprime, double *delta,
+                    double *matrixA, double *cj, double *h, double *wt,
+                    double *rpar, int *ipar)
+{
+
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  DASSL_DATA* dasslData = (DASSL_DATA*)(void*)((double**)rpar)[1];
+  threadData_t *threadData = (threadData_t*)(void*)((double**)rpar)[2];
+
+  const int index = data->callback->INDEX_JAC_A;
+  JACOBIAN* jacobian = &(data->simulationInfo->analyticJacobians[index]);
+
+  double delta_hhh;
+  int ires;
+  double* delta_hh = dasslData->delta_hh;
+  double* ysave = dasslData->ysave;
+
+  unsigned int i,j,l,k,ii;
+
+  /* set context for the start values extrapolation of non-linear algebraic loops */
+  setContext(data, *t, CONTEXT_JACOBIAN);
+
+  for(i = 0; i < jacobian->sparsePattern->maxColors; i++)
+  {
+    for(ii=0; ii < jacobian->sizeCols; ii++)
+    {
+      if(jacobian->sparsePattern->colorCols[ii]-1 == i)
+      {
+        delta_hhh = *h * yprime[ii];
+        delta_hh[ii] = numericalJacobianStep(y[ii], delta_hhh, fabs(1./wt[ii]),
+                                             dasslData->jacNominalFactor * dasslData->nominal[ii]);
+        delta_hh[ii] = (delta_hhh >= 0 ? delta_hh[ii] : -delta_hh[ii]);
+        delta_hh[ii] = y[ii] + delta_hh[ii] - y[ii];    // Due to floating-point arithmetic rounding errors can result in: delta_hh[ii] != y[ii] + delta_hh[ii] - y[ii]
+
+        ysave[ii] = y[ii];
+        y[ii] += delta_hh[ii];
+
+        delta_hh[ii] = 1. / delta_hh[ii];
+      }
+    }
+    (*dasslData->residualFunction)(t, y, yprime, cj, dasslData->newdelta, &ires, rpar, ipar);
+
+    increaseJacContext(data);
+
+    for(ii = 0; ii < jacobian->sizeCols; ii++)
+    {
+      if(jacobian->sparsePattern->colorCols[ii]-1 == i)
+      {
+        j = jacobian->sparsePattern->leadindex[ii];
+        while(j < jacobian->sparsePattern->leadindex[ii+1])
+        {
+          l  =  jacobian->sparsePattern->index[j];
+          k  = l + ii*jacobian->sizeRows;
+          matrixA[k] = (dasslData->newdelta[l] - delta[l]) * delta_hh[ii];
+          // -I*cj will be added in callJacobian()
+          j++;
+        };
+        y[ii] = ysave[ii];
+      }
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Calculate Jacobian.
+ *
+ * @param t         Independent variable (time).
+ * @param y         Array with state variables, size dasslData->N.
+ * @param yprime    Array with state derivatives, size dasslData->N.
+ * @param deltaD    Previous F(t,y,y') := f(t,y) - y'
+ *                  Array of size dasslData->N.
+ * @param pd        On output contains values of Jacobian matrix
+ *                  J = (∂F)/(∂y) + cj * (∂F)/(∂y').
+ *                  Array of size dasslData->N*dasslData->N, storing matrix in row-major order.
+ * @param cj        Coefficient from BDF method, cj =  1/alpha = h_n / alpha_n,0
+ * @param h         Step size of DASSL solver.
+ * @param wt        Array with error weights, size dasslData->N.
+ * @param rpar      Struct storing user data.
+ * @param ipar      Type: {DATA*, DASSL_DATA*, threadData_t*}
+ * @return int      Specified by library interface. Given to residualFunction, which ignores it.
+ */
+static int callJacobian(double *t, double *y, double *yprime, double *deltaD,
+                        double *pd, double *cj, double *h, double *wt,
+                        double *rpar, int* ipar)
+{
+  DATA* data = (DATA*)(void*)((double**)rpar)[0];
+  DASSL_DATA* dasslData = (DASSL_DATA*)(void*)((double**)rpar)[1];
+  threadData_t *threadData = (threadData_t*)(void*)((double**)rpar)[2];
+  int i;
+
+  /* profiling */
+  if (measure_time_flag) rt_accumulate(SIM_TIMER_SOLVER);
+  rt_tick(SIM_TIMER_JACOBIAN);
+
+  /* Initialize dense Jacobian buffer. */
+  memset(pd, 0, dasslData->N * dasslData->N * sizeof(double));
+
+  /* Compute J = (∂F)/(∂y) */
+  if(dasslData->jacobianFunction(t, y, yprime, deltaD, pd, cj, h, wt, rpar, ipar))
+  {
+    throwStreamPrint(threadData, "Error, can not get Matrix A ");
+    return 1;
+  }
+
+  /* Compute J += cj * (∂F)/(∂y') = cj*(-I) */
+  for(i = 0; i < dasslData->N*dasslData->N; i += dasslData->N + 1)
+  {
+    pd[i] -= *cj;
+  }
+
+  /* debug */
+  /* Compare evaluated Jacobian against a numerical reference.
+   * Only meaningful when the configured method is not already numerical. */
+  if (OMC_ACTIVE_STREAM(OMC_LOG_JAC)
+      && dasslData->dasslJacobian != COLOREDNUMJAC
+      && dasslData->dasslJacobian != NUMJAC)
+  {
+    // print the analytical Jacobian for debugging
+    printJacobianMatrix(OMC_LOG_JAC, "DASSL-Solver: analytical Jacobian pd (column-major)", pd,
+                        data, dasslData->N, *t);
+
+    // and print comparison to numerical Jacobian
+    double* pdNumerical = (double*) calloc(dasslData->N * dasslData->N, sizeof(double));
+    if (pdNumerical != NULL)
+    {
+      int row, col, k;
+      double absDiff, relDiff;
+      double maxAbsDiff = 0.0, maxRelDiff = 0.0;
+      int maxAbsRow = 0, maxAbsCol = 0, maxRelRow = 0, maxRelCol = 0;
+
+      /* Compute numerical Jacobian ∂F/∂y using finite differences */
+      jacA_num(t, y, yprime, deltaD, pdNumerical, cj, h, wt, rpar, ipar);
+
+      /* Apply the same cj * ∂F/∂y' = -cj*I correction */
+      for (k = 0; k < dasslData->N * dasslData->N; k += dasslData->N + 1)
+      {
+        pdNumerical[k] -= *cj;
+      }
+
+      /* Find maximum absolute and relative element-wise differences */
+      for(col = 0; col < dasslData->N; col++)
+      {
+        for(row = 0; row < dasslData->N; row++)
+        {
+          int idx = col * dasslData->N + row;
+          absDiff = fabs(pd[idx] - pdNumerical[idx]);
+          relDiff = absDiff / fmax(fabs(pdNumerical[idx]), 1e-15);
+          if(absDiff > maxAbsDiff) { maxAbsDiff = absDiff; maxAbsRow = row; maxAbsCol = col; }
+          if(relDiff > maxRelDiff) { maxRelDiff = relDiff; maxRelRow = row; maxRelCol = col; }
+        }
+      }
+
+      infoStreamPrint(OMC_LOG_JAC, 1, "Jacobian verification: analytical vs. numerical");
+      infoStreamPrint(OMC_LOG_JAC, 0,
+                      "Max absolute difference: %g at (row=%d:'%s', col=%d:'%s')",
+                      maxAbsDiff, maxAbsRow, data->modelData->realVarsData[maxAbsRow].info.name,
+                      maxAbsCol, data->modelData->realVarsData[maxAbsCol].info.name);
+      infoStreamPrint(OMC_LOG_JAC, 0,
+                      "Max relative difference: %g at (row=%d:'%s', col=%d:'%s')",
+                      maxRelDiff, maxRelRow, data->modelData->realVarsData[maxRelRow].info.name,
+                      maxRelCol, data->modelData->realVarsData[maxRelCol].info.name);
+      messageClose(OMC_LOG_JAC);
+      free(pdNumerical);
+    }
+  }
+
+  /* set context for the start values extrapolation of non-linear algebraic loops */
+  unsetContext(data);
+
+  /* profiling */
+  rt_accumulate(SIM_TIMER_JACOBIAN);
+  if (measure_time_flag) rt_tick(SIM_TIMER_SOLVER);
+
+  return 0;
+}
+
+#ifdef __cplusplus
+}
+#endif

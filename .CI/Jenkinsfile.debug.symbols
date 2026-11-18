@@ -1,0 +1,84 @@
+def common
+pipeline {
+  agent none
+  options {
+    skipDefaultCheckout()
+    buildDiscarder(logRotator(numToKeepStr: "15", artifactNumToKeepStr: "5"))
+  }
+  stages {
+    stage('Environment') {
+      agent {
+        node {
+          label '!windows'
+          customWorkspace 'ws/OpenModelica'
+        }
+      }
+      options {
+        retry(count: 2, conditions: [nonresumable()])
+      }
+      steps {
+        script {
+          if (changeRequest()) {
+            def buildNumber = env.BUILD_NUMBER as int
+            if (buildNumber > 1) milestone(buildNumber - 1)
+            milestone(buildNumber)
+          }
+          // common.checkoutSCM(), which is not loaded yet
+          echo "Checking out on ${env.NODE_NAME} in ${env.WORKSPACE}"
+          int attempt = 0
+          retry(2) {
+            if (attempt++ > 0) {
+              sh script: 'git submodule absorbgitdirs && git submodule deinit --all -f', returnStatus: true
+            }
+            checkout(scm).each { k, v -> env.setProperty(k, v) }
+          }
+          common = load("${env.workspace}/.CI/common.groovy")
+        }
+      }
+    }
+    stage('Ubuntu-Noble') {
+      agent {
+        docker {
+          image 'docker.openmodelica.org/build-deps:noble.nightly.amd64'
+          label 'linux'
+          alwaysPull true
+          args "--mount type=volume,source=omlibrary-cache,target=/cache/omlibrary " +
+                "-v /var/lib/jenkins/gitcache:/var/lib/jenkins/gitcache"
+          customWorkspace 'ws/OpenModelica'
+        }
+      }
+      options {
+        retry(count: 2, conditions: [nonresumable()])
+      }
+      steps {
+        script { common.checkoutSCM() }
+        script {
+          // RelWithDebInfo: this job ships the debug symbols. Builds the GUI
+          // clients too.
+          common.buildOMC([
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            "-DOM_USE_CCACHE=OFF",
+            "-DCMAKE_INSTALL_PREFIX=build",
+            "-DCMAKE_C_COMPILER=clang",
+            "-DCMAKE_CXX_COMPILER=clang++"])
+        }
+        sh 'tar -zcf omdebug.tar.gz ./build/'
+        script {
+          def remote = [:]
+          remote.name = "build"
+          remote.host = "build.openmodelica.org"
+          remote.allowAnyHosts = true
+          withCredentials([sshUserPrivateKey(credentialsId: 'Hudson-SSH-Key', keyFileVariable: 'identity')]) {
+            remote.user = 'hudson'
+            remote.identityFile = identity
+            dir('./') {
+              findFiles(glob: 'omdebug.tar.gz' ).each {
+                sshPut remote: remote, from: it.toString(), into: "/var/www/build.openmodelica.org/linux/releases/debug/"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

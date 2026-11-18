@@ -1,0 +1,16 @@
+// name:     ParseFullModelica
+// keywords: parse
+// status:   correct
+//
+// Parse/Unparse entire MSL (default version)
+//
+
+loadModel(Modelica);getErrorString();
+loadString(list());getErrorString();
+
+// Result:
+// true
+// ""
+// true
+// ""
+// endResult

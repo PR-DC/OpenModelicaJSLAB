@@ -1,0 +1,38 @@
+// name:     asmaFlow.mos [BUG: #2429]
+// keywords: remove simple equation bug testing
+// status:   correct
+// teardown_command: rm -rf asmaFlow_* asmaFlow asmaFlow.exe
+
+loadModel(Modelica, {"4.1.0"}); getErrorString();
+loadFile("asmaFlow.mo"); getErrorString();
+simulate(asmaFlow); getErrorString();
+val(aimc.flange.tau, 0);
+val(aimc.inertiaRotor.flange_b.tau, 0);
+
+// Result:
+// true
+// ""
+// true
+// ""
+// record SimulationResult
+//     resultFile = "asmaFlow_res.mat",
+//     simulationOptions = "startTime = 0.0, stopTime = 20.0, numberOfIntervals = 10000, tolerance = 1e-6, method = 'auto', fileNamePrefix = 'asmaFlow', options = '', outputFormat = 'mat', variableFilter = '.*', cflags = '', simflags = ''",
+//     messages = "LOG_SUCCESS       | info    | The initialization finished successfully without homotopy method.
+// LOG_SUCCESS       | info    | The simulation finished successfully.
+// "
+// end SimulationResult;
+// "[Modelica 4.1.0+maint.om/Electrical/Machines/Utilities/TerminalBox.mo:4:3-6:29:writable] Warning: Parameter terminalBox.terminalConnection has no value, and is fixed during initialization (fixed=true), using available start value (start=\"Y\") as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Interfaces/PartialBasicInductionMachine.mo:8:3-10:65:writable] Warning: Parameter aimc.TsOperational has no value, and is fixed during initialization (fixed=true), using available start value (start=293.15) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Interfaces/PartialBasicInductionMachine.mo:14:3-16:67:writable] Warning: Parameter aimc.TsRef has no value, and is fixed during initialization (fixed=true), using available start value (start=293.15) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Interfaces/PartialBasicInductionMachine.mo:17:3-19:67:writable] Warning: Parameter aimc.alpha20s has no value, and is fixed during initialization (fixed=true), using available start value (start=0) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/BasicMachines/InductionMachines/IM_SquirrelCage.mo:36:3-38:67:writable] Warning: Parameter aimc.TrRef has no value, and is fixed during initialization (fixed=true), using available start value (start=293.15) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/BasicMachines/InductionMachines/IM_SquirrelCage.mo:39:3-41:67:writable] Warning: Parameter aimc.alpha20r has no value, and is fixed during initialization (fixed=true), using available start value (start=0) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/BasicMachines/InductionMachines/IM_SquirrelCage.mo:42:3-44:70:writable] Warning: Parameter aimc.TrOperational has no value, and is fixed during initialization (fixed=true), using available start value (start=293.15) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Losses/CoreParameters.mo:8:3-9:75:writable] Warning: Parameter aimc.statorCoreParameters.VRef has no value, and is fixed during initialization (fixed=true), using available start value (start=100.0) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Losses/StrayLoadParameters.mo:6:3-7:48:writable] Warning: Parameter aimc.strayLoadParameters.IRef has no value, and is fixed during initialization (fixed=true), using available start value (start=100.0) as default value.
+// [Modelica 4.1.0+maint.om/Electrical/Machines/Losses/CoreParameters.mo:8:3-9:75:writable] Warning: Parameter aimc.statorCoreParameters.VRef has no value, and is fixed during initialization (fixed=true), using available start value (start=100.0) as default value.
+// Warning: The initial conditions are not fully specified. For more information set -d=initialization. In OMEdit Tools->Options->Simulation->Show additional information from the initialization process, in OMNotebook call setCommandLineOptions(\"-d=initialization\").
+// "
+// -15.0
+// -15.0
+// endResult

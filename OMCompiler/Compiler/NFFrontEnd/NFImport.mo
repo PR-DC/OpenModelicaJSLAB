@@ -1,0 +1,212 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated uniontype NFImport
+  import NFInstNode.InstNode;
+  import NFInstNode;
+
+protected
+  import Absyn;
+  import Class = NFClass;
+  import Inst = NFInst;
+  import Lookup = NFLookup;
+  import NFClassTree.ClassTree;
+
+  import Import = NFImport;
+  import Error;
+  import ErrorTypes;
+
+public
+  record UNRESOLVED_IMPORT
+    Absyn.Import imp;
+    NFInstNode.ScopeRef scope "Weakly: the class tree owns the scope this
+      import sits in.";
+    SourceInfo info;
+  end UNRESOLVED_IMPORT;
+
+  record RESOLVED_IMPORT
+    NFInstNode.ScopeRef node "Weakly: the class tree owns the imported node.";
+    String shortName;
+    SourceInfo info;
+  end RESOLVED_IMPORT;
+
+  record CONFLICTING_IMPORT
+    Import imp1;
+    Import imp2;
+  end CONFLICTING_IMPORT;
+
+  function name
+    input Import imp;
+    output String name;
+  algorithm
+    name := match imp
+      case UNRESOLVED_IMPORT() then AbsynUtil.importName(imp.imp);
+      case RESOLVED_IMPORT() then InstNode.name(InstNode.borrow(imp.node));
+    end match;
+  end name;
+
+  function info
+    input Import imp;
+    output SourceInfo info;
+  algorithm
+    info := match imp
+      case UNRESOLVED_IMPORT() then imp.info;
+      case RESOLVED_IMPORT() then imp.info;
+    end match;
+  end info;
+
+  function resolve
+    input Import imp;
+    output InstNode node;
+    output Boolean changed;
+    output Import outImport;
+  algorithm
+    (outImport, node, changed) := match imp
+      case UNRESOLVED_IMPORT()
+        algorithm
+          (outImport, node) := instQualified(imp.imp, InstNode.fromCell(imp.scope), imp.info);
+        then
+          (outImport, node, true);
+
+      case RESOLVED_IMPORT()
+        then (imp, InstNode.fromCell(imp.node), false);
+
+      case CONFLICTING_IMPORT()
+        algorithm
+          printImportError(imp.imp1, imp.imp2);
+        then
+          fail();
+
+    end match;
+  end resolve;
+
+  function resolveList
+    input array<Import> imps;
+    output list<Import> resolvedImps = {};
+  algorithm
+    for imp in imps loop
+      try
+        (_, _, imp) := resolve(imp);
+
+        resolvedImps := match imp
+          case UNRESOLVED_IMPORT(imp = Absyn.Import.UNQUAL_IMPORT()) then instUnqualified(imp, resolvedImps);
+          else imp :: resolvedImps;
+        end match;
+      else
+      end try;
+    end for;
+  end resolveList;
+
+  function instQualified
+    input Absyn.Import imp;
+    input InstNode scope;
+    input SourceInfo info;
+    output Import outImport;
+    output InstNode node;
+  protected
+    String short_name;
+  algorithm
+    node := match imp
+      case Absyn.Import.NAMED_IMPORT()
+        then Lookup.lookupImport(imp.path, scope, info);
+
+      case Absyn.Import.QUAL_IMPORT()
+        then Lookup.lookupImport(imp.path, scope, info);
+    end match;
+
+    short_name := match imp
+      case Absyn.Import.NAMED_IMPORT() then imp.name;
+      else "";
+    end match;
+
+    outImport := RESOLVED_IMPORT(InstNode.scopeRef(node), short_name, info);
+  end instQualified;
+
+  function instUnqualified
+    input Import imp;
+    input output list<Import> imps = {};
+  protected
+    Absyn.Path path;
+    InstNode node;
+    NFInstNode.ScopeRef scope;
+    ClassTree tree;
+    SourceInfo info;
+  algorithm
+    UNRESOLVED_IMPORT(imp = Absyn.Import.UNQUAL_IMPORT(path = path), scope = scope, info = info) := imp;
+
+    node := Lookup.lookupImport(path, InstNode.fromCell(scope), info);
+    node := Inst.instPackage(node, NFInstContext.NO_CONTEXT);
+    tree := Class.classTree(InstNode.getClass(node));
+
+    () := match tree
+      case ClassTree.FLAT_TREE()
+        algorithm
+          for cls in tree.classes loop
+            imps := RESOLVED_IMPORT(InstNode.scopeRef(cls), "", info) :: imps;
+          end for;
+
+          for comp in tree.components loop
+            imps := RESOLVED_IMPORT(InstNode.scopeRef(comp), "", info) :: imps;
+          end for;
+        then
+          ();
+
+      else
+        algorithm
+          Error.terminate(getInstanceName() + " got invalid class tree", sourceInfo());
+        then
+          ();
+
+    end match;
+  end instUnqualified;
+
+  function printImportError
+    input Import imp1;
+    input Import imp2;
+  protected
+    ErrorTypes.Message err_msg;
+  algorithm
+    Error.addSourceMessage(Error.ERROR_FROM_HERE, {}, info(imp1));
+
+    err_msg := match imp2
+      case UNRESOLVED_IMPORT() then Error.MULTIPLE_QUALIFIED_IMPORTS_WITH_SAME_NAME;
+      case RESOLVED_IMPORT() then Error.IMPORT_SEVERAL_NAMES;
+    end match;
+
+    Error.addSourceMessage(err_msg, {name(imp2)}, info(imp2));
+  end printImportError;
+
+annotation(__OpenModelica_Interface="nf_frontend");
+end NFImport;

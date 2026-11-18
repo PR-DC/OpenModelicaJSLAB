@@ -1,0 +1,99 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+#ifndef ABSYN_OPERATOR_H
+#define ABSYN_OPERATOR_H
+
+#include <string_view>
+#include <ostream>
+
+#include "MetaModelica.h"
+
+namespace OpenModelica::Absyn
+{
+  class Operator
+  {
+    public:
+      enum Value
+      {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Pow,
+        UnaryPlus,
+        UnaryMinus,
+        AddEw,
+        SubEw,
+        MulEw,
+        DivEw,
+        PowEw,
+        UnaryPlusEw,
+        UnaryMinusEw,
+        And,
+        Or,
+        Not,
+        Less,
+        LessEq,
+        Greater,
+        GreaterEq,
+        Equal,
+        NotEqual
+      };
+
+    public:
+      explicit Operator(MetaModelica::Record value);
+
+      MetaModelica::Value toAbsyn() const noexcept;
+
+      bool isArithmetic() const noexcept;
+      bool isLogical() const noexcept;
+      bool isRelational() const noexcept;
+
+      std::string_view symbol() const noexcept;
+      std::string_view spacedSymbol() const noexcept;
+
+    private:
+      Value _value;
+  };
+
+  inline std::ostream& operator<< (std::ostream &os, Operator op) noexcept
+  {
+    os << op.symbol();
+    return os;
+  }
+}
+
+#endif /* ABSYN_OPERATOR_H */

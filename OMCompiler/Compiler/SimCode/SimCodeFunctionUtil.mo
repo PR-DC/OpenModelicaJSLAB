@@ -1,0 +1,3365 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package SimCodeFunctionUtil "SimCode functions not related to equation systems"
+
+import DAE;
+import AbsynUtil;
+import ClassInf;
+import Settings;
+import Types;
+import Util;
+import Global;
+import ProgramUtil;
+import HashTableStringToPath;
+import SimCodeFunction;
+import SimCodeVar;
+
+protected
+
+import Absyn;
+import Array;
+import Autoconf;
+import BaseHashTable;
+import ComponentReference;
+import ComponentReferenceBasics;
+import DAEDump;
+import DAEUtil;
+import ElementSource;
+import Error;
+import Expression;
+import ExpressionBasics;
+import ExpressionSimplify;
+import Flags;
+import Graph;
+import List;
+import Mod;
+import Patternm;
+import SCode;
+import SCodeUtil;
+import StringUtil;
+import Testsuite;
+import UnorderedMap;
+import Config;
+import System;
+
+public
+
+public function elementVars
+"Used by templates to get a list of variables from a valueblock."
+  input list<DAE.Element> ild;
+  output list<SimCodeFunction.Variable> vars;
+protected
+  list<DAE.Element> ld;
+algorithm
+  ld := List.filterOnTrue(ild, isVarQ);
+  vars := List.map(ld, daeInOutSimVar);
+end elementVars;
+
+public function crefSubIsScalar
+"Used by templates to determine if a component reference's subscripts are
+ scalar."
+  input DAE.ComponentRef cref;
+  output Boolean isScalar;
+protected
+  list<DAE.Subscript> subs;
+algorithm
+  subs := ComponentReferenceBasics.crefSubs(cref);
+  isScalar := subsToScalar(subs);
+end crefSubIsScalar;
+
+protected function subsToScalar "scalar expression."
+  input list<DAE.Subscript> inExpSubscriptLst;
+  output Boolean outBoolean;
+algorithm
+  outBoolean := match inExpSubscriptLst
+    local
+      Boolean b;
+      list<DAE.Subscript> r;
+    case {} then true;
+    case DAE.SLICE() :: _ then false;
+    case DAE.WHOLEDIM() :: _ then false;
+    case DAE.INDEX() :: r
+      algorithm
+        b := subsToScalar(r);
+      then
+        b;
+  end match;
+end subsToScalar;
+
+public function crefNoSub
+"Used by templates to determine if a component reference has no subscripts."
+  input DAE.ComponentRef cref;
+  output Boolean noSub;
+algorithm
+  noSub := not ComponentReference.crefHaveSubs(cref);
+end crefNoSub;
+
+public function inFunctionContext
+  input SimCodeFunction.Context inContext;
+  output Boolean outInFunction;
+algorithm
+  outInFunction := match inContext
+    case SimCodeFunction.FUNCTION_CONTEXT() then true;
+    else false;
+  end match;
+end inFunctionContext;
+
+public function crefIsScalar
+  "Whether a component reference is a scalar depends on what context we are in.
+  If we are generating code for a function, then only crefs without subscripts
+  are scalar. If we are generating code for simulation though, then crefs with
+  only constant subscripts are also scalars, since a variable is generated for
+  each element of an array in the model."
+  input DAE.ComponentRef cref;
+  input SimCodeFunction.Context context;
+  output Boolean isScalar;
+algorithm
+  if inFunctionContext(context) then
+    isScalar := listEmpty(ComponentReference.crefLastSubs(cref));
+  elseif Flags.isSet(Flags.NF_SCALARIZE) then
+    isScalar := ComponentReference.crefHasScalarSubscripts(cref);
+  else
+    isScalar := not ComponentReference.crefHaveSubs(cref);
+  end if;
+end crefIsScalar;
+
+public function buildCrefExpFromAsub
+"Used by templates to convert an ASUB expression to a component reference
+ with subscripts."
+  input DAE.Exp cref;
+  input list<DAE.Exp> subs;
+  output DAE.Exp cRefOut;
+algorithm
+  cRefOut := match(cref, subs)
+    local
+      DAE.Exp crefExp;
+      DAE.Type ty;
+      DAE.ComponentRef crNew;
+      list<DAE.Subscript> indexes;
+
+    case (_, {}) then cref;
+    case (DAE.CREF(componentRef=crNew, ty=ty), _)
+      algorithm
+        indexes := List.map(subs, Expression.makeIndexSubscript);
+        crNew := ComponentReference.subscriptCref(crNew, indexes);
+        crefExp := Expression.makeCrefExp(crNew, ty);
+      then
+        crefExp;
+  end match;
+end buildCrefExpFromAsub;
+
+public function buildCrefExpFromSubs
+"Used by templates to convert an ASUB expression to a component reference
+ with subscripts."
+  input DAE.Exp cref;
+  input list<DAE.Subscript> subs;
+  output DAE.Exp cRefOut;
+algorithm
+  cRefOut := match(cref, subs)
+    local
+      DAE.Exp crefExp;
+      DAE.Type ty;
+      DAE.ComponentRef crNew;
+
+    case (_, {}) then cref;
+    case (DAE.CREF(componentRef=crNew, ty=ty), _)
+      algorithm
+        crNew := ComponentReference.subscriptCref(crNew, subs);
+        crefExp := Expression.makeCrefExp(crNew, ty);
+      then
+        crefExp;
+  end match;
+end buildCrefExpFromSubs;
+
+public function padAsubSubscripts
+"Used by templates: the subscripts of an ASUB of exp, with a whole-dimension
+ subscript for each trailing dimension they leave out."
+  input DAE.Exp exp;
+  input list<DAE.Subscript> subs;
+  output list<DAE.Subscript> outSubs;
+protected
+  Integer n = listLength(Expression.arrayDimension(Expression.typeof(exp))) - listLength(subs);
+algorithm
+  outSubs := if n > 0 then listAppend(subs, List.fill(DAE.WHOLEDIM(), n)) else subs;
+end padAsubSubscripts;
+
+public function incrementInt
+"Used by templates to create new integers that are increments of another."
+  input Integer inInt;
+  input Integer increment;
+  output Integer outInt;
+algorithm
+  outInt := inInt + increment;
+end incrementInt;
+
+public function decrementInt
+"Used by templates to create new integers that are increments of another."
+  input Integer inInt;
+  input Integer decrement;
+  output Integer outInt;
+algorithm
+  outInt := inInt - decrement;
+end decrementInt;
+
+
+public function protectedVars
+    input list<SimCodeVar.SimVar> InSimVars;
+    output list<SimCodeVar.SimVar> OutSimVars;
+   algorithm
+   OutSimVars:= List.filterOnTrue(InSimVars,isNotProtected);
+end protectedVars;
+
+protected function isNotProtected
+  input SimCodeVar.SimVar simVar;
+  output Boolean isProtected;
+algorithm
+  SimCodeVar.SIMVAR(isProtected=isProtected) := simVar;
+  isProtected := not isProtected;
+end isNotProtected;
+
+
+public function makeCrefRecordExp
+"Helper function to generate records."
+  input DAE.ComponentRef inCRefRecord;
+  input DAE.Var inVar;
+  output DAE.Exp outExp;
+algorithm
+  outExp := match (inCRefRecord, inVar)
+    local
+      DAE.ComponentRef cr, cr1;
+      String name;
+      DAE.Type tp;
+    case (cr, DAE.TYPES_VAR(name=name, ty=tp))
+      algorithm
+        cr1 := ComponentReference.crefPrependIdent(cr, name, {}, tp);
+        outExp := Expression.makeCrefExp(cr1, tp);
+      then
+        outExp;
+  end match;
+end makeCrefRecordExp;
+
+public function splitRecordAssignmentToMemberAssignments
+"This function is used by the templates to split up a record assignment to
+ assignments of each of the members. This is needed in simulation context
+ since there is no 'record' per se. Instead the elements(locations) of the record are
+ scattered through the SIMVAR structure.
+
+ Note that this does not recurse to check if a member itself is a record as well i.e.
+ we generate an assignment of records. But since these assignments are sent the codegen
+ template we will indirectly come back here and resolve them."
+  input DAE.ComponentRef lhs_cref;
+  input DAE.Type lhs_type;
+  input String rhs_cref_str;
+  output list<DAE.Statement> outAssigns;
+protected
+  DAE.ComponentRef rhs_cref;
+algorithm
+
+  outAssigns := {};
+  rhs_cref := DAE.CREF_IDENT(rhs_cref_str, lhs_type, {});
+
+  () := match lhs_type
+    local
+      DAE.Exp l_v_exp, r_v_exp;
+      DAE.Statement stmt;
+
+    case DAE.T_COMPLEX() algorithm
+      for v in lhs_type.varLst loop
+        // l_v_cref := ComponentReference.crefPrependIdent(lhs_cref, v.name, {}, v.ty);
+        // r_v_cref := ComponentReference.crefPrependIdent(rhs_cref, v.name, {}, v.ty);
+
+        // l_v_exp := Expression.makeCrefExp(l_v_cref, v.ty);
+        // r_v_exp := Expression.makeCrefExp(r_v_cref, v.ty);
+
+        l_v_exp := makeCrefRecordExp(lhs_cref, v);
+        r_v_exp := makeCrefRecordExp(rhs_cref, v);
+
+        if Types.isArray(v.ty) then
+          stmt := DAE.STMT_ASSIGN_ARR(v.ty, l_v_exp, r_v_exp, DAE.emptyElementSource);
+        else
+          stmt := DAE.STMT_ASSIGN(v.ty, l_v_exp, r_v_exp, DAE.emptyElementSource);
+        end if;
+
+        outAssigns := stmt::outAssigns;
+      end for;
+
+      outAssigns := listReverse(outAssigns);
+    then ();
+
+  end match;
+end splitRecordAssignmentToMemberAssignments;
+
+public function derComponentRef
+"Used by templates to derrive a cref in a der(cref) expression.
+ Particularly, this function is called for the C# code generator,
+ while for C/C++, it is solved by prefixing the cref with '$P$DER' in daeExpCall() template.
+ The prefixing technique is not usable for C#, because there is no macroprocessor in C#.
+ TODO: all der(cref) expressions should be eliminated before the expressions enter templates
+       to pull this logic (and this function) out of templates."
+  input DAE.ComponentRef inCref;
+  output DAE.ComponentRef derCref;
+algorithm
+  derCref := ComponentReference.crefPrefixDer(inCref);
+end derComponentRef;
+
+public function hackArrayReverseToCref
+"This is a hack transformation of an expanded array back to its cref.
+It is used in daeExpArray() (for C# yet) to optimize the generated code.
+TODO: This function should not exist!
+Rather the array should not be let expanded when SimCode is entering templates.
+"
+  input DAE.Exp inExp;
+  input SimCodeFunction.Context context;
+  output DAE.Exp outExp;
+algorithm
+  outExp := matchcontinue inExp
+    local
+      list<DAE.Exp> aRest;
+      DAE.ComponentRef cr;
+      DAE.Type aty;
+      DAE.Exp crefExp;
+
+    case DAE.ARRAY(ty=aty, scalar=true, array =(DAE.CREF(componentRef=cr) ::aRest))
+      algorithm
+        failure(SimCodeFunction.FUNCTION_CONTEXT():=context); // only in the function context
+        { DAE.INDEX(DAE.ICONST(1)) } := ComponentReference.crefLastSubs(cr);
+        cr := ComponentReferenceBasics.crefStripLastSubs(cr);
+        true := isArrayExpansion(aRest, cr, 2);
+        crefExp := Expression.makeCrefExp(cr, aty);
+      then
+        crefExp;
+
+    else inExp;
+
+  end matchcontinue;
+end hackArrayReverseToCref;
+
+protected function isArrayExpansion
+"Helper funtion to hackArrayReverseToCref."
+  input list<DAE.Exp> inArrayElems;
+  input DAE.ComponentRef inCref;
+  input Integer index;
+  output Boolean isExpanded;
+algorithm
+  isExpanded := matchcontinue inArrayElems
+    local
+      list<DAE.Exp> aRest;
+      Integer i;
+      DAE.ComponentRef cr;
+    case {} then true;
+    case DAE.CREF(componentRef=cr) :: aRest
+      algorithm
+        { DAE.INDEX(DAE.ICONST(i)) } := ComponentReference.crefLastSubs(cr);
+        true := (i == index);
+        cr := ComponentReferenceBasics.crefStripLastSubs(cr);
+        true := ComponentReferenceBasics.crefEqualNoStringCompare(inCref, cr);
+      then isArrayExpansion(aRest, inCref, index+1);
+    else false;
+  end matchcontinue;
+end isArrayExpansion;
+
+public function hackMatrixReverseToCref
+"This is a hack transformation of an expanded matrix back to its cref.
+It is used in daeExpMatrix() (for C# yet) to optimize the generated code.
+TODO: This function should not exist!
+Rather the matrix should not be let expanded when SimCode is entering templates
+"
+  input DAE.Exp inExp;
+  input SimCodeFunction.Context context;
+  output DAE.Exp outExp;
+algorithm
+  outExp := matchcontinue inExp
+    local
+      DAE.ComponentRef cr;
+      DAE.Type aty;
+      list<list<DAE.Exp>> rows;
+      DAE.Exp crefExp;
+
+    case DAE.MATRIX(ty=aty, matrix = rows as (((DAE.CREF(componentRef=cr))::_)::_) )
+      algorithm
+        failure(SimCodeFunction.FUNCTION_CONTEXT():=context);
+        { DAE.INDEX(DAE.ICONST(1)), DAE.INDEX(DAE.ICONST(1)) } := ComponentReference.crefLastSubs(cr);
+        cr := ComponentReferenceBasics.crefStripLastSubs(cr);
+        true := isMatrixExpansion(rows, cr, 1, 1);
+        crefExp := Expression.makeCrefExp(cr, aty);
+      then
+        crefExp;
+
+    else inExp;
+
+  end matchcontinue;
+end hackMatrixReverseToCref;
+
+protected function isMatrixExpansion
+"Helper funtion to hackMatrixReverseToCref."
+  input list<list<DAE.Exp>> rows;
+  input DAE.ComponentRef inCref;
+  input Integer rowIndex;
+  input Integer colIndex;
+  output Boolean isExpanded;
+algorithm
+  isExpanded := matchcontinue rows
+    local
+      list<list<DAE.Exp>> restRows;
+      list<DAE.Exp> restElems;
+      Integer r, c;
+      DAE.ComponentRef cr;
+    case {} then true;
+    case {} :: restRows then isMatrixExpansion(restRows, inCref, rowIndex+1, 1);
+    case (DAE.CREF(componentRef=cr) :: restElems) :: restRows
+      algorithm
+        { DAE.INDEX(DAE.ICONST(r)), DAE.INDEX(DAE.ICONST(c)) } := ComponentReference.crefLastSubs(cr);
+        true := (r == rowIndex) and (c == colIndex);
+        cr := ComponentReferenceBasics.crefStripLastSubs(cr);
+        true := ComponentReferenceBasics.crefEqualNoStringCompare(inCref, cr);
+      then isMatrixExpansion(restElems :: restRows, inCref, rowIndex, colIndex+1);
+    else false;
+  end matchcontinue;
+end isMatrixExpansion;
+
+public function hackGetFirstExternalFunctionLib
+"This is a hack to get the original library name given to an external function.
+TODO: redesign OMC and Modelica specification so they are not so C/C++ centric."
+  input list<String> libs;
+  output String outFirstLib;
+algorithm
+  outFirstLib := matchcontinue libs
+    local
+      String lib;
+
+    case _
+      algorithm
+        lib := List.last(libs);
+        lib := System.stringReplace(lib, "-l", "");
+      then
+        lib;
+
+    else "NO_LIB";
+
+  end matchcontinue;
+end hackGetFirstExternalFunctionLib;
+
+public function createAssertforSqrt
+   input DAE.Exp inExp;
+   output DAE.Exp outExp;
+algorithm
+  outExp :=
+  match inExp
+    case _
+      algorithm
+        // Simplify things like abs(exp) >= 0 to exp
+        (outExp, _) := ExpressionSimplify.simplify(DAE.RELATION(inExp, DAE.GREATEREQ(DAE.T_REAL_DEFAULT), DAE.RCONST(0.0), -1, NONE()));
+      then outExp;
+  end match;
+end createAssertforSqrt;
+
+public function createDAEString
+   input String inString;
+   output DAE.Exp outExp;
+   annotation(__OpenModelica_EarlyInline = true);
+algorithm
+  outExp := DAE.SCONST(inString);
+end createDAEString;
+
+/* end of TypeView published functions */
+
+// =============================================================================
+// section to generate SimCode from functions
+//
+// Finds the called functions in BackendDAE and transforms them to a list of
+// libraries and a list of SimCodeFunction.Function uniontypes.
+// =============================================================================
+
+protected function orderRecordDecls
+  input SimCodeFunction.RecordDeclaration decl1;
+  input SimCodeFunction.RecordDeclaration decl2;
+  output Boolean b;
+algorithm
+  b := match (decl1,decl2)
+    local
+      Absyn.Path path1,path2;
+    case (SimCodeFunction.RECORD_DECL_DEF(path=path1),SimCodeFunction.RECORD_DECL_DEF(path=path2)) then AbsynUtil.pathGe(path1,path2);
+    else true;
+  end match;
+end orderRecordDecls;
+
+public function elaborateFunctions
+  input Absyn.Program program;
+  input list<DAE.Function> daeElements;
+  input list<DAE.Type> metarecordTypes;
+  input list<DAE.Exp> literals;
+  input list<String> includes;
+  output list<SimCodeFunction.Function> functions;
+  output list<SimCodeFunction.RecordDeclaration> recordDecls;
+  output list<String> outIncludes;
+  output list<String> includeDirs;
+  output list<String> libs;
+  output list<String> libpaths;
+protected
+  HashTableStringToPath.HashTable ht;
+  list<tuple<SimCodeFunction.RecordDeclaration,list<SimCodeFunction.RecordDeclaration>>> g;
+  UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  recDeclsMap := UnorderedMap.new<SimCodeFunction.RecordDeclaration>(stringHashDjb2, stringEq);
+  (functions, outIncludes, includeDirs, libs, libpaths) := elaborateFunctions2(program, daeElements, {}, includes, {}, {}, {}, recDeclsMap);
+
+  collectRecDeclsFromMetaRecCallExps(literals, recDeclsMap);
+  collectRecDeclsFromTypes(metarecordTypes, recDeclsMap);
+  addRecordDeclsForExtraConstructors(recDeclsMap);
+
+  recordDecls := UnorderedMap.valueList(recDeclsMap);
+  recordDecls := List.sort(recordDecls, orderRecordDecls);
+
+  ht := HashTableStringToPath.emptyHashTableSized(BaseHashTable.lowBucketSize);
+  (recordDecls,_) := List.mapFold(recordDecls, aliasRecordDeclarations, ht);
+  // Topological sort since we have no guarantees in the order of generated records
+  g := Graph.buildGraph(recordDecls, getRecordDependencies, recordDecls);
+  (recordDecls, {}) := Graph.topologicalSort(g, isRecordDeclEqual);
+end elaborateFunctions;
+
+protected function addRecordDeclsForExtraConstructors
+  "An extra constructor builds a struct of its record type, which is otherwise
+   only declared where the record is used with its own defaults. Added after
+   collecting, so that such a use always provides the declaration."
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  for decl in UnorderedMap.valueList(recDeclsMap) loop
+    () := match decl
+      case SimCodeFunction.RECORD_DECL_ADD_CONSTRCTOR() guard not UnorderedMap.contains(decl.name, recDeclsMap)
+        algorithm
+          UnorderedMap.add(decl.name, SimCodeFunction.RECORD_DECL_FULL(decl.name, NONE(), decl.defPath,
+            list(variableWithoutBinding(v) for v in decl.variables), decl.usedExternally), recDeclsMap);
+        then ();
+      else ();
+    end match;
+  end for;
+end addRecordDeclsForExtraConstructors;
+
+protected function variableWithoutBinding
+  input output SimCodeFunction.Variable var;
+algorithm
+  () := match var
+    case SimCodeFunction.VARIABLE()
+      algorithm
+        var.value := NONE();
+        var.bind_from_outside := false;
+      then ();
+    else ();
+  end match;
+end variableWithoutBinding;
+
+protected function getRecordDependencies
+  input SimCodeFunction.RecordDeclaration decl;
+  input list<SimCodeFunction.RecordDeclaration> allDecls;
+  output list<SimCodeFunction.RecordDeclaration> dependencies;
+algorithm
+  dependencies := match decl
+    local
+      String name;
+      list<SimCodeFunction.Variable> vars;
+      list<DAE.Type> tys;
+      list<list<DAE.Type>> tyss;
+    case SimCodeFunction.RECORD_DECL_FULL(aliasName=SOME(name))
+      then List.select1(allDecls, recordDeclHasName, name);
+    case SimCodeFunction.RECORD_DECL_ADD_CONSTRCTOR(name=name)
+      then List.select1(allDecls, recordDeclHasName, name);
+    case SimCodeFunction.RECORD_DECL_FULL(variables=vars)
+      algorithm
+        tys := list(getVarType(v) for v in vars);
+        tyss := List.map1(tys, Types.getAllInnerTypesOfType, Util.anyReturnTrue);
+        tys := List.flatten(tyss);
+        dependencies := List.filterMap1(tys, getRecordDependenciesFromType, allDecls);
+      then List.unique(dependencies);
+    else {};
+  end match;
+end getRecordDependencies;
+
+protected function getVarType
+  input SimCodeFunction.Variable var;
+  output DAE.Type ty;
+algorithm
+  ty := match var
+    case SimCodeFunction.VARIABLE(ty=ty) then ty;
+    else DAE.T_ANYTYPE_DEFAULT;
+  end match;
+end getVarType;
+
+protected function getRecordDependenciesFromType
+  input DAE.Type ty;
+  input list<SimCodeFunction.RecordDeclaration> allDecls;
+  output SimCodeFunction.RecordDeclaration decl;
+protected
+  Absyn.Path path;
+  String name;
+algorithm
+  DAE.T_COMPLEX(complexClassType = ClassInf.RECORD(path)) := ty;
+  name := AbsynUtil.pathStringUnquoteReplaceDot(path, "_");
+  decl := List.find1(allDecls, recordDeclHasName, name);
+end getRecordDependenciesFromType;
+
+public function setTrivialRecords
+  "Registers the records whose members are all scalars without references, or
+   such records. The declarations come sorted by their dependencies."
+  input list<SimCodeFunction.RecordDeclaration> recordDecls;
+protected
+  list<String> trivial = {};
+algorithm
+  for decl in recordDecls loop
+    () := match decl
+      case SimCodeFunction.RECORD_DECL_FULL()
+        guard List.all(decl.variables, function isTrivialRecordMember(allDecls = recordDecls, trivial = trivial))
+        algorithm
+          trivial := decl.name :: trivial;
+        then ();
+      else ();
+    end match;
+  end for;
+  setGlobalRoot(Global.trivialRecords, trivial);
+end setTrivialRecords;
+
+public function isTrivialRecord
+  input String name;
+  output Boolean b;
+algorithm
+  b := listMember(name, getGlobalRoot(Global.trivialRecords));
+end isTrivialRecord;
+
+protected function isTrivialRecordMember
+  input SimCodeFunction.Variable var;
+  input list<SimCodeFunction.RecordDeclaration> allDecls;
+  input list<String> trivial;
+  output Boolean b;
+protected
+  String name;
+algorithm
+  b := match getVarType(var)
+    case DAE.T_REAL() then true;
+    case DAE.T_INTEGER() then true;
+    case DAE.T_BOOL() then true;
+    case DAE.T_ENUMERATION() then true;
+    case DAE.T_COMPLEX(complexClassType = ClassInf.RECORD())
+      algorithm
+        try
+          SimCodeFunction.RECORD_DECL_FULL(name = name) := getRecordDependenciesFromType(getVarType(var), allDecls);
+          b := listMember(name, trivial);
+        else
+          b := false;
+        end try;
+      then b;
+    else false;
+  end match;
+end isTrivialRecordMember;
+
+protected function recordDeclHasName
+  input SimCodeFunction.RecordDeclaration decl;
+  input String name;
+  output Boolean b;
+algorithm
+  b := match decl
+    case SimCodeFunction.RECORD_DECL_FULL() then stringEq(name, decl.name);
+    else false;
+  end match;
+end recordDeclHasName;
+
+protected function isRecordDeclEqual
+  input SimCodeFunction.RecordDeclaration decl1;
+  input SimCodeFunction.RecordDeclaration decl2;
+  output Boolean b;
+algorithm
+  b := match (decl1,decl2)
+    case (SimCodeFunction.RECORD_DECL_FULL(),SimCodeFunction.RECORD_DECL_FULL()) then stringEq(decl1.name, decl2.name);
+    case (SimCodeFunction.RECORD_DECL_DEF(),SimCodeFunction.RECORD_DECL_DEF()) then AbsynUtil.pathEqual(decl1.path, decl2.path);
+    else false;
+  end match;
+end isRecordDeclEqual;
+
+protected function elaborateFunctions2
+  input Absyn.Program program;
+  input list<DAE.Function> daeElements;
+  input list<SimCodeFunction.Function> inFunctions;
+  input list<String> inIncludes;
+  input list<String> inIncludeDirs;
+  input list<String> inLibs;
+  input list<String> inPaths;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+  output list<SimCodeFunction.Function> outFunctions;
+  output list<String> outIncludes;
+  output list<String> outIncludeDirs;
+  output list<String> outLibs;
+  output list<String> outLibsPaths;
+algorithm
+  (outFunctions, outIncludes, outIncludeDirs, outLibs,outLibsPaths) :=
+  match (daeElements, inFunctions, inIncludes, inIncludeDirs, inLibs, inPaths)
+    local
+      Boolean b;
+      list<SimCodeFunction.Function> accfns, fns;
+      SimCodeFunction.Function fn;
+      list<String> includes, libs,libPaths;
+      DAE.Function fel;
+      list<DAE.Function> rest;
+      String name, fname;
+      list<String> includeDirs;
+      Absyn.Path path;
+
+    case ({}, accfns, includes, includeDirs, libs, libPaths)
+      then (listReverse(accfns), includes, includeDirs, libs,libPaths);
+    case ((DAE.FUNCTION( type_ = DAE.T_FUNCTION(functionAttributes=DAE.FUNCTION_ATTRIBUTES(isBuiltin=DAE.FUNCTION_BUILTIN_PTR()))) :: rest), accfns, includes, includeDirs, libs, libPaths)
+      algorithm
+        // skip over builtin functions
+        (fns, includes, includeDirs, libs,libPaths) := elaborateFunctions2(program, rest, accfns, includes, includeDirs, libs,libPaths, recDeclsMap);
+      then
+        (fns, includes, includeDirs, libs,libPaths);
+    case ((DAE.FUNCTION(partialPrefix = true) :: rest), accfns, includes, includeDirs, libs, libPaths)
+      algorithm
+        // skip over partial functions
+        (fns, includes, includeDirs, libs,libPaths) := elaborateFunctions2(program, rest, accfns, includes, includeDirs, libs,libPaths, recDeclsMap);
+      then
+        (fns, includes, includeDirs, libs,libPaths);
+    case ((fel as DAE.FUNCTION(path = path, functions = DAE.FUNCTION_EXT(externalDecl = DAE.EXTERNALDECL(name=name, language="builtin"))::_))::rest, accfns, includes, includeDirs, libs, libPaths)
+      algorithm
+        // skip over builtin functions @adrpo: we should skip ONLY IF THE NAME OF THE FUNCTION IS THE SAME AS THE NAME OF THE EXTERNAL FUNCTION!
+        fname := AbsynUtil.pathString(AbsynUtil.makeNotFullyQualified(path));
+        b := stringEq(fname, name);
+        if not b then
+          (fn, includes, includeDirs, libs,libPaths) := elaborateFunction(program, fel, includes, includeDirs, libs,libPaths, recDeclsMap);
+          accfns := fn :: accfns;
+        end if;
+        (fns, includes, includeDirs, libs,libPaths) := elaborateFunctions2(program, rest, accfns, includes, includeDirs, libs,libPaths, recDeclsMap);
+      then
+        (fns, includes, includeDirs, libs,libPaths);
+
+    case ((fel as DAE.FUNCTION(path = path, functions = DAE.FUNCTION_EXT(externalDecl = DAE.EXTERNALDECL(name=name, language="C"))::_))::rest, accfns, includes, includeDirs, libs, libPaths)
+      algorithm
+        // skip over known external C functions @adrpo: we should skip ONLY IF THE NAME OF THE FUNCTION IS THE SAME AS THE NAME OF THE EXTERNAL FUNCTION!
+        fname := AbsynUtil.pathString(AbsynUtil.makeNotFullyQualified(path));
+        b := listMember(name, SCodeUtil.knownExternalCFunctions) and stringEq(fname, name);
+        if not b then
+          (fn, includes, includeDirs, libs,libPaths) := elaborateFunction(program, fel, includes, includeDirs, libs,libPaths, recDeclsMap);
+          accfns := fn :: accfns;
+        end if;
+        (fns, includes, includeDirs, libs,libPaths) := elaborateFunctions2(program, rest, accfns, includes, includeDirs, libs,libPaths, recDeclsMap);
+      then
+        (fns, includes, includeDirs, libs,libPaths);
+
+    case ((fel :: rest), accfns, includes, includeDirs, libs, libPaths)
+      algorithm
+        (fn, includes, includeDirs, libs,libPaths) := elaborateFunction(program, fel, includes, includeDirs, libs,libPaths, recDeclsMap);
+        (fns, includes, includeDirs, libs,libPaths) := elaborateFunctions2(program, rest, (fn :: accfns), includes, includeDirs, libs,libPaths, recDeclsMap);
+      then
+        (fns, includes, includeDirs, libs,libPaths);
+  end match;
+end elaborateFunctions2;
+
+/* Does the actual work of transforming a DAE.FUNCTION to a SimCodeFunction.Function. */
+protected function elaborateFunction
+  input Absyn.Program program;
+  input DAE.Function inElement;
+  input list<String> inIncludes;
+  input list<String> inIncludeDirs;
+  input list<String> inLibs;
+  input list<String> inLibPaths;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+  output SimCodeFunction.Function outFunction;
+  output list<String> outIncludes;
+  output list<String> outIncludeDirs;
+  output list<String> outLibs;
+  output list<String> outLibPaths;
+algorithm
+  (outFunction, outIncludes, outIncludeDirs, outLibs,outLibPaths):=
+  matchcontinue (inElement, inIncludes, inIncludeDirs, inLibs, inLibPaths)
+    local
+      DAE.Function fn;
+      String extfnname, lang;
+      list<DAE.Element> vars; // , bivars, invars, outvars;
+      list<String> includes, libs, libPaths, fn_libs,fn_paths, fn_includes, fn_includeDirs;
+      Absyn.Path fpath;
+      list<DAE.FuncArg> args;
+      DAE.Type restype;
+      list<DAE.ExtArg> extargs;
+      list<SimCodeFunction.SimExtArg> simextargs;
+      SimCodeFunction.SimExtArg extReturn;
+      DAE.ExtArg extretarg;
+      Option<SCode.Annotation> ann;
+      DAE.ExternalDecl extdecl;
+      list<SimCodeFunction.Variable> outVars, inVars, biVars, funArgs, varDecls;
+      list<DAE.Statement> bodyStmts;
+      list<DAE.Element> daeElts;
+      Absyn.Path name;
+      DAE.ElementSource source;
+      SourceInfo info;
+      Boolean dynamicLoad;
+      list<String> includeDirs;
+      DAE.FunctionAttributes funAttrs;
+      list<DAE.Var> varlst;
+      SCode.Visibility visibility;
+
+    // Modelica function
+    case (DAE.FUNCTION(path = fpath, source = source, visibility = visibility,
+      functions = DAE.FUNCTION_DEF(body = daeElts)::_, // might be followed by derivative maps
+      type_ = DAE.T_FUNCTION(funcArg=args, functionAttributes=funAttrs),
+      partialPrefix=false), includes, includeDirs, libs, libPaths)
+      algorithm
+
+        DAE.FUNCTION_ATTRIBUTES(functionParallelism=DAE.FP_NON_PARALLEL()) := funAttrs;
+
+        daeElts := optMRFAElems(daeElts);
+        outVars := List.map(DAEUtil.getOutputElements(daeElts), daeInOutSimVar);
+        funArgs := List.map1(args, typesSimFunctionArg, NONE());
+        collectRecDeclsFromElems(daeElts, recDeclsMap);
+        vars := sortVarDecls(List.filterOnTrue(daeElts, isVarQ));
+        varDecls := List.map(vars, daeInOutSimVar);
+        bodyStmts := listAppend(elaborateStatement(e) for e guard DAEUtil.isAlgorithm(e) in daeElts);
+        info := ElementSource.getElementSourceFileInfo(source);
+      then
+        (SimCodeFunction.FUNCTION(fpath, outVars, funArgs, varDecls, bodyStmts, visibility, info), includes, includeDirs, libs,libPaths);
+
+    // Kernel function
+    case (DAE.FUNCTION(path = fpath, source = source,
+      functions = DAE.FUNCTION_DEF(body = daeElts)::_, // might be followed by derivative maps
+      type_ = DAE.T_FUNCTION(funcArg=args, functionAttributes=funAttrs),
+      partialPrefix=false), includes, includeDirs, libs, libPaths)
+      algorithm
+
+        DAE.FUNCTION_ATTRIBUTES(functionParallelism=DAE.FP_KERNEL_FUNCTION()) := funAttrs;
+
+        daeElts := optMRFAElems(daeElts);
+        outVars := List.map(DAEUtil.getOutputElements(daeElts), daeInOutSimVar);
+        funArgs := List.map1(args, typesSimFunctionArg, NONE());
+        collectRecDeclsFromElems(daeElts, recDeclsMap);
+        vars := sortVarDecls(List.filterOnTrue(daeElts, isVarNotInputNotOutput));
+        varDecls := List.map(vars, daeInOutSimVar);
+        bodyStmts := listAppend(elaborateStatement(e) for e guard DAEUtil.isAlgorithm(e) in daeElts);
+        info := ElementSource.getElementSourceFileInfo(source);
+      then
+        (SimCodeFunction.KERNEL_FUNCTION(fpath, outVars, funArgs, varDecls, bodyStmts, info), includes, includeDirs, libs,libPaths);
+
+    // Parallel function
+    case (DAE.FUNCTION(path = fpath, source = source,
+      functions = DAE.FUNCTION_DEF(body = daeElts)::_, // might be followed by derivative maps
+      type_ = DAE.T_FUNCTION(funcArg=args, functionAttributes = funAttrs),
+      partialPrefix=false), includes, includeDirs, libs, libPaths)
+      algorithm
+
+        DAE.FUNCTION_ATTRIBUTES(functionParallelism=DAE.FP_PARALLEL_FUNCTION()) := funAttrs;
+
+        daeElts := optMRFAElems(daeElts);
+        outVars := List.map(DAEUtil.getOutputElements(daeElts), daeInOutSimVar);
+        funArgs := List.map1(args, typesSimFunctionArg, NONE());
+        collectRecDeclsFromElems(daeElts, recDeclsMap);
+        vars := sortVarDecls(List.filterOnTrue(daeElts, isVarQ));
+        varDecls := List.map(vars, daeInOutSimVar);
+        bodyStmts := listAppend(elaborateStatement(e) for e guard DAEUtil.isAlgorithm(e) in daeElts);
+        info := ElementSource.getElementSourceFileInfo(source);
+      then
+        (SimCodeFunction.PARALLEL_FUNCTION(fpath, outVars, funArgs, varDecls, bodyStmts, info), includes, includeDirs, libs,libPaths);
+
+    // External functions.
+    case (DAE.FUNCTION(path = fpath, source = source, visibility = visibility,
+      functions = DAE.FUNCTION_EXT(body =  daeElts, externalDecl = extdecl)::_, // might be followed by derivative maps
+      type_ = (DAE.T_FUNCTION(funcArg = args))), includes, includeDirs, libs, libPaths)
+      algorithm
+        DAE.EXTERNALDECL(name=extfnname, args=extargs,
+          returnArg=extretarg, language=lang, ann=ann) := extdecl;
+        // outvars = DAEUtil.getOutputElements(daeElts);
+        // invars = DAEUtil.getInputVars(daeElts);
+        // bivars = DAEUtil.getBidirVars(daeElts);
+        funArgs := List.map1(args, typesSimFunctionArg, NONE());
+        outVars := List.map(DAEUtil.getOutputElements(daeElts), daeInOutSimVar);
+        inVars := List.map(DAEUtil.getInputVars(daeElts), daeInOutSimVar);
+        biVars := List.map(DAEUtil.getBidirElements(daeElts), daeInOutSimVar);
+        collectRecDeclsFromElems(daeElts, recDeclsMap);
+        info := ElementSource.getElementSourceFileInfo(source);
+        (fn_includes, fn_includeDirs, fn_libs, fn_paths,dynamicLoad) := generateExtFunctionIncludes(program, fpath, ann, info);
+        includes := List.union(fn_includes, includes);
+        includeDirs := List.union(fn_includeDirs, includeDirs);
+        libs := List.union(fn_libs, libs);
+        libPaths := List.union(fn_paths, libPaths);
+        simextargs := List.map(extargs, extArgsToSimExtArgs);
+        extReturn := extArgsToSimExtArgs(extretarg);
+        (simextargs, extReturn) := fixOutputIndex(outVars, simextargs, extReturn);
+        // make lang to-upper as we have FORTRAN 77 and Fortran 77 in the Modelica Library!
+        lang := System.toupper(lang);
+      then
+        (SimCodeFunction.EXTERNAL_FUNCTION(fpath, extfnname, funArgs, simextargs, extReturn,
+          inVars, outVars, biVars, fn_includes, fn_libs, lang, visibility, info, dynamicLoad), includes, includeDirs, libs,libPaths);
+
+    // Record constructor
+    case (DAE.RECORD_CONSTRUCTOR(source = source, type_ = DAE.T_FUNCTION(funcArg = args, funcResultType = restype as DAE.T_COMPLEX(complexClassType = ClassInf.RECORD(name)))), includes, includeDirs, libs, libPaths)
+      algorithm
+        funArgs := List.map1(args, typesSimFunctionArg, NONE());
+        collectRecDeclsFromType(restype, recDeclsMap);
+        DAE.T_COMPLEX(varLst = varlst) := restype;
+        // varlst = List.filterOnTrue(varlst, Types.isProtectedVar);
+        varlst := List.filterOnFalse(varlst, Types.isModifiableTypesVar);
+        varDecls := List.map(varlst, typesVar);
+        info := ElementSource.getElementSourceFileInfo(source);
+      then
+        (SimCodeFunction.RECORD_CONSTRUCTOR(name, funArgs, varDecls, SCode.PUBLIC(), info), includes, includeDirs, libs,libPaths);
+
+    // failure
+    case (fn, _, _, _, _)
+      algorithm
+        Error.addInternalError("function elaborateFunction failed for function:\n" + DAEDump.dumpFunctionStr(fn), sourceInfo());
+      then
+        fail();
+  end matchcontinue;
+end elaborateFunction;
+
+protected function typesSimFunctionArg
+"Generates code from a function argument."
+  input DAE.FuncArg inFuncArg;
+  input Option<DAE.Exp> binding;
+  output SimCodeFunction.Variable outVar;
+algorithm
+  outVar := matchcontinue inFuncArg
+    local
+      DAE.Type tty;
+      String name;
+      DAE.ComponentRef cref_;
+      DAE.Const const;
+      list<DAE.FuncArg> args;
+      DAE.Type res_ty;
+      list<SimCodeFunction.Variable> var_args;
+      list<DAE.Type> tys;
+      DAE.VarKind kind;
+      DAE.VarParallelism prl;
+
+    case DAE.FUNCARG(name=name, ty=DAE.T_FUNCTION(funcArg = args, funcResultType = DAE.T_TUPLE(types = tys)))
+      algorithm
+        var_args := List.map1(args, typesSimFunctionArg, NONE());
+        tys := List.map(tys, Types.simplifyType);
+      then
+        SimCodeFunction.FUNCTION_PTR(name, tys, var_args, binding);
+
+    case DAE.FUNCARG(name=name, ty=DAE.T_FUNCTION(funcArg = args, funcResultType = DAE.T_NORETCALL()))
+      algorithm
+        var_args := List.map1(args, typesSimFunctionArg, NONE());
+      then
+        SimCodeFunction.FUNCTION_PTR(name, {}, var_args, binding);
+
+    case DAE.FUNCARG(name=name, ty=DAE.T_FUNCTION(funcArg = args, funcResultType = res_ty))
+      algorithm
+        res_ty := Types.simplifyType(res_ty);
+        var_args := List.map1(args, typesSimFunctionArg, NONE());
+      then
+        SimCodeFunction.FUNCTION_PTR(name, {res_ty}, var_args, binding);
+
+    case DAE.FUNCARG(name=name, ty=tty, par=prl, const=const)
+      algorithm
+        tty := Types.simplifyType(tty);
+        cref_  := ComponentReferenceBasics.makeCrefIdent(name, tty, {});
+        kind := DAEUtil.const2VarKind(const);
+      then
+        SimCodeFunction.VARIABLE(cref_, tty, binding, {}, prl, kind, false);
+  end matchcontinue;
+end typesSimFunctionArg;
+
+protected function daeInOutSimVar
+  input DAE.Element inElement;
+  output SimCodeFunction.Variable outVar;
+algorithm
+  outVar := matchcontinue inElement
+    local
+      String name;
+      DAE.Type daeType;
+      DAE.ComponentRef id;
+      DAE.VarKind kind;
+      DAE.VarParallelism prl;
+      list<DAE.Dimension> inst_dims;
+      // list<DAE.Exp> inst_dims_exp;
+      Option<DAE.Exp> binding;
+      SimCodeFunction.Variable var;
+    case DAE.VAR(componentRef = DAE.CREF_IDENT(ident=name), ty = daeType as DAE.T_FUNCTION(), parallelism = prl, binding = binding)
+      algorithm
+        var := typesSimFunctionArg(DAE.FUNCARG(name, daeType, DAE.C_VAR(), prl, NONE()), binding);
+      then var;
+
+    case DAE.VAR(componentRef = id,
+      parallelism = prl,
+      ty = daeType,
+      binding = binding,
+      dims = inst_dims,
+      kind = kind
+    )
+      algorithm
+        daeType := Types.simplifyType(daeType);
+        // inst_dims_exp := List.map(inst_dims, Expression.dimensionSizeExpHandleUnkown);
+      then SimCodeFunction.VARIABLE(id, daeType, binding, inst_dims, prl, kind, false);
+    else
+      algorithm
+        // TODO: ArrayEqn fails here
+        Error.addInternalError("function daeInOutSimVar failed\n", sourceInfo());
+      then
+        fail();
+  end matchcontinue;
+end daeInOutSimVar;
+
+protected function extArgsToSimExtArgs
+  input DAE.ExtArg extArg;
+  output SimCodeFunction.SimExtArg simExtArg;
+algorithm
+  simExtArg :=
+  match extArg
+    local
+      DAE.ComponentRef componentRef;
+      Absyn.Direction dir;
+      DAE.Type type_;
+      Boolean isInput;
+      Boolean isOutput;
+      Boolean isArray;
+      DAE.Exp exp_;
+      Integer outputIndex;
+
+    case DAE.EXTARG(componentRef, dir, type_)
+      algorithm
+        isInput := AbsynUtil.isInput(dir);
+        isOutput := AbsynUtil.isOutput(dir);
+        outputIndex := if isOutput then -1 else 0; // correct output index is added later by fixOutputIndex
+        isArray := Types.isArray(type_);
+        type_ := Types.simplifyType(type_);
+      then SimCodeFunction.SIMEXTARG(componentRef, isInput, outputIndex, isArray, false /*fixed later*/, type_);
+
+    case DAE.EXTARGEXP(exp_, type_)
+      algorithm
+        type_ := Types.simplifyType(type_);
+      then SimCodeFunction.SIMEXTARGEXP(exp_, type_);
+
+    case DAE.EXTARGSIZE(componentRef, type_, exp_)
+      algorithm
+        type_ := Types.simplifyType(type_);
+      then SimCodeFunction.SIMEXTARGSIZE(componentRef, true, 0, type_, exp_);
+
+    case DAE.NOEXTARG() then SimCodeFunction.SIMNOEXTARG();
+  end match;
+end extArgsToSimExtArgs;
+
+protected function fixOutputIndex
+  input list<SimCodeFunction.Variable> outVars;
+  input list<SimCodeFunction.SimExtArg> simExtArgsIn;
+  input SimCodeFunction.SimExtArg extReturnIn;
+  output list<SimCodeFunction.SimExtArg> simExtArgsOut;
+  output SimCodeFunction.SimExtArg extReturnOut;
+algorithm
+  (simExtArgsOut, extReturnOut) := match extReturnIn
+    local
+    case _
+      algorithm
+        simExtArgsOut := List.map1(simExtArgsIn, assignOutputIndex, outVars);
+        extReturnOut := assignOutputIndex(extReturnIn, outVars);
+      then
+        (simExtArgsOut, extReturnOut);
+  end match;
+end fixOutputIndex;
+
+protected function assignOutputIndex
+  input SimCodeFunction.SimExtArg simExtArgIn;
+  input list<SimCodeFunction.Variable> outVars;
+  output SimCodeFunction.SimExtArg simExtArgOut;
+algorithm
+  simExtArgOut :=
+  matchcontinue simExtArgIn
+    local
+      DAE.ComponentRef cref, fcref;
+      Boolean isInput;
+      Integer outputIndex; // > 0 if output
+      Boolean isArray, hasBinding;
+      DAE.Type type_;
+      DAE.Exp exp;
+      Integer newOutputIndex;
+
+    case SimCodeFunction.SIMEXTARG(cref, isInput, outputIndex, isArray, _, type_)
+      algorithm
+        true := outputIndex == -1;
+        fcref := ComponentReferenceBasics.crefFirstCref(cref);
+        (newOutputIndex, hasBinding) := findIndexInList(fcref, outVars, 1);
+      then
+        SimCodeFunction.SIMEXTARG(cref, isInput, newOutputIndex, isArray, hasBinding, type_);
+
+    case SimCodeFunction.SIMEXTARGSIZE(cref, isInput, outputIndex, type_, exp)
+      algorithm
+        true := outputIndex == -1;
+        (newOutputIndex, _) := findIndexInList(cref, outVars, 1);
+      then
+        SimCodeFunction.SIMEXTARGSIZE(cref, isInput, newOutputIndex, type_, exp);
+
+    else
+      simExtArgIn;
+  end matchcontinue;
+end assignOutputIndex;
+
+protected function findIndexInList
+  input DAE.ComponentRef cref;
+  input list<SimCodeFunction.Variable> outVars;
+  input Integer inCurrentIndex;
+  output Integer crefIndexInOutVars;
+  output Boolean hasBinding;
+algorithm
+  (crefIndexInOutVars, hasBinding) :=
+  matchcontinue (outVars, inCurrentIndex)
+    local
+      DAE.ComponentRef name;
+      list<SimCodeFunction.Variable> restOutVars;
+      Option<DAE.Exp> v;
+      Integer currentIndex;
+
+    case ({}, _) then (-1, false);
+    case (SimCodeFunction.VARIABLE(name=name, value=v) :: _, currentIndex)
+      algorithm
+        true := ComponentReferenceBasics.crefEqualNoStringCompare(cref, name);
+      then (currentIndex, isSome(v));
+    case (_ :: restOutVars, currentIndex)
+      algorithm
+        currentIndex := currentIndex + 1;
+        (currentIndex, hasBinding) := findIndexInList(cref, restOutVars, currentIndex);
+      then (currentIndex, hasBinding);
+  end matchcontinue;
+end findIndexInList;
+
+protected function elaborateStatement
+  input DAE.Element inElement;
+  output list<DAE.Statement> stmts;
+algorithm
+  DAE.ALGORITHM(algorithm_ = DAE.ALGORITHM_STMTS(statementLst = stmts)) := inElement;
+end elaborateStatement;
+
+protected function optMRFAElems
+  "Applies DAEUtil.optimizeMetaRecordFieldAssigns to every algorithm body in
+   the DAE element list and lifts the temp DAE.VAR declarations the pass
+   created into the function's local-var section. Runs before
+   collectRecDeclsFromElems so that any METARECORDCALL expressions
+   introduced by the pass are picked up when the record-declaration map
+   is populated. See issue #11909."
+  input output list<DAE.Element> elems;
+protected
+  list<DAE.Element> processed = {};
+  list<DAE.Element> tempVars = {};
+  DAE.Element e2;
+algorithm
+  for e in elems loop
+    (e2, tempVars) := optMRFAElem(e, tempVars);
+    processed := e2 :: processed;
+  end for;
+  // Prepend new temp DAE.VAR declarations. Inputs/outputs are filtered
+  // by direction downstream, not by position, so the extra BIDIR locals
+  // do not perturb the function signature.
+  elems := listAppend(listReverse(tempVars), listReverse(processed));
+end optMRFAElems;
+
+protected function optMRFAElem
+  input output DAE.Element elem;
+  input output list<DAE.Element> tempVars;
+algorithm
+  (elem, tempVars) := match elem
+    local
+      list<DAE.Statement> stmts;
+    case DAE.ALGORITHM(algorithm_ = DAE.ALGORITHM_STMTS(statementLst = stmts))
+      algorithm
+        (stmts, tempVars) := DAEUtil.optimizeMetaRecordFieldAssigns(stmts, tempVars);
+        elem.algorithm_ := DAE.ALGORITHM_STMTS(stmts);
+      then (elem, tempVars);
+    else (elem, tempVars);
+  end match;
+end optMRFAElem;
+
+public function checkValidMainFunction
+"Verifies that an in-function can be generated.
+This is not the case if the input involves function-pointers."
+  input String name;
+  input SimCodeFunction.Function fn;
+algorithm
+  () := matchcontinue fn
+    local
+      list<SimCodeFunction.Variable> inVars;
+    case SimCodeFunction.FUNCTION(functionArguments = inVars)
+      algorithm
+        failure(List.find(inVars, isFunctionPtr));
+      then ();
+    case SimCodeFunction.EXTERNAL_FUNCTION(inVars = inVars)
+      algorithm
+        failure(List.find(inVars, isFunctionPtr));
+      then ();
+    else
+      algorithm
+        Error.addMessage(Error.GENERATECODE_INVARS_HAS_FUNCTION_PTR, {name});
+      then fail();
+  end matchcontinue;
+end checkValidMainFunction;
+
+public function isBoxedFunction
+"Verifies that an in-function can be generated.
+This is not the case if the input involves function-pointers."
+  input SimCodeFunction.Function fn;
+  output Boolean b;
+algorithm
+  b := matchcontinue fn
+    local
+      list<SimCodeFunction.Variable> inVars, outVars;
+    case SimCodeFunction.FUNCTION(functionArguments = inVars, outVars = outVars)
+      algorithm
+        List.map_0(inVars, isBoxedArg);
+        List.map_0(outVars, isBoxedArg);
+      then true;
+    case SimCodeFunction.EXTERNAL_FUNCTION(inVars = inVars, outVars = outVars)
+      algorithm
+        List.map_0(inVars, isBoxedArg);
+        List.map_0(outVars, isBoxedArg);
+      then true;
+    else false;
+  end matchcontinue;
+end isBoxedFunction;
+
+protected function isFunctionPtr
+"Checks if an input variable is a function pointer"
+  input SimCodeFunction.Variable var;
+  output Boolean b;
+algorithm
+  b := match var
+      /* Yes, they are VARIABLE, not SimCodeFunction.FUNCTION_PTR. */
+    case SimCodeFunction.FUNCTION_PTR() then true;
+    else false;
+  end match;
+end isFunctionPtr;
+
+protected function isBoxedArg
+"Checks if a variable is a boxed datatype"
+  input SimCodeFunction.Variable var;
+algorithm
+  () := match var
+    case SimCodeFunction.FUNCTION_PTR() then ();
+    case SimCodeFunction.VARIABLE(ty = DAE.T_METABOXED()) then ();
+    case SimCodeFunction.VARIABLE(ty = DAE.T_METATYPE()) then ();
+    case SimCodeFunction.VARIABLE(ty = DAE.T_STRING()) then ();
+  end match;
+end isBoxedArg;
+
+public function funcHasParallelInOutArrays
+"checks if a boxed function can be generated.
+currently this is not the case if the input/output
+involves parallel (global/local) array variables."
+  input SimCodeFunction.Function fn;
+  output Boolean b;
+protected
+  list<SimCodeFunction.Variable> inVars, outVars;
+algorithm
+  SimCodeFunction.FUNCTION(functionArguments = inVars, outVars = outVars) := fn;
+  for e in inVars loop
+    if isParallelArrayVar(e) then
+      b := true;
+      return;
+    end if;
+  end for;
+
+  for e in outVars loop
+    if isParallelArrayVar(e) then
+      b := true;
+      return;
+    end if;
+  end for;
+
+  b := false;
+end funcHasParallelInOutArrays;
+
+protected function isParallelArrayVar
+"Checks if a variable is a boxed datatype"
+  input SimCodeFunction.Variable var;
+  output Boolean b;
+algorithm
+  b := match var
+    case SimCodeFunction.VARIABLE(ty = DAE.T_ARRAY(), parallelism = DAE.PARGLOBAL()) then true;
+    case SimCodeFunction.VARIABLE(ty = DAE.T_ARRAY(), parallelism = DAE.PARLOCAL()) then true;
+    else false;
+  end match;
+end isParallelArrayVar;
+
+public function findLiterals
+  "Finds all literal expressions in functions"
+  input list<DAE.Function> fns;
+  output list<DAE.Function> ofns;
+  output list<DAE.Exp> literals;
+algorithm
+  (ofns, (_, _, literals)) := DAEUtil.traverseDAEFunctions(
+    fns, findLiteralsHelper,
+    (0, newExpIndexMap(), {}));
+  literals := listReverse(literals);
+end findLiterals;
+
+public
+
+function newExpIndexMap
+  output UnorderedMap<DAE.Exp, Integer> map = UnorderedMap.new<Integer>(ExpressionBasics.hashExp, ExpressionBasics.expEqual, BaseHashTable.bigBucketSize);
+end newExpIndexMap;
+
+function findLiteralsHelper
+  input DAE.Exp inExp;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp exp;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> tpl;
+algorithm
+  exp := inExp;
+  tpl := inTpl;
+  (exp, tpl) := Expression.traverseExpBottomUp(exp,
+    function Patternm.traverseConstantPatternsHelper(func=replaceLiteralExp),
+    tpl);
+  (exp, tpl) := Expression.traverseExpTopDown(exp, replaceLiteralArrayExp, tpl);
+end findLiteralsHelper;
+
+function findLiteralsHelperKeepSingle
+  "findLiteralsHelper, except that a string used once (per uses) that is not
+   a literal yet stays in place."
+  input DAE.Exp inExp;
+  input UnorderedMap<DAE.Exp, Integer> uses;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp exp;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> tpl;
+algorithm
+  (exp, tpl) := Expression.traverseExpBottomUp(inExp,
+    function Patternm.traverseConstantPatternsHelper(func=function replaceLiteralExpKeepSingle(uses=uses)),
+    inTpl);
+  (exp, tpl) := Expression.traverseExpTopDown(exp, replaceLiteralArrayExp, tpl);
+end findLiteralsHelperKeepSingle;
+
+function countStringUses
+  input DAE.Exp inExp;
+  input UnorderedMap<DAE.Exp, Integer> inUses;
+  output DAE.Exp exp = inExp;
+  output UnorderedMap<DAE.Exp, Integer> uses;
+algorithm
+  (_, uses) := Expression.traverseExpBottomUp(inExp, countStringUse, inUses);
+end countStringUses;
+
+protected
+
+function isSconst
+  input DAE.Exp e;
+  output Boolean b;
+algorithm
+  b := match e case DAE.SCONST() then true; else false; end match;
+end isSconst;
+
+function countStringUse
+  input DAE.Exp inExp;
+  input UnorderedMap<DAE.Exp, Integer> inUses;
+  output DAE.Exp exp = inExp;
+  output UnorderedMap<DAE.Exp, Integer> uses = inUses;
+algorithm
+  if isSconst(inExp) then
+    uses := addStringUse(inExp, uses);
+  else
+    // A lifted literal array cannot hold an unlifted string
+    for e in literalElements(inExp) loop
+      if isSconst(e) then
+        uses := addStringUse(e, uses);
+      end if;
+    end for;
+  end if;
+end countStringUse;
+
+function addStringUse
+  input DAE.Exp e;
+  input output UnorderedMap<DAE.Exp, Integer> uses;
+algorithm
+  UnorderedMap.add(e, UnorderedMap.getOrDefault(e, uses, 0) + 1, uses);
+end addStringUse;
+
+function literalElements
+  input DAE.Exp e;
+  output list<DAE.Exp> elts;
+algorithm
+  elts := match e
+    local
+      DAE.Exp e1, e2;
+    case DAE.ARRAY() then e.array;
+    case DAE.MATRIX() then List.flatten(e.matrix);
+    case DAE.BOX(e1) then {e1};
+    case DAE.META_OPTION(SOME(e1)) then {e1};
+    case DAE.CONS(e1, e2) then {e1, e2};
+    case DAE.LIST() then e.valList;
+    case DAE.META_TUPLE() then e.listExp;
+    case DAE.METARECORDCALL() then e.args;
+    case DAE.CALL(path = Absyn.IDENT("listArrayLiteral")) then e.expLst;
+    else {};
+  end match;
+end literalElements;
+
+function replaceLiteralExpKeepSingle
+  input DAE.Exp inExp;
+  input UnorderedMap<DAE.Exp, Integer> uses;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp outExp;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> outTpl;
+protected
+  UnorderedMap<DAE.Exp, Integer> ht;
+algorithm
+  (_, ht, _) := inTpl;
+  if isSconst(inExp) and UnorderedMap.getOrDefault(inExp, uses, 0) == 1 and not UnorderedMap.contains(inExp, ht) then
+    outExp := inExp;
+    outTpl := inTpl;
+  else
+    (outExp, outTpl) := replaceLiteralExp(inExp, inTpl);
+  end if;
+end replaceLiteralExpKeepSingle;
+
+
+function replaceLiteralArrayExp
+  "The tuples contain:
+  * The expression to be replaced (or not)
+  * Index of next literal
+  * HashTable Exp->Index (Number of the literal)
+  * The list of literals
+
+  Handles only array expressions (needs to be performed in a top-down fashion)
+  "
+  input DAE.Exp inExp;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp outExp;
+  output Boolean cont=true;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> outTpl;
+algorithm
+  (outExp,outTpl) := match (inExp,inTpl)
+    local
+      DAE.Exp exp2;
+      tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> tpl;
+    case (DAE.ARRAY(), tpl)
+      algorithm
+        try
+          isLiteralArrayExp(inExp);
+          (exp2, tpl) := replaceLiteralExp2(inExp, tpl);
+          cont := false;
+        else
+          exp2 := inExp;
+        end try;
+      then (exp2, tpl);
+    case (DAE.MATRIX(), tpl)
+      algorithm
+        try
+          isLiteralArrayExp(inExp);
+          (exp2, tpl) := replaceLiteralExp2(inExp, tpl);
+          cont := false;
+        else
+          exp2 := inExp;
+        end try;
+      then (exp2, tpl);
+    else (inExp, inTpl);
+  end match;
+end replaceLiteralArrayExp;
+
+function replaceLiteralExp
+  "The tuples contain:
+  * The expression to be replaced (or not)
+  * Index of next literal
+  * HashTable Exp->Index (Number of the literal)
+  * The list of literals
+  "
+  input DAE.Exp inExp;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp outExp;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> outTpl;
+algorithm
+  (outExp,outTpl) := matchcontinue (inExp,inTpl)
+    local
+      DAE.Exp exp;
+      String msg;
+      tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> t;
+      list<DAE.Exp> es;
+    case (exp, t)
+      algorithm
+        failure(isLiteralExp(exp)); // exit if the expression is not literal
+      then (exp, t);
+    case (exp, t)
+      algorithm
+        isTrivialLiteralExp(exp);
+      then (exp, t);
+    case (DAE.LIST(valList=es), t)
+      algorithm
+        true := listLength(es) > 25;
+        (exp,t) := replaceLiteralExp2(inExp, t);
+      then (exp, t); // Too large list; causes performance issues to find all sublists...
+    case (exp, t)
+      algorithm
+        exp := listToCons(exp);
+        (exp, t) := Expression.traverseExpBottomUp(exp, replaceLiteralExp, t);
+      then (exp, t); // All sublists should also be added as literals...
+    case (exp, _)
+      algorithm
+        failure(listToCons(exp));
+        (exp,t) := replaceLiteralExp2(exp, inTpl);
+      then (exp, t);
+    case (exp, _)
+      algorithm
+        msg := "function replaceLiteralExp failed. Falling back to not replacing "+ExpressionBasics.printExpStr(exp)+".";
+        Error.addInternalError(msg, sourceInfo());
+      then (inExp,inTpl);
+  end matchcontinue;
+end replaceLiteralExp;
+
+function replaceLiteralExp2
+  "The tuples contain:
+  * The expression to be replaced (or not)
+  * Index of next literal
+  * HashTable Exp->Index (Number of the literal)
+  * The list of literals
+  "
+  input DAE.Exp inExp;
+  input tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> inTpl;
+  output DAE.Exp outExp;
+  output tuple<Integer, UnorderedMap<DAE.Exp, Integer>, list<DAE.Exp>> outTpl;
+algorithm
+  (outExp,outTpl) := matchcontinue (inExp,inTpl)
+    local
+      DAE.Exp exp, nexp;
+      Integer i, ix;
+      list<DAE.Exp> l;
+      UnorderedMap<DAE.Exp, Integer> ht;
+    case (exp, (_, ht, _))
+      algorithm
+        ix := UnorderedMap.getOrFail(exp, ht);
+        nexp := DAE.SHARED_LITERAL(ix, exp);
+      then (nexp, inTpl);
+    case (exp, (i, ht, l))
+      algorithm
+        UnorderedMap.add(exp, i, ht);
+        nexp := DAE.SHARED_LITERAL(i, exp);
+      then (nexp, (i+1, ht, exp::l));
+  end matchcontinue;
+end replaceLiteralExp2;
+
+function listToCons
+"Converts a DAE.LIST to a chain of DAE.CONS"
+  input DAE.Exp e;
+  output DAE.Exp o;
+algorithm
+  o := match e
+    local
+      list<DAE.Exp> es;
+    case DAE.LIST(es as _::_) then listToCons2(es);
+  end match;
+end listToCons;
+
+function listToCons2
+"Converts a DAE.LIST to a chain of DAE.CONS"
+  input list<DAE.Exp> ies;
+  output DAE.Exp o;
+algorithm
+  o := match ies
+    local
+      DAE.Exp car, cdr;
+      list<DAE.Exp> es;
+    case {} then DAE.LIST({});
+    case car::es
+      algorithm
+        cdr := listToCons2(es);
+      then DAE.CONS(car, cdr);
+  end match;
+end listToCons2;
+
+function isTrivialLiteralExp
+"Succeeds if the expression should not be translated to a constant literal because it is too simple"
+  input DAE.Exp exp;
+algorithm
+  () := match exp
+    case DAE.BOX(DAE.SCONST(_)) then fail();
+    case DAE.BOX(DAE.RCONST(_)) then fail();
+    case DAE.BOX(_) then ();
+    case DAE.ICONST(_) then ();
+    case DAE.BCONST(_) then ();
+    case DAE.RCONST(_) then ();
+    case DAE.ENUM_LITERAL() then ();
+    case DAE.LIST(valList={}) then ();
+    case DAE.META_OPTION(NONE()) then ();
+    case DAE.SHARED_LITERAL() then ();
+    else fail();
+  end match;
+end isTrivialLiteralExp;
+
+function isLiteralArrayExp
+  input DAE.Exp iexp;
+algorithm
+  () := match iexp
+    local
+      DAE.Exp e1, e2, exp;
+      list<DAE.Exp> expl;
+      list<list<DAE.Exp>> expll;
+
+    case DAE.SCONST(_) then ();
+    case DAE.ICONST(_) then ();
+    case DAE.RCONST(_) then ();
+    case DAE.BCONST(_) then ();
+    case DAE.ARRAY(array=expl) algorithm List.map_0(expl, isLiteralArrayExp); then ();
+    case DAE.MATRIX(matrix=expll) algorithm List.map_0(List.flatten(expll), isLiteralArrayExp); then ();
+    case DAE.ENUM_LITERAL() then ();
+    case DAE.META_OPTION(NONE()) then ();
+    case DAE.META_OPTION(SOME(exp)) algorithm isLiteralArrayExp(exp); then ();
+    case DAE.BOX(exp) algorithm isLiteralArrayExp(exp); then ();
+    case DAE.CONS(car = e1, cdr = e2) algorithm isLiteralArrayExp(e1); isLiteralArrayExp(e2); then ();
+    case DAE.LIST(valList = expl) algorithm List.map_0(expl, isLiteralArrayExp); then ();
+    case DAE.META_TUPLE(expl) algorithm List.map_0(expl, isLiteralArrayExp); then ();
+    case DAE.METARECORDCALL(args=expl) algorithm List.map_0(expl, isLiteralArrayExp); then ();
+    case DAE.SHARED_LITERAL() then ();
+    else fail();
+  end match;
+end isLiteralArrayExp;
+
+function isLiteralExp
+"Returns if the expression may be replaced by a constant literal"
+  input DAE.Exp iexp;
+algorithm
+  () := match iexp
+    local
+      DAE.Exp e1, e2, exp;
+      list<DAE.Exp> expl;
+    case DAE.SCONST(_) then ();
+    case DAE.ICONST(_) then ();
+    case DAE.RCONST(_) then ();
+    case DAE.BCONST(_) then ();
+    case DAE.ENUM_LITERAL() then ();
+    case DAE.META_OPTION(NONE()) then ();
+    case DAE.META_OPTION(SOME(exp)) algorithm isLiteralExp(exp); then ();
+    case DAE.BOX(exp) algorithm isLiteralExp(exp); then ();
+    case DAE.CONS(car = e1, cdr = e2) algorithm isLiteralExp(e1); isLiteralExp(e2); then ();
+    case DAE.LIST(valList = expl) algorithm List.map_0(expl, isLiteralExp); then ();
+    case DAE.META_TUPLE(expl) algorithm List.map_0(expl, isLiteralExp); then ();
+    case DAE.METARECORDCALL(args=expl) algorithm List.map_0(expl, isLiteralExp); then ();
+    case DAE.SHARED_LITERAL() then ();
+    case DAE.CALL(path=Absyn.IDENT("listArrayLiteral"), expLst=expl) algorithm List.map_0(expl, isLiteralExp); then ();
+    else fail();
+  end match;
+end isLiteralExp;
+
+protected function collectRecDeclsFromTypes
+  input list<DAE.Type> inTypes;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  for ty in inTypes loop
+     collectRecDeclsFromType(ty, recDeclsMap);
+  end for;
+end collectRecDeclsFromTypes;
+
+protected function collectRecDeclsFromElems
+"Translate all records used by varlist to structs."
+  input list<DAE.Element> inElems;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  for elem in inElems loop
+
+    () := match elem
+      case DAE.VAR() algorithm
+        collectRecDeclsFromType(elem.ty, recDeclsMap);
+
+        if isSome(elem.binding) and Config.acceptMetaModelicaGrammar() then
+          Expression.traverseExpBottomUp(Util.getOption(elem.binding), collectRecDeclsFromMetaRecCallExp, recDeclsMap);
+        end if;
+      then ();
+
+      case DAE.ALGORITHM() algorithm
+        if Config.acceptMetaModelicaGrammar() then
+          DAEUtil.traverseAlgorithmExps(elem.algorithm_, Expression.traverseSubexpressionsHelper, (collectRecDeclsFromMetaRecCallExp, recDeclsMap));
+        end if;
+      then ();
+
+      else ();
+    end match;
+
+  end for;
+end collectRecDeclsFromElems;
+
+protected function isVarQ
+"Succeeds if inElement is a variable or constant that is not input."
+  input DAE.Element inElement;
+  output Boolean outB;
+algorithm
+  outB := match inElement
+    local
+      DAE.VarKind vk;
+      DAE.VarDirection vd;
+    case DAE.VAR(kind=vk, direction=vd)
+      guard
+        isVarKindVarOrParameter(vk) and
+        isDirectionNotInput(vd)
+      then true;
+    else false;
+  end match;
+end isVarQ;
+
+protected function sortVarDecls
+  "Sorts the outputs and locals of a function such that each one is initialized
+   after the variables its binding and dimensions use. The declaration order is
+   kept if it is already valid or if the dependencies are cyclic."
+  input list<DAE.Element> inVars;
+  output list<DAE.Element> outVars = inVars;
+protected
+  list<String> names, seen = {};
+  Boolean sorted = true;
+  list<tuple<DAE.Element, list<DAE.Element>>> cycles;
+algorithm
+  names := list(varDeclName(v) for v in inVars);
+  for v in inVars loop
+    for d in varDeclUses(v) loop
+      if listMember(d, names) and not listMember(d, seen) then
+        sorted := false;
+      end if;
+    end for;
+    seen := varDeclName(v) :: seen;
+  end for;
+
+  if not sorted then
+    (outVars, cycles) := Graph.topologicalSort(
+      Graph.buildGraph(inVars, varDeclEdges, inVars), varDeclNameEqual);
+    if not listEmpty(cycles) then
+      outVars := inVars;
+    end if;
+  end if;
+end sortVarDecls;
+
+protected function varDeclEdges
+  input DAE.Element inVar;
+  input list<DAE.Element> inVars;
+  output list<DAE.Element> outEdges;
+protected
+  String name = varDeclName(inVar);
+  list<String> uses = varDeclUses(inVar);
+algorithm
+  outEdges := list(v for v guard not stringEq(varDeclName(v), name) and
+    listMember(varDeclName(v), uses) in inVars);
+end varDeclEdges;
+
+protected function varDeclNameEqual
+  input DAE.Element inVar1;
+  input DAE.Element inVar2;
+  output Boolean outEqual = stringEq(varDeclName(inVar1), varDeclName(inVar2));
+end varDeclNameEqual;
+
+protected function varDeclName
+  input DAE.Element inVar;
+  output String outName;
+protected
+  DAE.ComponentRef cr;
+algorithm
+  DAE.VAR(componentRef = cr) := inVar;
+  outName := ComponentReferenceBasics.crefFirstIdent(cr);
+end varDeclName;
+
+protected function varDeclUses
+  "The first identifiers of the crefs in the binding and dimensions of a
+   variable, except its own name."
+  input DAE.Element inVar;
+  output list<String> outNames = {};
+protected
+  Option<DAE.Exp> binding;
+  DAE.InstDims dims;
+  DAE.Type ty;
+  list<DAE.Exp> exps = {};
+  String name;
+algorithm
+  DAE.VAR(binding = binding, dims = dims, ty = ty) := inVar;
+  if isSome(binding) then
+    exps := {Util.getOption(binding)};
+  end if;
+  for d in listAppend(dims, TypesDump.getDimensions(ty)) loop
+    exps := match d
+      case DAE.DIM_EXP() then d.exp :: exps;
+      else exps;
+    end match;
+  end for;
+
+  name := varDeclName(inVar);
+  for e in exps loop
+    for cr in Expression.extractCrefsFromExp(e) loop
+      outNames := match cr
+        case DAE.CREF_IDENT() guard not stringEq(cr.ident, name) then cr.ident :: outNames;
+        case DAE.CREF_QUAL() guard not stringEq(cr.ident, name) then cr.ident :: outNames;
+        else outNames;
+      end match;
+    end for;
+  end for;
+end varDeclUses;
+
+protected function isVarNotInputNotOutput
+"Succeeds if inElement is a variable or constant that is not input or output.
+needed in kernel functions since they shouldn't have output vars."
+  input DAE.Element inElement;
+  output Boolean outB;
+algorithm
+  outB := match inElement
+    local
+      DAE.VarKind vk;
+      DAE.VarDirection vd;
+    case DAE.VAR(kind=vk, direction=vd)
+      guard
+        isVarKindVarOrParameter(vk) and
+        isDirectionNotInputNotOutput(vd)
+      then true;
+    else false;
+  end match;
+end isVarNotInputNotOutput;
+
+protected function isVarKindVarOrParameter
+  input DAE.VarKind inVarKind;
+  output Boolean outB;
+algorithm
+  outB := match inVarKind
+    case DAE.VARIABLE() then true;
+    case DAE.PARAM() then true;
+    case DAE.CONST() then true;
+    else false;
+  end match;
+end isVarKindVarOrParameter;
+
+protected function isDirectionNotInput
+  input DAE.VarDirection inVarDirection;
+  output Boolean outB;
+algorithm
+  outB := match inVarDirection
+    case DAE.OUTPUT() then true;
+    case DAE.BIDIR() then true;
+    else false;
+  end match;
+end isDirectionNotInput;
+
+protected function isDirectionNotInputNotOutput
+  input DAE.VarDirection inVarDirection;
+  output Boolean outB;
+algorithm
+  outB := match inVarDirection
+    case DAE.BIDIR() then true;
+    else false;
+  end match;
+end isDirectionNotInputNotOutput;
+
+protected function filterNg "Sets the number of zero crossings to zero if events are disabled."
+  input Integer ng;
+  output Integer outInteger;
+algorithm
+  outInteger := if useZerocrossing() then ng else 0;
+end filterNg;
+
+protected function useZerocrossing
+  output Boolean res;
+algorithm
+  res := Flags.isSet(Flags.EVENTS);
+end useZerocrossing;
+
+protected function getCrefFromExp "Assume input Exp is CREF and return the ComponentRef, fail otherwise."
+  input DAE.Exp e;
+  output Absyn.ComponentRef c;
+algorithm
+  c := match e
+    local
+      DAE.ComponentRef crefe;
+      Absyn.ComponentRef crefa;
+
+    case DAE.CREF(componentRef = crefe)
+      algorithm
+        crefa := ComponentReference.unelabCref(crefe);
+      then
+        crefa;
+
+    else
+      algorithm
+        Error.addInternalError("function getCrefFromExp failed: input was not of type DAE.CREF", sourceInfo());
+      then
+        fail();
+  end match;
+end getCrefFromExp;
+
+protected function collectRecDeclsFromType
+"Helper function to generateStructsForRecords."
+  input DAE.Type inRecordType;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  () := match inRecordType
+    local
+      Absyn.Path path;
+      list<DAE.Var> varlst;
+      String name,sname;
+      list<String> fieldNames;
+      list<SimCodeFunction.Variable> vars;
+      SimCodeFunction.RecordDeclaration recDecl;
+      Option<SimCodeFunction.RecordDeclaration> optRecDecl;
+      Boolean is_default, usedExternally, bool1, changed;
+
+    case DAE.T_COMPLEX(complexClassType = ClassInf.RECORD(path), varLst = varlst, usedExternally = usedExternally)
+      algorithm
+        name := AbsynUtil.pathStringUnquoteReplaceDot(path, "_");
+        (sname, is_default) := checkBindingsandGetConstructorName(name, varlst);
+
+        optRecDecl := UnorderedMap.get(sname, recDeclsMap);
+
+        if is_default then
+          // If it already exists check if we need to update it.
+          if isSome(optRecDecl) then
+            SOME(SimCodeFunction.RECORD_DECL_FULL(_, _, _, vars, bool1)) := optRecDecl;
+            (vars, changed) := addMissingDefaults(vars, varlst);
+
+            if changed or (usedExternally and not bool1) then
+              recDecl := SimCodeFunction.RECORD_DECL_FULL(sname, NONE(), path, vars, usedExternally or bool1);
+              UnorderedMap.add(sname, recDecl, recDeclsMap);
+            end if;
+          // Add it if it does not exist.
+          else
+            vars := List.map(varlst, typesVar);
+            recDecl := SimCodeFunction.RECORD_DECL_FULL(sname, NONE(), path, vars, usedExternally);
+            UnorderedMap.add(sname, recDecl, recDeclsMap);
+
+            collectRecDeclsFromTypesVars(varlst, recDeclsMap);
+          end if;
+
+        // It is not a default construtor
+        else
+          // Add it if does not exist. Otherwise do nothing.
+          if isNone(optRecDecl) then
+            vars := List.map(varlst, typesVar);
+            recDecl := SimCodeFunction.RECORD_DECL_ADD_CONSTRCTOR(sname, name, vars, path, usedExternally);
+            UnorderedMap.add(sname, recDecl, recDeclsMap);
+            collectRecDeclsFromTypesVars(varlst, recDeclsMap);
+          end if;
+        end if;
+      then ();
+
+    case DAE.T_COMPLEX(complexClassType = ClassInf.RECORD(_)) then ();
+
+    case DAE.T_METARECORD(path = Absyn.QUALIFIED(name="SourceInfo")) then ();
+
+    case DAE.T_METARECORD(fields = varlst, path=path)
+      algorithm
+        sname := AbsynUtil.pathStringUnquoteReplaceDot(path, "_");
+        fieldNames := List.map(varlst, generateVarName);
+        UnorderedMap.tryAdd(sname, SimCodeFunction.RECORD_DECL_DEF(path, fieldNames), recDeclsMap);
+        collectRecDeclsFromTypesVars(varlst, recDeclsMap);
+      then ();
+
+    case _ then ();
+
+  end match;
+end collectRecDeclsFromType;
+
+protected function addMissingDefaults
+  "Not every type of a record carries the defaults of its fields, so the
+   declaration takes each missing default from the next type that has it."
+  input list<SimCodeFunction.Variable> inVars;
+  input list<DAE.Var> typeVars;
+  output list<SimCodeFunction.Variable> vars = {};
+  output Boolean changed = false;
+protected
+  Option<DAE.Exp> value;
+  SimCodeFunction.Variable var;
+algorithm
+  for v in inVars loop
+    var := v;
+    () := match var
+      case SimCodeFunction.VARIABLE(value = NONE())
+        algorithm
+          for tv in typeVars loop
+            if stringEq(tv.name, ComponentReferenceBasics.crefFirstIdent(var.name)) then
+              value := checkSourceAndGetBindingExp(tv.binding);
+              if isSome(value) then
+                var.value := value;
+                changed := true;
+              end if;
+              break;
+            end if;
+          end for;
+        then ();
+      else ();
+    end match;
+    vars := var :: vars;
+  end for;
+  vars := listReverse(vars);
+end addMissingDefaults;
+
+protected function typesVarNoBinding
+  input DAE.Var inTypesVar;
+  output SimCodeFunction.Variable outVar;
+algorithm
+  outVar := match inTypesVar
+    local
+      String name;
+      DAE.Type ty;
+      DAE.ComponentRef cref_;
+      DAE.Attributes attr;
+      SCode.Parallelism scPrl;
+      DAE.VarParallelism prl;
+
+    case DAE.TYPES_VAR(name=name, attributes = attr, ty=ty)
+      algorithm
+        ty := Types.simplifyType(ty);
+        cref_ := ComponentReferenceBasics.makeCrefIdent(name, ty, {});
+        DAE.ATTR(parallelism = scPrl) := attr;
+        prl := scodeParallelismToDAEParallelism(scPrl);
+      then SimCodeFunction.VARIABLE(cref_, ty, NONE(), {}, prl,DAE.VARIABLE(), false);
+  end match;
+end typesVarNoBinding;
+
+protected function typesVar
+  input DAE.Var inTypesVar;
+  output SimCodeFunction.Variable outVar;
+algorithm
+  outVar := match inTypesVar
+    local
+      String name;
+      DAE.Type ty;
+      DAE.ComponentRef cref_;
+      DAE.Attributes attr;
+      SCode.Parallelism scPrl;
+      DAE.VarParallelism prl;
+      Option<DAE.Exp> bindExp;
+
+    case DAE.TYPES_VAR(name=name, attributes = attr, ty=ty)
+      algorithm
+        ty := Types.simplifyType(ty);
+        cref_ := ComponentReferenceBasics.makeCrefIdent(name, ty, {});
+        DAE.ATTR(parallelism = scPrl) := attr;
+        prl := scodeParallelismToDAEParallelism(scPrl);
+        bindExp := checkSourceAndGetBindingExp(inTypesVar.binding);
+      then SimCodeFunction.VARIABLE(cref_, ty, bindExp, {}, prl, DAE.VARIABLE(), inTypesVar.bind_from_outside);
+  end match;
+end typesVar;
+
+protected function checkBindingsandGetConstructorName
+  input String rec_name;
+  input list<DAE.Var> vars;
+  output String ctor_name;
+  output Boolean is_default;
+protected
+  Integer varnum;
+algorithm
+  is_default := true;
+
+  ctor_name := rec_name;
+  varnum := 1;
+
+  for var in vars loop
+    if var.bind_from_outside and not isBindingFromDerivedRecordDeclaration(var.binding) then
+      is_default := false;
+      ctor_name := ctor_name + "_" + intString(varnum);
+    end if;
+
+    varnum := intAdd(varnum,1);
+  end for;
+end checkBindingsandGetConstructorName;
+
+protected function isBindingFromDerivedRecordDeclaration
+  input DAE.Binding bind;
+  output Boolean b;
+algorithm
+  b := match bind
+    case DAE.EQBOUND(source=DAE.BINDING_FROM_DERIVED_RECORD_DECL())  then true;
+    else false;
+  end match;
+end isBindingFromDerivedRecordDeclaration;
+
+protected function checkSourceAndGetBindingExp
+  input DAE.Binding inBinding;
+  output Option<DAE.Exp> bindExp;
+algorithm
+  bindExp := match inBinding
+    local
+    case DAE.EQBOUND(source=DAE.BINDING_FROM_RECORD_SUBMODS()) then NONE();
+    case DAE.EQBOUND() then SOME(inBinding.exp);
+    else NONE();
+  end match;
+end checkSourceAndGetBindingExp;
+
+protected function scodeParallelismToDAEParallelism
+  input SCode.Parallelism inParallelism;
+  output DAE.VarParallelism outParallelism;
+algorithm
+  outParallelism := match inParallelism
+    case SCode.PARGLOBAL()    then DAE.PARGLOBAL();
+    case SCode.PARLOCAL()     then DAE.PARLOCAL();
+    case SCode.NON_PARALLEL() then DAE.NON_PARALLEL();
+  end match;
+end scodeParallelismToDAEParallelism;
+
+protected function variableName
+  input SimCodeFunction.Variable v;
+  output String s;
+algorithm
+  s := match v
+    case SimCodeFunction.VARIABLE(name=DAE.CREF_IDENT(ident=s)) then s;
+    case SimCodeFunction.FUNCTION_PTR(name=s) then s;
+  end match;
+end variableName;
+
+protected function compareVariable
+  input SimCodeFunction.Variable v1;
+  input SimCodeFunction.Variable v2;
+  output Boolean b;
+algorithm
+  b := stringCompare(variableName(v1),variableName(v2)) > 0;
+end compareVariable;
+
+protected function generateVarName
+  input DAE.Var inVar;
+  output String outName;
+algorithm
+  outName :=
+  match inVar
+    local
+      DAE.Ident name;
+    case DAE.TYPES_VAR(name = name) then name;
+    else "NULL";
+  end match;
+end generateVarName;
+
+protected function collectRecDeclsFromTypesVars
+"Helper function to collectRecDeclsFromElems."
+  input list<DAE.Var> inRecordTypeVars;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  for recTyVar in inRecordTypeVars loop
+    () := match Types.arrayElementType(recTyVar.ty)
+      local
+        DAE.Type ty;
+      case ty as DAE.T_COMPLEX(complexClassType = ClassInf.RECORD(_)) algorithm
+        collectRecDeclsFromType(ty, recDeclsMap);
+      then ();
+
+      else ();
+    end match;
+  end for;
+end collectRecDeclsFromTypesVars;
+
+protected function collectRecDeclsFromMetaRecCallExps
+  input list<DAE.Exp> inExpl;
+  input UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+algorithm
+  for exp in inExpl loop
+    collectRecDeclsFromMetaRecCallExp(exp, recDeclsMap);
+  end for;
+end collectRecDeclsFromMetaRecCallExps;
+
+protected function collectRecDeclsFromMetaRecCallExp
+  input output DAE.Exp inExp;
+  input output UnorderedMap<String, SimCodeFunction.RecordDeclaration> recDeclsMap;
+protected
+  String name;
+algorithm
+  () := match inExp
+    case DAE.METARECORDCALL() algorithm
+      if inExp.index <> -1 then
+        name := AbsynUtil.pathStringUnquoteReplaceDot(inExp.path, "_");
+        UnorderedMap.tryAdd(name, SimCodeFunction.RECORD_DECL_DEF(inExp.path, inExp.fieldNames), recDeclsMap);
+      end if;
+    then ();
+
+    else ();
+  end match;
+end collectRecDeclsFromMetaRecCallExp;
+
+
+protected function generateExtFunctionIncludes "by investigating the annotation of an external function."
+  input Absyn.Program program;
+  input Absyn.Path path;
+  input Option<SCode.Annotation> inAbsynAnnotationOption;
+  input SourceInfo info;
+  output list<String> includes;
+  output list<String> includeDirs;
+  output list<String> libs;
+  output list<String> paths;
+  output Boolean dynamcLoad;
+algorithm
+  (includes, includeDirs, libs,paths, dynamcLoad):=
+  match inAbsynAnnotationOption
+    local
+      SCode.Mod mod;
+      Boolean b, isWasm;
+      String target;
+      Option<String> resources;
+      list<String> libNames, fullLibNames, dirs;
+
+    case SOME(SCode.ANNOTATION(mod))
+      algorithm
+        b := generateExtFunctionDynamicLoad(mod);
+        target := Flags.getConfigString(Flags.TARGET);
+        (libs, libNames) := generateExtFunctionIncludesLibstr(target,mod);
+        includes := generateExtFunctionIncludesIncludestr(mod);
+        (libs, dirs, resources) := generateExtFunctionLibraryDirectoryFlags(program, path, mod, libs);
+        isWasm := isWasmSimCodeTarget();
+        paths := generateExtFunctionLibraryDirectoryPaths(program, path, mod);
+        if isWasm then
+          dirs := List.union(dirs, paths);
+        end if;
+        // A bundle installPackage put there covers the `Library` names, some of
+        // which it links in privately.
+        for name in if Flags.isSet(Flags.CHECK_EXT_LIBS) and not (isWasm and hasWasmBundle(dirs)) then libNames else {} loop
+          // A wasm run uses either form, so both are looked for and built, unless
+          // the module it loads is there already.
+          if not (isWasm and max(System.regularFileExists(d + n) for d in "" :: list(d + "/" for d in dirs), n in {name + ".wasm", "lib" + name + ".wasm"})) then
+            if getGerneralTarget(target)=="msvc" or Autoconf.os=="Windows_NT" then
+              fullLibNames := {name + Autoconf.dllExt, "lib" + name + ".a", "lib" + name + ".lib"};
+            else
+              fullLibNames := {"lib" + name + ".a", "lib" + name + Autoconf.dllExt};
+            end if;
+            lookForExtFunctionLibrary(fullLibNames, dirs, name, resources, path, info, false);
+            if isWasm then
+              lookForExtFunctionLibrary({name + ".wasm", "lib" + name + ".wasm"},
+                                        dirs, name, resources, path, info, true);
+            end if;
+          end if;
+        end for;
+        if isWasm then
+          // A wasm target gets no -L flags, so the search dirs travel as libPaths.
+          paths := List.union(paths, list(d for d guard System.directoryExists(d) in listReverse(dirs)));
+        end if;
+        includeDirs := generateExtFunctionIncludeDirectoryFlags(program, path, mod, includes);
+      then
+        (includes, includeDirs, libs,paths, b);
+    case NONE() then ({}, {}, {},{}, false);
+  end match;
+end generateExtFunctionIncludes;
+
+protected function hasWasmBundle
+  "Whether installPackage put prebuilt wasm modules (an `omc-<generation>`
+   directory) in one of `dirs`."
+  input list<String> dirs;
+  output Boolean b = false;
+algorithm
+  for d in dirs loop
+    if (StringUtil.endsWith(d, "wasm32-wasip1") or StringUtil.endsWith(d, "wasm32-wasip1/")) and System.directoryExists(d) then
+      if List.any(System.subDirectories(d), function StringUtil.startsWith(prefix = "omc-")) then
+        b := true;
+        return;
+      end if;
+    end if;
+  end for;
+end hasWasmBundle;
+
+protected function lookForExtFunctionLibrary
+  "`forWasm` looks for the wasm module a simulation loads rather than the platform
+   library a host links, and builds that instead. A library without a wasm build is
+   the ordinary case, so this pass does not report one missing."
+  input list<String> names;
+  input list<String> dirs;
+  input String name;
+  input Option<String> resources;
+  input Absyn.Path path;
+  input SourceInfo info;
+  input Boolean forWasm;
+protected
+  list<String> dirs2;
+algorithm
+  dirs2 := Settings.getInstallationDirectoryPath() + "/lib/" + Autoconf.triple + "/omc"::"/usr/lib/"+Autoconf.triple::"/lib/"+Autoconf.triple::"/usr/lib/"::"/lib/"::dirs; // We could also try to look in ldconfig, etc for system libraries
+  if not max(System.regularFileExists(d+"/"+n) for d in dirs2, n in names) then
+    () := match resources
+      local
+        String resourcesStr, tmpdir, srcdir, builddir, cmd, pwd, contents, found;
+        Integer status;
+        Boolean didFind, isCMake;
+      case SOME(resourcesStr)
+        algorithm
+          if System.directoryExists(resourcesStr) and not extLibraryBuildAttempted(resourcesStr, name, forWasm) then
+            didFind := false;
+            for dir in extLibraryBuildProjects(resourcesStr, forWasm) loop
+              srcdir := resourcesStr + (if dir == "." then "" else "/" + dir);
+              isCMake := System.regularFileExists(srcdir + "/CMakeLists.txt");
+              tmpdir := System.createTemporaryDirectory(Settings.getTempDirectoryPath() + "/omc_compile_" + name + "_");
+              Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {"Created directory " + tmpdir}, info);
+              if isCMake then
+                // Out of source: the project is read where it lies.
+                builddir := tmpdir;
+              else
+                // autotools builds in-tree, so it gets a copy of Resources.
+                builddir := tmpdir + "/" + dir;
+                cmd := "cp -a \"" + resourcesStr + "\"/* \"" + tmpdir + "\"";
+                Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {cmd}, info);
+                System.systemCall(cmd);
+              end if;
+              pwd := System.pwd();
+              if 0==System.cd(builddir) then
+                Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {"Changed directory to " + System.pwd()}, info);
+                cmd := extLibraryBuildCommand(path, forWasm, if isCMake then srcdir else "");
+                status := System.systemCall(cmd, "log");
+                contents := System.readFile("log");
+                if status <> 0 then
+                  Error.addSourceMessage(Error.COMPILER_WARNING, {"Failed to run "+cmd+": " + contents}, info);
+                else
+                  Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {"Succeeded with compilation and installation of the library using:\ncommand: "+cmd+"\n" + contents}, info);
+                  // The names are spellings of one library, not files that must all exist.
+                  didFind := max(System.regularFileExists(d+"/"+n) for d in dirs2, n in names);
+                  if didFind then
+                    found := listHead(list(x for x guard System.regularFileExists(x) in List.flatten(list(d+"/"+n for d in dirs2, n in names))));
+                    Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {"Compiled "+found+" by running build project " + resourcesStr + "/" + dir}, info);
+                  else
+                    Error.addSourceMessage(Error.EXT_LIBRARY_NOT_FOUND_DESPITE_COMPILATION_SUCCESS, {name, cmd, System.pwd()}, info);
+                  end if;
+                end if;
+              else
+                Error.addSourceMessage(Error.COMPILER_WARNING, {"Failed to change directory to " + builddir}, info);
+              end if;
+              System.cd(pwd);
+              System.removeDirectory(tmpdir);
+              Error.addSourceMessage(Error.COMPILER_NOTIFICATION, {"Removed directory " + tmpdir}, info);
+              if didFind then
+                break;
+              end if;
+            end for;
+          end if;
+        then ();
+      else ();
+    end match;
+    if not max(System.regularFileExists(d+"/"+n) for d in dirs2, n in names) then
+      // suppress this warning if we're running the testsuite
+      if not (forWasm or Testsuite.isRunning()) then
+        Error.addSourceMessage(Error.EXT_LIBRARY_NOT_FOUND, {name, sum("\n  " + d + "/" + n for d in dirs2, n in names)}, info);
+      end if;
+    end if;
+  end if;
+end lookForExtFunctionLibrary;
+
+protected function generateExtFunctionIncludeDirectoryFlags
+  "Process LibraryDirectory and IncludeDirectory"
+  input Absyn.Program program;
+  input Absyn.Path path;
+  input SCode.Mod inMod;
+  input list<String> includes;
+  output list<String> outDirs;
+algorithm
+  outDirs := matchcontinue includes
+    local
+      String str,istr;
+    case {} then {};
+    case _
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.STRING(str))) :=
+          Mod.getUnelabedSubMod(inMod, "IncludeDirectory");
+        str := ProgramUtil.getFullPathFromUri(program, str, false);
+        istr := "\"-I"+str+"\"";
+      then if System.directoryExists(str) then {istr} else {};
+    case _
+      algorithm
+        str := "modelica://" + AbsynUtil.pathFirstIdent(path) + "/Resources/Include";
+        str := ProgramUtil.getFullPathFromUri(program, str, false);
+        istr := "\"-I"+str+"\"";
+      then if System.directoryExists(str) then {istr} else {};
+        // Read SourceInfo instead?
+    else {};
+  end matchcontinue;
+end generateExtFunctionIncludeDirectoryFlags;
+
+protected function getLinkerLibraryPaths"Builds search paths for the linker to find external libraries.
+ Some libraries need special treatment.
+ author: vwaurich TUD 2016-10"
+  input String uri;
+  input Absyn.Path path;
+  input list<String> inLibs;
+  output list<String> libPaths;
+protected
+  String installationDir;
+algorithm
+  installationDir := Settings.getInstallationDirectoryPath();
+
+  () := match(uri,path,inLibs)
+    local
+  case(_, _,{"-lWinmm"}) guard Autoconf.os=="Windows_NT"
+    algorithm
+    //Winmm has to be linked from the windows system but not from the resource directories.
+    //This is a fix for M_DD since otherwise the dummy pthread.dll that breaks the built will be linked
+      libPaths := {(installationDir + "/lib/" + Autoconf.triple + "/omc")};
+    then ();
+  case(, _,_)
+    algorithm
+      libPaths := listAppend(uri :: uri + "/" + System.modelicaPlatform() :: msvcLibraryDirectoryPaths(uri + "/" + System.modelicaPlatform()),
+                  {uri + "/" + System.openModelicaPlatform(),
+                   uri + "/" + System.openModelicaPlatformAlternative(),
+                   (Settings.getHomeDir(false) + "/.openmodelica/binaries/" + AbsynUtil.pathFirstIdent(path)),
+                   // Where an MSL-shaped build project forces its CMAKE_INSTALL_LIBDIR.
+                   (userCompiledBinariesDirectory(path) + "/Library/" + System.modelicaPlatform()),
+                   (installationDir + "/lib/"),
+                   (installationDir + "/lib/" + Autoconf.triple + "/omc")});
+
+      // A build project run for a wasm target installs beside, not over, the host build.
+      if isWasmSimCodeTarget() then
+        libPaths := userCompiledBinariesDirectory(path) + "/" + wasmLibraryTriple ::
+                    userCompiledBinariesDirectory(path) + "/" + wasmLibraryTriple + "/Library/" + wasmLibraryTriple ::
+                    libPaths;
+      end if;
+
+      if Autoconf.os == "Windows_NT" then
+        libPaths := List.appendElt(installationDir + "/bin/", libPaths);
+      end if;
+
+      // The static ModelicaExternalC libraries are for FMUs and have no HDF5.
+      // For MAT v7.3, an executable links the shared ones in ffi/, ahead of them.
+      if Autoconf.hdf5Libs <> "" and not isWasmSimCodeTarget() then
+        libPaths := List.appendElt(installationDir + "/lib/" + Autoconf.triple + "/omc/ffi", libPaths);
+      end if;
+
+    then ();
+  end match;
+end getLinkerLibraryPaths;
+
+protected function generateExtFunctionLibraryDirectoryFlags
+  "Process LibraryDirectory and IncludeDirectory"
+  input Absyn.Program program;
+  input Absyn.Path path;
+  input SCode.Mod inMod;
+  input list<String> inLibs;
+  output list<String> outLibs;
+  output list<String> installDirs;
+  output Option<String> resources;
+algorithm
+  (outLibs, installDirs, resources) := matchcontinue inLibs
+    local
+      String str, target, resourcesStr;
+      list<String> libs, libs2;
+      Boolean isLinux;
+    case {} then ({}, {}, NONE());
+    case libs
+      algorithm
+        str := matchcontinue inMod
+          case _
+            algorithm
+              SCode.MOD(binding = SOME(Absyn.STRING(str))) := Mod.getUnelabedSubMod(inMod, "LibraryDirectory");
+            then str;
+          else "modelica://" + AbsynUtil.pathFirstIdent(path) + "/Resources/Library";
+        end matchcontinue;
+        str := ProgramUtil.getFullPathFromUri(program, str, false);
+        resourcesStr := ProgramUtil.getFullPathFromUri(program, "modelica://" + AbsynUtil.pathFirstIdent(path) + "/Resources", false);
+        isLinux := stringEq("linux",Autoconf.os);
+        target := Flags.getConfigString(Flags.TARGET);
+        // please, take care about ordering these libraries, the most specific should have the highest priority
+        libs2 := getLinkerLibraryPaths(str, path, inLibs);
+        libs := List.fold2(libs2, generateExtFunctionLibraryDirectoryFlags2, isLinux, target, libs);
+      then (libs, listReverse(libs2), SOME(resourcesStr));
+    else (inLibs, {}, NONE());
+  end matchcontinue;
+end generateExtFunctionLibraryDirectoryFlags;
+
+protected function generateExtFunctionLibraryDirectoryFlags2
+  input String dir;
+  input Boolean isLinux;
+  input String target;
+  input list<String> inLibs;
+  output list<String> libs;
+algorithm
+  // A wasm target loads modules by path (libPaths) instead of linking.
+  if isWasmSimCodeTarget() then
+    libs := inLibs;
+    return;
+  end if;
+  libs := if isLinux then "-Wl,-rpath=\"" + dir + "\""::inLibs else inLibs;
+  libs := (if getGerneralTarget(target)=="msvc" then "/LIBPATH:\"" + dir + "\"" else "\"-L" + dir + "\"")::libs;
+end generateExtFunctionLibraryDirectoryFlags2;
+
+protected function getGerneralTarget
+   input String target;
+  output String generalTarget;
+algorithm
+  generalTarget := if (System.stringFind(target, "msvc") == 0) then "msvc" else target;
+end getGerneralTarget;
+
+protected function msvcLibraryDirectoryPaths
+  "The existing compiler directories of platformDir for an MSVC target, least
+   preferred first."
+  input String platformDir;
+  output list<String> dirs = {};
+algorithm
+  if getGerneralTarget(Flags.getConfigString(Flags.TARGET)) == "msvc" then
+    dirs := list(platformDir + "/" + d for d guard System.directoryExists(platformDir + "/" + d) in listReverse(Util.msvcLibraryDirectories()));
+  end if;
+end msvcLibraryDirectoryPaths;
+
+
+protected function userCompiledBinariesDirectory
+  input Absyn.Path path;
+  output String str = Settings.getHomeDir(false)+"/.openmodelica/binaries/"+AbsynUtil.pathFirstIdent(path);
+end userCompiledBinariesDirectory;
+
+constant String wasmLibraryTriple = "wasm32-wasip1";
+
+protected function extLibraryBuildProjects
+  "Build projects, most preferred first, relative to Resources. Only a CMake one
+   can cross-compile, so only it can build the wasm module. Resources itself comes
+   first: that is where the MSL puts the CMakeLists.txt a tool is meant to run."
+  input String resources;
+  input Boolean forWasm;
+  output list<String> projects;
+protected
+  list<String> dirs, cmakeProjects;
+algorithm
+  dirs := list("BuildProjects/" + d for d in System.subDirectories(resources + "/BuildProjects"));
+  if System.regularFileExists(resources + "/CMakeLists.txt") then
+    dirs := "." :: dirs;
+  end if;
+  cmakeProjects := list(d for d guard
+    System.regularFileExists(resources + "/" + d + "/CMakeLists.txt") in dirs);
+  projects := if forWasm then cmakeProjects else
+    listAppend(cmakeProjects, list(d for d guard
+      not listMember(d, cmakeProjects) and
+      System.regularFileExists(resources + "/" + d + "/autogen.sh") in dirs));
+end extLibraryBuildProjects;
+
+protected function extLibraryBuildAttempted
+  "Whether the build projects have already been run this session, and marks them
+   run. A failed build installs nothing, so every further external function of the
+   library would otherwise repeat it, copying the whole Resources tree each time."
+  input String resources;
+  input String name;
+  input Boolean forWasm;
+  output Boolean attempted;
+protected
+  list<String> done;
+  String key = resources + "\n" + name + "\n" + String(forWasm);
+algorithm
+  done := getGlobalRoot(Global.extLibraryBuildIndex);
+  attempted := listMember(key, done);
+  if not attempted then
+    setGlobalRoot(Global.extLibraryBuildIndex, key :: done);
+  end if;
+end extLibraryBuildAttempted;
+
+protected function extLibraryBuildCommand
+  "Build and install one build project, run in an empty build directory for CMake
+   and in the copied project directory for autotools."
+  input Absyn.Path path;
+  input Boolean forWasm;
+  input String cmakeSourceDir "empty for an autotools project";
+  output String cmd;
+protected
+  String libdir, extra;
+algorithm
+  libdir := userCompiledBinariesDirectory(path);
+  if cmakeSourceDir <> "" then
+    if forWasm then
+      libdir := libdir + "/" + wasmLibraryTriple;
+      // A wasm target loads a module rather than linking an archive.
+      extra := " -DBUILD_SHARED_LIBS=ON \"-DCMAKE_TOOLCHAIN_FILE=" +
+               Settings.getInstallationDirectoryPath() + "/share/omc/cmake/" +
+               wasmLibraryTriple + ".cmake\"";
+    else
+      extra := "";
+    end if;
+    // How an MSL-shaped project asks for the tool's ModelicaUtilities.h.
+    extra := extra + " \"-DMODELICA_UTILITIES_INCLUDE_DIR=" +
+             Settings.getInstallationDirectoryPath() + "/include/omc/c\"";
+    // -S/-B and `cmake --install` need a newer CMake than RHEL 8's 3.11.
+    cmd := "cmake -DCMAKE_BUILD_TYPE=Release \"-DCMAKE_INSTALL_PREFIX=" +
+           libdir + "\" -DCMAKE_INSTALL_LIBDIR=." + extra + " \"" + cmakeSourceDir +
+           "\" && cmake --build . && cmake --build . --target install";
+  else
+    // TODO: Add $(host)
+    cmd := "sh ./autogen.sh && ./configure --libdir='" + libdir + "' && make && make install";
+  end if;
+end extLibraryBuildCommand;
+
+protected function generateExtFunctionLibraryDirectoryPaths
+  "Process LibraryDirectory and IncludeDirectory"
+  input Absyn.Program program;
+  input Absyn.Path path;
+  input SCode.Mod inMod;
+  output list<String> outLibs;
+algorithm
+  outLibs := matchcontinue inMod
+    local
+      String str, platform1, platform2, platform3;
+      list<String> libs;
+      Boolean isLinux;
+    case _
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.STRING(str))) :=
+          Mod.getUnelabedSubMod(inMod, "LibraryDirectory");
+        str := ProgramUtil.getFullPathFromUri(program, str, false);
+        platform1 := System.openModelicaPlatform();
+        platform2 := System.openModelicaPlatformAlternative();
+        platform3 := System.modelicaPlatform();
+        isLinux := stringEq("linux",Autoconf.os);
+        // please, take care about ordering these libraries, the most specific should go first (in reverse here)
+        libs := generateExtFunctionLibraryDirectoryPaths2(true, str, isLinux, {} );
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform3,""), str + "/" + platform3, isLinux, libs);
+        for dir in msvcLibraryDirectoryPaths(str + "/" + platform3) loop
+          libs := generateExtFunctionLibraryDirectoryPaths2(true, dir, isLinux, libs);
+        end for;
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform2,""), str + "/" + platform2, isLinux, libs);
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform1,""), str + "/" + platform1, isLinux, libs);
+        libs := generateExtFunctionLibraryDirectoryPaths2(isWasmSimCodeTarget(), str + "/wasm32-wasip1", isLinux, libs);
+      then libs;
+    case _
+      algorithm
+        str := "modelica://" + AbsynUtil.pathFirstIdent(path) + "/Resources/Library";
+        str := ProgramUtil.getFullPathFromUri(program, str, false);
+        platform1 := System.openModelicaPlatform();
+        platform2 := System.openModelicaPlatformAlternative();
+        platform3 := System.modelicaPlatform();
+        isLinux := stringEq("linux",Autoconf.os);
+        // please, take care about ordering these libraries, the most specific should go first (in reverse here)
+        libs := generateExtFunctionLibraryDirectoryPaths2(true, str, isLinux, {} );
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform3,""), str + "/" + platform3, isLinux, libs);
+        for dir in msvcLibraryDirectoryPaths(str + "/" + platform3) loop
+          libs := generateExtFunctionLibraryDirectoryPaths2(true, dir, isLinux, libs);
+        end for;
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform2,""), str + "/" + platform2, isLinux, libs);
+        libs := generateExtFunctionLibraryDirectoryPaths2(not stringEq(platform1,""), str + "/" + platform1, isLinux, libs);
+        libs := generateExtFunctionLibraryDirectoryPaths2(isWasmSimCodeTarget(), str + "/wasm32-wasip1", isLinux, libs);
+      then libs;
+    else {};
+  end matchcontinue;
+end generateExtFunctionLibraryDirectoryPaths;
+
+
+protected function generateExtFunctionLibraryDirectoryPaths2
+  input Boolean add;
+  input String dir;
+  input Boolean isLinux;
+  input list<String> inLibs;
+  output list<String> libs;
+algorithm
+  libs := match (add, inLibs)
+    local
+      Boolean b;
+    case (true, libs)
+      algorithm
+        b := System.directoryExists(dir);
+        libs := List.consOnTrue(b, dir , libs);
+       then libs;
+   else inLibs;
+  end match;
+end generateExtFunctionLibraryDirectoryPaths2;
+
+
+protected function getLibraryStringInMSVCFormat
+"Takes an Absyn.STRING describing a library and outputs a list
+of strings corresponding to it.
+Note: Normally only outputs a single string, but Lapack on MinGW is special."
+  input Absyn.Exp exp;
+  output list<String> strs;
+  output list<String> names;
+algorithm
+  (strs,names) := matchcontinue exp
+    local
+      String str;
+
+    // seems lapack can show on Lapack form or lapack (different case) (MLS revision 6155)
+    // Lapack on MinGW/Windows is linked against f2c
+    case Absyn.STRING(str) guard str=="Lapack" or str=="lapack"
+      then ({"lapack_win32_MT.lib", "f2c.lib"}, {});
+
+    // omcruntime on windows needs linking with wsock and then some :)
+    case Absyn.STRING("omcruntime")
+      algorithm
+        true := "Windows_NT" == Autoconf.os;
+        strs := {"f2c.lib", "initialization.lib", "libexpat.lib", "math-support.lib", "meta.lib", "ModelicaExternalC.lib", "results.lib", "simulation.lib", "solver.lib", "sundials_kinsol.lib", "sundials_nvecserial.lib", "sundials_sunlinsolklu", "util.lib", "lapack_win32_MT.lib"};
+      then
+        (strs, {});
+
+    case Absyn.STRING("fmilib")
+      then ({"fmilib.lib","shlwapi.lib"},{});
+
+    // A file is passed as it is, and if the string starts with a -, it's
+    // probably a linker flag
+    case Absyn.STRING(str)
+      algorithm
+        true := System.regularFileExists(str) or "-" == stringGetStringChar(str, 1);
+      then ({str},{});
+
+    case Absyn.STRING(str)
+      algorithm
+        str := str + ".lib";
+      then ({str},{});
+
+    else
+      algorithm
+        Error.addInternalError("Failed to process Library annotation for external function", sourceInfo());
+      then fail();
+  end matchcontinue;
+end getLibraryStringInMSVCFormat;
+
+protected function getLibraryStringInGccFormat
+"Takes an Absyn.STRING describing a library and outputs a list
+of strings corresponding to it.
+Note: Normally only outputs a single string, but Lapack on MinGW is special."
+  input Absyn.Exp exp;
+  output list<String> strs;
+  output list<String> names;
+algorithm
+  (strs,names) := matchcontinue exp
+    local
+      String str;
+      list<String> strs1, strs2, strs3, names1, names2, names3;
+
+    // Lapack is always included, except in an FMU, which carries only the part
+    // of it the runtime uses.
+    case Absyn.STRING(str) guard str=="lapack" or str=="Lapack"
+      then (if Flags.getConfigBool(Flags.BUILDING_FMU) then {"-llapack"} else {},{});
+
+    //pthreads is already linked under windows
+    case Absyn.STRING("pthread") guard Autoconf.os=="Windows_NT"
+      algorithm
+        Error.addCompilerNotification("pthreads library is already available. It is not linked from the external library resource directory.\n");
+      then  ({},{});
+
+   //do not link rt.dll for Modelica Device Drivers as it is not needed under windows
+    case Absyn.STRING("rt") guard Autoconf.os=="Windows_NT"
+      algorithm
+        Error.addCompilerNotification("rt library is not needed under Windows. It is not linked from the external library resource directory.\n");
+      then  ({},{});
+
+   //do not link Ws2_32.dll for Modelica Device Drivers as it is not needed under windows
+    case Absyn.STRING("Ws2_32") guard Autoconf.os=="Windows_NT"
+      algorithm
+        Error.addCompilerNotification("Ws2_32 library is not needed under Windows. It is not linked from the external library resource directory.\n");
+      then  ({},{});
+
+    //user32 is already linked under windows
+    case Absyn.STRING("User32") guard Autoconf.os=="Windows_NT"
+      algorithm
+        Error.addCompilerNotification("User32 library is already available. It is not linked from the external library resource directory.\n");
+      then  ({},{});
+
+    //winmm is a windows system lib
+    case Absyn.STRING(str as "Winmm") guard Autoconf.os=="Windows_NT"
+      algorithm
+        str := "-l" + str;
+        Error.addCompilerNotification("Winmm library is a windows system library. It is not linked from the external library resource directory.\n");
+      then  ({str},{});
+
+    //do not link X11.dll for Modelica Device Drivers as it is not needed under windows
+    case Absyn.STRING("X11") guard Autoconf.os=="Windows_NT"
+      algorithm
+        Error.addCompilerNotification("X11 library is not needed under Windows. It is not linked from the external library resource directory.\n");
+      then  ({},{});
+
+    // With HDF5, this is the shared library in ffi/ (see getLinkerLibraryPaths).
+    // HDF5 is named too, so that ld finds the library it needs.
+    case Absyn.STRING("ModelicaMatIO") guard Autoconf.hdf5Libs <> ""
+      then ({"-lModelicaMatIO", Autoconf.hdf5Libs},{});
+
+    case Absyn.STRING(str as "omcruntime")
+      algorithm
+        if "Windows_NT" == Autoconf.os then
+          // omcruntime on windows needs linking with wsock and then some :)
+          str := "-l" + str;
+          strs := str :: "-lintl" :: "-liconv" :: "-lexpat" :: "-lsqlite3" :: "-ltre" :: "-lws2_32" :: "-lRpcrt4" :: "-lregex" :: {};
+        else
+          strs := Autoconf.systemLibs;
+        end if;
+      then  (strs,{});
+
+    // One element per library, which the wasm-jit loads one by one.
+    case Absyn.STRING("fmilib")
+      then (if Autoconf.os=="Windows_NT" then {"-lfmilib","-lshlwapi"}
+            elseif Autoconf.fmilibLibs == "" then {"-lfmilib"}
+            else "-lfmilib" :: Util.stringSplitAtChar(Autoconf.fmilibLibs, " "),{});
+
+    case Absyn.STRING(str)
+      algorithm
+        if str=="ModelicaStandardTables" then
+          // MSL 3.2.1 did not have the updated annotations...
+          (strs1,names1) := getLibraryStringInGccFormat(Absyn.STRING("ModelicaIO"));
+          (strs2,names2) := getLibraryStringInGccFormat(Absyn.STRING("ModelicaMatIO"));
+          (strs3,names3) := getLibraryStringInGccFormat(Absyn.STRING("zlib"));
+          strs := listAppend(strs1, listAppend(strs2, strs3));
+          names := listAppend(names1, listAppend(names2, names3));
+        else
+          strs := {};
+          names := {};
+        end if;
+        // If the string is a file, return it as it is
+        // If the string starts with a -, it's probably -l or -L gcc flags
+        if System.regularFileExists(str) or "-" == stringGetStringChar(str, 1) then
+          strs := str::strs;
+        else
+          strs := ("-l" + str)::strs;
+          names := str::names;
+        end if;
+
+      then (strs,names);
+
+    else
+      algorithm
+        Error.addInternalError("Failed to process Library annotation for external function", sourceInfo());
+      then fail();
+  end matchcontinue;
+end getLibraryStringInGccFormat;
+
+protected function isWasmSimCodeTarget
+  output Boolean isWasm = StringUtil.startsWith(Config.simCodeTarget(), "wasm");
+end isWasmSimCodeTarget;
+
+protected function stripLibraryExtension
+"The base name of a library written for any target, so an annotation naming a host
+ object file or shared library still identifies the wasm module."
+  input String str;
+  output String base = str;
+algorithm
+  for ext in {".wasm", ".dylib", ".obj", ".dll", ".lib", ".so", ".a", ".o"} loop
+    if StringUtil.endsWith(str, ext) then
+      base := Util.removeLastNChar(str, stringLength(ext));
+      return;
+    end if;
+  end for;
+end stripLibraryExtension;
+
+protected function getLibraryStringInWasmFormat
+"The name of the wasm module implementing the library the Absyn.STRING describes.
+ A wasm target has no linker: the annotation resolves to a PIC dylink module omc
+ loads as-is, rather than to linker flags.
+
+ The gcc-format string follows it, so a native host running the wasm can fall back
+ to the platform shared library for a function no wasm module implements."
+  input Absyn.Exp exp;
+  output list<String> strs;
+  output list<String> names;
+algorithm
+  (strs, names) := match exp
+    local
+      String str;
+      list<String> host;
+
+    // In the runtime already: LAPACK/BLAS are in-wasm, and zlib is inside the
+    // modules that use it.
+    case Absyn.STRING("lapack") then ({},{});
+    case Absyn.STRING("Lapack") then ({},{});
+    case Absyn.STRING("blas") then ({},{});
+    case Absyn.STRING("zlib") then ({},{});
+    // The MSL's: the modules installed with it when there are, else the side
+    // modules omc carries, never a platform library.
+    case Absyn.STRING("ModelicaExternalC") then ({"ModelicaExternalC.wasm"},{});
+    case Absyn.STRING("ModelicaStandardTables") then ({"ModelicaStandardTables.wasm"},{});
+    case Absyn.STRING("ModelicaIO") then ({"ModelicaIO.wasm"},{});
+    case Absyn.STRING("ModelicaMatIO") then ({"ModelicaMatIO.wasm"},{});
+
+    case Absyn.STRING(str)
+      algorithm
+        // Linker flags mean nothing here; only a library name can be resolved.
+        if "-" == stringGetStringChar(str, 1) then
+          strs := {};
+          names := {};
+        else
+          (host, names) := getLibraryStringInGccFormat(exp);
+          strs := (stripLibraryExtension(str) + ".wasm") :: host;
+        end if;
+      then (strs, names);
+
+    else
+      algorithm
+        Error.addInternalError("Failed to process Library annotation for external function", sourceInfo());
+      then fail();
+  end match;
+end getLibraryStringInWasmFormat;
+
+protected function generateExtFunctionIncludesLibstr
+  input String target;
+  input SCode.Mod inMod;
+  output list<String> outStringLst;
+  output list<String> names;
+algorithm
+  (outStringLst, names) := matchcontinue (if isWasmSimCodeTarget() then "wasm" else getGerneralTarget(target))
+    local
+      list<Absyn.Exp> arr;
+      list<String> libs;
+      list<list<String>> libsList, namesList;
+      Absyn.Exp exp;
+    case "wasm"
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.ARRAY(arr))) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libsList, namesList) := List.map_2(arr, getLibraryStringInWasmFormat);
+      then
+        (List.flatten(libsList), List.flatten(namesList));
+    case "wasm"
+      algorithm
+        SCode.MOD(binding = SOME(exp)) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libs,names) := getLibraryStringInWasmFormat(exp);
+      then
+        (libs,names);
+    case "msvc"
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.ARRAY(arr))) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libsList, namesList) := List.map_2(arr, getLibraryStringInMSVCFormat);
+      then
+        (List.flatten(libsList), List.flatten(namesList));
+    case "msvc"
+      algorithm
+        SCode.MOD(binding = SOME(exp)) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libs,names) := getLibraryStringInMSVCFormat(exp);
+      then
+        (libs,names);
+    case _
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.ARRAY(arr))) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libsList, namesList) := List.map_2(arr, getLibraryStringInGccFormat);
+      then
+        (List.flatten(libsList), List.flatten(namesList));
+    case _
+      algorithm
+        SCode.MOD(binding = SOME(exp)) :=
+          Mod.getUnelabedSubMod(inMod, "Library");
+        (libs,names) := getLibraryStringInGccFormat(exp);
+      then
+        (libs,names);
+    else ({},{});
+  end matchcontinue;
+end generateExtFunctionIncludesLibstr;
+
+protected function generateExtFunctionIncludesIncludestr
+  input SCode.Mod inMod;
+  output list<String> includes;
+algorithm
+  includes := matchcontinue inMod
+    local
+      String inc, inc_1;
+      Integer lineNumberStart;
+      String str,fileName;
+    case _
+      algorithm
+        SCode.MOD(binding = SOME(Absyn.STRING(inc)), info = SOURCEINFO(fileName=fileName,lineNumberStart=lineNumberStart)) :=
+          Mod.getUnelabedSubMod(inMod, "Include");
+        str := "#line "+intString(lineNumberStart)+" \""+fileName+"\"";
+        inc_1 := System.unescapedString(inc);
+        includes := if /*Config.acceptMetaModelicaGrammar() or*/ Flags.isSet(Flags.GEN_DEBUG_SYMBOLS) then {str,inc_1} else {inc_1};
+      then includes;
+    else {};
+  end matchcontinue;
+end generateExtFunctionIncludesIncludestr;
+
+protected function generateExtFunctionDynamicLoad
+  input SCode.Mod inMod;
+  output Boolean outDynamicLoad;
+algorithm
+  outDynamicLoad:= matchcontinue inMod
+    local
+      Boolean b;
+    case _
+      algorithm
+        SCode.MOD(binding = SOME((Absyn.BOOL(b)))) :=
+          Mod.getUnelabedSubMod(inMod, "DynamicLoad");
+      then
+        b;
+    else false;
+  end matchcontinue;
+end generateExtFunctionDynamicLoad;
+
+public function getImplicitRecordConstructors
+  "If a record instance is sent to a function we need to generate code for the
+  record constructor even if it's not explicitly called, because the constructor
+  is used by the generated code. This function checks the arguments of a
+  function for these implicit record constructor calls and returns a list of all
+  record constructors that are used."
+  input list<DAE.Exp> inExpLst;
+  output list<DAE.Exp> outExpLst;
+algorithm
+  outExpLst := matchcontinue inExpLst
+    local
+      DAE.ComponentRef cref;
+      Absyn.Path record_path;
+      list<DAE.Exp> rest_expr;
+      DAE.Exp record_cref;
+    case {} then {};
+      // A record component reference.
+    case DAE.CREF(
+      componentRef = cref,
+      ty = (DAE.T_COMPLEX(
+        complexClassType = ClassInf.RECORD(path = record_path)))) :: rest_expr
+      algorithm
+        // Make sure it has no subscripts, i.e. it's a component reference for
+        // an entire record instance.
+        {} := ComponentReference.crefLastSubs(cref);
+        // Build a DAE.CREF from the record path.
+        cref := ComponentReference.pathToCref(record_path);
+        record_cref := Expression.crefExp(cref);
+        rest_expr := getImplicitRecordConstructors(rest_expr);
+      then record_cref :: rest_expr;
+    case _ :: rest_expr
+      algorithm
+        rest_expr := getImplicitRecordConstructors(rest_expr);
+      then rest_expr;
+  end matchcontinue;
+end getImplicitRecordConstructors;
+
+protected function getCalledFunctionsInFunctions "Goes through the given DAE, finds the given functions and collects
+  the names of the functions called from within those functions"
+  input list<Absyn.Path> paths;
+  input HashTableStringToPath.HashTable inHt;
+  input AvlTreePathFunction.Tree funcs;
+  output HashTableStringToPath.HashTable outHt;
+algorithm
+  outHt := match (paths, inHt)
+    local
+      list<Absyn.Path> rest;
+      Absyn.Path path;
+      HashTableStringToPath.HashTable ht;
+
+    case ({}, ht) then ht;
+    case (path::rest, ht)
+      algorithm
+        ht := getCalledFunctionsInFunction2(path, AbsynUtil.pathStringNoQual(path), ht, funcs);
+        ht := getCalledFunctionsInFunctions(rest, ht, funcs);
+      then ht;
+  end match;
+end getCalledFunctionsInFunctions;
+
+public function getCalledFunctionsInFunction2 "Goes through the given DAE, finds the given function and collects
+  the names of the functions called from within those functions"
+  input Absyn.Path inPath;
+  input String pathstr;
+  input HashTableStringToPath.HashTable inHt "paths to not add";
+  input AvlTreePathFunction.Tree funcs;
+  output HashTableStringToPath.HashTable outHt "paths to not add";
+algorithm
+  outHt := matchcontinue (inPath, inHt)
+    local
+      String str;
+      Absyn.Path path;
+      DAE.Function funcelem;
+      list<Absyn.Path> calledfuncs, varfuncs;
+      list<DAE.Element> els;
+      HashTableStringToPath.HashTable ht;
+
+    case (_, ht)
+      guard BaseHashTable.hasKey(pathstr, ht)
+      then ht;
+
+    case (path, ht)
+      algorithm
+        funcelem := DAEUtil.getNamedFunction(path, funcs);
+        els := DAEUtil.getFunctionElements(funcelem);
+        // SimCodeFunction.Function reference variables are filtered out
+        varfuncs := List.fold(els, DAEUtil.collectFunctionRefVarPaths, {});
+        (_, (_, varfuncs)) := DAEUtil.traverseDAEElementList(els, Expression.traverseSubexpressionsHelper, (DAEUtil.collectValueblockFunctionRefVars, varfuncs));
+        (_, (_, (calledfuncs, _))) := DAEUtil.traverseDAEElementList(els, Expression.traverseSubexpressionsHelper, (matchNonBuiltinCallsAndFnRefPaths, ({}, varfuncs)));
+        ht := BaseHashTable.add((pathstr, path), ht);
+        ht := addDestructor(funcelem, ht);
+        ht := getCalledFunctionsInFunctions(calledfuncs, ht, funcs);
+      then ht;
+
+    case (path, _)
+      algorithm
+        failure(DAEUtil.getNamedFunction(path, funcs));
+        str := "function getCalledFunctionsInFunction2: Class " + pathstr + " not found in global scope.";
+        Error.addInternalError(str, sourceInfo());
+      then
+        fail();
+  end matchcontinue;
+end getCalledFunctionsInFunction2;
+
+public function getCalledFunctionsInFunction
+"Goes through the given DAE, finds the given function and collects
+  the names of the functions called from within those functions.
+  Lives here (next to its helper getCalledFunctionsInFunction2) rather than in
+  SimCodeFunction so the SimCodeFunction datatype package does not depend on
+  this function package."
+  input Absyn.Path path;
+  input AvlTreePathFunction.Tree funcs;
+  output list<Absyn.Path> outPaths;
+protected
+  HashTableStringToPath.HashTable ht;
+algorithm
+  ht := HashTableStringToPath.emptyHashTable();
+  ht := getCalledFunctionsInFunction2(path,AbsynUtil.pathStringNoQual(path),ht,funcs);
+  outPaths := BaseHashTable.hashTableValueList(ht);
+end getCalledFunctionsInFunction;
+
+protected function addDestructor
+  input DAE.Function func;
+  input HashTableStringToPath.HashTable inHt;
+  output HashTableStringToPath.HashTable outHt;
+algorithm
+  outHt := match func
+    local
+      Absyn.Path path;
+    case DAE.FUNCTION(type_=DAE.T_FUNCTION(funcResultType=DAE.T_COMPLEX(complexClassType=ClassInf.EXTERNAL_OBJ(path=path))))
+      algorithm
+        path := AbsynUtil.joinPaths(path,Absyn.IDENT("destructor"));
+      then addDestructor2(path,AbsynUtil.pathStringNoQual(path),inHt);
+    else inHt;
+  end match;
+end addDestructor;
+
+protected function addDestructor2
+  input Absyn.Path path;
+  input String pathstr;
+  input HashTableStringToPath.HashTable inHt;
+  output HashTableStringToPath.HashTable ht = inHt;
+algorithm
+  if not BaseHashTable.hasKey(pathstr, ht) then
+    ht := BaseHashTable.add((pathstr, path), ht);
+  end if;
+end addDestructor2;
+
+protected function matchNonBuiltinCallsAndFnRefPaths "The extra argument is a tuple<list, list>; the second list is the list of variable
+  names to filter out (so we don't add function references variables)"
+  input DAE.Exp inExp;
+  input tuple<list<Absyn.Path>, list<Absyn.Path>> itpl;
+  output DAE.Exp outExp;
+  output tuple<list<Absyn.Path>, list<Absyn.Path>> otpl;
+algorithm
+  (outExp,otpl) := matchcontinue (inExp,itpl)
+    local
+      Absyn.Path path;
+      list<Absyn.Path> acc, filter;
+    case (DAE.CALL(path = path, attr = DAE.CALL_ATTR(builtin = false)), (acc, filter))
+      algorithm
+        path := AbsynUtil.makeNotFullyQualified(path);
+        false := List.isMemberOnTrue(path, filter, AbsynUtil.pathEqual);
+      then (inExp, (path::acc, filter));
+    case (DAE.REDUCTION(reductionInfo = DAE.REDUCTIONINFO(path = path)), (acc, filter))
+      algorithm
+        false := List.isMemberOnTrue(path, {Absyn.IDENT("list"),Absyn.IDENT("listReverse"),Absyn.IDENT("array"),Absyn.IDENT("min"),Absyn.IDENT("max"),Absyn.IDENT("sum"),Absyn.IDENT("product")}, AbsynUtil.pathEqual);
+        false := List.isMemberOnTrue(path, filter, AbsynUtil.pathEqual);
+      then (inExp, (path::acc, filter));
+    case (DAE.PARTEVALFUNCTION(path = path), (acc, filter))
+      algorithm
+        path := AbsynUtil.makeNotFullyQualified(path);
+        false := List.isMemberOnTrue(path, filter, AbsynUtil.pathEqual);
+      then (inExp, (path::acc, filter));
+    case (DAE.CREF(ty = DAE.T_FUNCTION_REFERENCE_FUNC(builtin = false)), (acc, filter))
+      algorithm
+        path := AbsynUtil.crefToPath(getCrefFromExp(inExp));
+        false := List.isMemberOnTrue(path, filter, AbsynUtil.pathEqual);
+      then (inExp, (path::acc, filter));
+    else (inExp,itpl);
+  end matchcontinue;
+end matchNonBuiltinCallsAndFnRefPaths;
+
+protected function aliasRecordDeclarations
+  input SimCodeFunction.RecordDeclaration inDecl;
+  input HashTableStringToPath.HashTable inHt;
+  output SimCodeFunction.RecordDeclaration decl;
+  output HashTableStringToPath.HashTable ht;
+algorithm
+  (decl,ht) := match inDecl
+    local
+      list<SimCodeFunction.Variable> vars;
+      Absyn.Path name;
+      String str,sname;
+      Option<String> alias;
+      Boolean extConvert;
+    case SimCodeFunction.RECORD_DECL_FULL(sname, _, name, vars, extConvert)
+      algorithm
+        str := stringDelimitList(List.map(vars, variableString), "\n");
+        (alias,ht) := aliasRecordDeclarations2(str, name, inHt);
+      then (SimCodeFunction.RECORD_DECL_FULL(sname, alias, name, vars, extConvert),ht);
+    else (inDecl,inHt);
+  end match;
+end aliasRecordDeclarations;
+
+protected function aliasRecordDeclarations2
+  input String str;
+  input Absyn.Path path;
+  input HashTableStringToPath.HashTable inHt;
+  output Option<String> alias;
+  output HashTableStringToPath.HashTable ht;
+algorithm
+  (alias,ht) := matchcontinue inHt
+    local
+      String aliasStr;
+    case _
+      algorithm
+        aliasStr := AbsynUtil.pathStringUnquoteReplaceDot(BaseHashTable.get(str, inHt),"_");
+      then (SOME(aliasStr),inHt);
+    else
+      algorithm
+        ht := BaseHashTable.add((str,path),inHt);
+      then (NONE(),ht);
+  end matchcontinue;
+end aliasRecordDeclarations2;
+
+protected function variableString
+  "The member as it is laid out in the struct. In C an array member is an
+   array descriptor whatever its dimension sizes, while the Cpp runtime uses
+   a fixed-size array type when the sizes are known."
+  input SimCodeFunction.Variable var;
+  output String str;
+algorithm
+  str := match var
+    local
+      DAE.ComponentRef name;
+      DAE.Type ty;
+    case SimCodeFunction.VARIABLE(name=name, ty=ty) guard Config.simCodeTarget() == "Cpp"
+      then TypesDump.unparseType(ty) + " " + ComponentReferenceBasics.printComponentRefStr(name);
+    case SimCodeFunction.VARIABLE(name=name, ty=ty)
+      then TypesDump.unparseType(Types.arrayElementType(ty)) + "[" + intString(Types.numberOfDimensions(ty)) + "] " + ComponentReferenceBasics.printComponentRefStr(name);
+    case SimCodeFunction.FUNCTION_PTR(name=str)
+      then "modelica_fnptr " + str;
+  end match;
+end variableString;
+
+public function createMakefileParams
+  input list<String> includes;
+  input list<String> libs;
+  input list<String> libPaths;
+  input Boolean isFunction;
+  input Boolean isFMU=false;
+  output SimCodeFunction.MakefileParams makefileParams;
+protected
+  String omhome, ccompiler, cxxcompiler, linker, exeext, dllext, cflags, ldflags, rtlibs, platform, compileDir;
+algorithm
+  ccompiler := if Flags.isSet(Flags.HPCOM) then System.getOMPCCompiler() else System.getCCompiler();
+  cxxcompiler := System.getCXXCompiler();
+  linker := System.getLinker();
+  exeext := Autoconf.exeExt;
+  dllext := Autoconf.dllExt;
+  omhome := Settings.getInstallationDirectoryPath();
+  omhome := System.trim(omhome, "\""); // Remove any quotation marks from omhome.
+  cflags := System.getCFlags() + " " +
+            (if Flags.isSet(Flags.HPCOM) then "-fopenmp" else "");
+  ldflags := System.getLDFlags();
+  // The Rust simulation runtime serves ParModelica/auto's own interface, so
+  // linking the C++ one beside it would define PM_Model_create and friends twice.
+  if Flags.getConfigBool(Flags.PARMODAUTO) and not Config.simCodeRustRuntime() then
+    ldflags := " " + Autoconf.parModelicaAutoLibs + " " + ldflags;
+  end if;
+  // A MetaModelica function library is dlopened into omc and hands values back
+  // through omc's own vocabulary, so it links the runtime omc links.
+  rtlibs := if isFunction then (if Config.acceptMetaModelicaGrammar() then Autoconf.ldflags_runtime_mmc else Autoconf.ldflags_runtime)
+            elseif isFMU then Autoconf.ldflags_runtime_fmu
+            elseif Config.simCodeRustRuntime() then Autoconf.ldflags_runtime_sim_rust
+            else Autoconf.ldflags_runtime_sim;
+  platform := System.modelicaPlatform();
+  compileDir :=  System.pwd() + Autoconf.pathDelimiter;
+  makefileParams := SimCodeFunction.MAKEFILE_PARAMS(ccompiler, cxxcompiler, linker, exeext, dllext,
+        omhome, cflags, ldflags, rtlibs, includes, libs,libPaths, platform,compileDir);
+end createMakefileParams;
+
+public
+
+function codegenResetTryThrowIndex
+algorithm
+  setGlobalRoot(Global.codegenTryThrowIndex, {});
+end codegenResetTryThrowIndex;
+
+function codegenPushTryThrowIndex
+  input Integer i;
+protected
+  list<Integer> lst;
+algorithm
+  lst := getGlobalRoot(Global.codegenTryThrowIndex);
+  setGlobalRoot(Global.codegenTryThrowIndex, i::lst);
+end codegenPushTryThrowIndex;
+
+function codegenPopTryThrowIndex
+protected
+  list<Integer> lst;
+algorithm
+  lst := getGlobalRoot(Global.codegenTryThrowIndex);
+  _::lst := lst;
+  setGlobalRoot(Global.codegenTryThrowIndex, lst);
+end codegenPopTryThrowIndex;
+
+function codegenPeekTryThrowIndex
+  output Integer i;
+protected
+  list<Integer> lst;
+algorithm
+  lst := getGlobalRoot(Global.codegenTryThrowIndex);
+  i := match lst
+    case i::_ then i;
+    else -1;
+  end match;
+end codegenPeekTryThrowIndex;
+
+public function varIndex
+  input SimCodeVar.SimVar var;
+  output Integer index;
+algorithm
+  SimCodeVar.SIMVAR(index=index) := var;
+end varIndex;
+
+public function isParallelFunctionContext
+  input SimCodeFunction.Context context;
+  output Boolean outBool;
+algorithm
+  outBool := match context
+    case SimCodeFunction.FUNCTION_CONTEXT() then context.is_parallel;
+    else false;
+  end match;
+end isParallelFunctionContext;
+
+function twodigit
+  input Integer i;
+  output String outS;
+algorithm
+  outS :=
+  match i
+    local String s;
+    case _ guard i < 10
+      algorithm
+        s := intString(i);
+        s := stringAppend("0", s);
+      then
+        s;
+    else intString(i);
+  end match;
+end twodigit;
+
+public function generateSubPalceholders
+  input DAE.ComponentRef cr;
+  output String outdef;
+protected
+  list<DAE.Dimension> dims;
+  Integer nrdims;
+  list<String> idxstrlst;
+algorithm
+  dims := ComponentReferenceBasics.crefDims(cr);
+  nrdims := listLength(dims);
+  idxstrlst := List.map(List.intRange(nrdims),intString);
+  outdef := stringDelimitList(List.threadMap(List.fill("i_", nrdims), idxstrlst, stringAppend), ",");
+end generateSubPalceholders;
+
+
+/* This functions are used to get/append cref prefixes in function contexts.The cref prefix is appended
+  to all crefs generated. We use this to generate dependent names in some cases (for example when generating
+  code for record constructors) so that every cref we generate while this is set has this prefix applied to it*/
+public function getCurrentCrefPrefix
+  input SimCodeFunction.Context context;
+  output String cref_pref;
+algorithm
+  cref_pref := match context
+    case SimCodeFunction.FUNCTION_CONTEXT(cref_pref, _) then cref_pref;
+    else algorithm Error.addInternalError("Tried to get cref prefix from a non FUNCTION_CONTEXT() context. cref_pref is only avaiable in FUNCTION_CONTEXT.", sourceInfo()); then fail();
+  end match;
+end getCurrentCrefPrefix;
+
+public function appendCurrentCrefPrefix
+  input SimCodeFunction.Context context;
+  input String in_cref_pref;
+  output SimCodeFunction.Context out_context;
+protected
+  String cref_pref;
+  Boolean prl;
+algorithm
+  out_context := match context
+    case SimCodeFunction.FUNCTION_CONTEXT(cref_pref, prl) then SimCodeFunction.FUNCTION_CONTEXT(cref_pref + in_cref_pref, prl);
+    else algorithm Error.addInternalError("Tried to append cref prefix from a non FUNCTION_CONTEXT() context. cref_pref is only avaiable in FUNCTION_CONTEXT.", sourceInfo()); then fail();
+  end match;
+end appendCurrentCrefPrefix;
+
+annotation(__OpenModelica_Interface="simcode_util");
+end SimCodeFunctionUtil;

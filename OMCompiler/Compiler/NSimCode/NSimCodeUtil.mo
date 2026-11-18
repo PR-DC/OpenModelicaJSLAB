@@ -1,0 +1,117 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NSimCodeUtil
+"file:        NSimCodeUtil.mo
+ package:     NSimCodeUtil
+ description: This file contains utility functions for simcode creation.
+              Mainly cref to simvar mapping utilities.
+"
+// Frontend imports
+import ComponentRef = NFComponentRef;
+
+// SimCode imports
+import NSimVar.{SimVar, SimVars, ExtObjInfo, ConvertMemo};
+
+// Old SimCode imports
+import HashTableCrefSimVar;
+
+// Util imports
+import List;
+import UnorderedMap;
+
+public
+  function createSimCodeMap
+    input SimVars simVars;
+    input ExtObjInfo extObjInfo;
+    output UnorderedMap<ComponentRef, SimVar> simcode_map = UnorderedMap.new<SimVar>(ComponentRef.hash, ComponentRef.isEqual);
+  algorithm
+    addListSimCodeMap(simVars.stateVars, simcode_map);
+    addListSimCodeMap(simVars.derivativeVars, simcode_map);
+    addListSimCodeMap(simVars.algVars, simcode_map);
+    addListSimCodeMap(simVars.discreteAlgVars, simcode_map);
+    addListSimCodeMap(simVars.intAlgVars, simcode_map);
+    addListSimCodeMap(simVars.boolAlgVars, simcode_map);
+    addListSimCodeMap(simVars.inputVars, simcode_map);
+    addListSimCodeMap(simVars.outputVars, simcode_map);
+    addListSimCodeMap(simVars.aliasVars, simcode_map);
+    addListSimCodeMap(simVars.intAliasVars, simcode_map);
+    addListSimCodeMap(simVars.boolAliasVars, simcode_map);
+    addListSimCodeMap(simVars.paramVars, simcode_map);
+    addListSimCodeMap(simVars.intParamVars, simcode_map);
+    addListSimCodeMap(simVars.boolParamVars, simcode_map);
+    addListSimCodeMap(simVars.stringAlgVars, simcode_map);
+    addListSimCodeMap(simVars.stringParamVars, simcode_map);
+    addListSimCodeMap(simVars.stringAliasVars, simcode_map);
+    addListSimCodeMap(simVars.extObjVars, simcode_map);
+    addListSimCodeMap(simVars.constVars, simcode_map);
+    addListSimCodeMap(simVars.intConstVars, simcode_map);
+    addListSimCodeMap(simVars.boolConstVars, simcode_map);
+    addListSimCodeMap(simVars.stringConstVars, simcode_map);
+    addListSimCodeMap(simVars.residualVars, simcode_map);
+    addListSimCodeMap(simVars.jacobianVars, simcode_map);
+    addListSimCodeMap(simVars.seedVars, simcode_map);
+    addListSimCodeMap(simVars.realOptimizeConstraintsVars, simcode_map);
+    addListSimCodeMap(simVars.realOptimizeFinalConstraintsVars, simcode_map);
+    addListSimCodeMap(simVars.sensitivityVars, simcode_map);
+    addListSimCodeMap(simVars.dataReconSetcVars, simcode_map);
+    addListSimCodeMap(simVars.dataReconinputVars, simcode_map);
+    addListSimCodeMap(simVars.dataReconSetBVars, simcode_map);
+    addListSimCodeMap(extObjInfo.objects, simcode_map);
+  end createSimCodeMap;
+
+  function addListSimCodeMap
+    input list<SimVar> simVars;
+    input output UnorderedMap<ComponentRef, SimVar> simcode_map;
+  algorithm
+    // TODO write function UnorderedMap.addList to avoid rehashes
+    for var in simVars loop
+      UnorderedMap.add(SimVar.getName(var), var, simcode_map);
+    end for;
+  end addListSimCodeMap;
+
+  function convertSimCodeMap
+    input UnorderedMap<ComponentRef, SimVar> simcode_map;
+    input ConvertMemo memo;
+    output HashTableCrefSimVar.HashTable old_ht;
+  algorithm
+    old_ht := HashTableCrefSimVar.emptyHashTableSized(UnorderedMap.size(simcode_map));
+    for var in UnorderedMap.valueList(simcode_map) loop
+      old_ht := HashTableCrefSimVar.addSimVarToHashTable(SimVar.convertMemoized(var, memo), old_ht);
+    end for;
+  end convertSimCodeMap;
+
+annotation(__OpenModelica_Interface="nbackend");
+end NSimCodeUtil;

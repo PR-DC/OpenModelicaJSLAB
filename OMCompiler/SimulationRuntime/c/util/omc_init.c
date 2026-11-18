@@ -1,0 +1,80 @@
+/*
+ * This file belongs to the OpenModelica Run-Time System
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC), c/o Linköpings
+ * universitet, Department of Computer and Information Science, SE-58183 Linköping, Sweden. All rights
+ * reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF THE BSD NEW LICENSE OR THE
+ * AGPL VERSION 3 LICENSE OR THE OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8. ANY
+ * USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES RECIPIENT'S
+ * ACCEPTANCE OF THE BSD NEW LICENSE OR THE OSMC PUBLIC LICENSE OR THE AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium) Public License
+ * (OSMC-PL) are obtained from OSMC, either from the above address, from the URLs:
+ * http://www.openmodelica.org or https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica, and in the OpenModelica distribution. GNU
+ * AGPL version 3 is obtained from: https://www.gnu.org/licenses/licenses.html#GPL. The BSD NEW
+ * License is obtained from: http://www.opensource.org/licenses/BSD-3-Clause.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY
+ * SET FORTH IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF
+ * OSMC-PL.
+ *
+ */
+
+#include <stdio.h>
+#include "omc_init.h"
+#include "omc_stackoverflow.h"
+
+#if defined(OM_HAVE_PTHREADS)
+pthread_key_t mmc_thread_data_key = 0;
+pthread_once_t mmc_init_once = PTHREAD_ONCE_INIT;
+#else
+threadData_t *OMC_MAIN_THREADDATA_NAME = 0;
+#endif
+
+static void mmc_init_nogc_once(void)
+{
+#if defined(OM_HAVE_PTHREADS)
+  pthread_key_create(&mmc_thread_data_key,NULL);
+#endif
+#if !defined(OMC_MINIMAL_RUNTIME)
+  /* Stack overflow detection is too expensive and fun for small targets
+   * C-code is usually not generated for stack overflow detection anyway... */
+  init_metamodelica_segv_handler();
+#endif
+}
+
+/* The key and the signal handler's alternate stack are per process, but
+ * fmi{1,2,3}Instantiate calls this once per instance. */
+void mmc_init_nogc(void)
+{
+#if defined(OM_HAVE_PTHREADS)
+  static pthread_once_t nogc_once = PTHREAD_ONCE_INIT;
+  pthread_once(&nogc_once, mmc_init_nogc_once);
+#else
+  static int initialized = 0;
+  if (!initialized) {
+    initialized = 1;
+    mmc_init_nogc_once();
+  }
+#endif
+}
+
+#if defined(OMC_MINIMAL_RUNTIME)
+void mmc_init(void)
+{
+  fprintf(stderr, "Error: called mmc_init (requesting garbage collection) when OMC was compiled with a minimal runtime system.");
+  exit(1);
+}
+#else
+#include "../gc/omc_gc.h"
+void mmc_init(void)
+{
+  mmc_init_nogc();
+  mmc_GC_init();
+}
+#endif

@@ -1,0 +1,36 @@
+// name: ParameterBug.mos [tests https://trac.openmodelica.org/OpenModelica/ticket/1956]
+// keywords:
+// status: correct
+//
+
+
+loadFile("ParameterBug.mo"); getErrorString();
+instantiateModel(ParameterBug.A); getErrorString();
+
+loadFile("PropagateRedeclareMod1.mo"); getErrorString();
+instantiateModel(D); getErrorString();
+
+// Result:
+// true
+// ""
+// "class ParameterBug.A
+//   parameter Real Vdc = 1.0;
+//   parameter Real offset = Vdc;
+//   final parameter Real c.offset = offset;
+//   Real c.x;
+//   Real c.y = c.x;
+// equation
+//   c.x = c.offset;
+// end ParameterBug.A;
+// "
+// ""
+// true
+// ""
+// "class D
+//   Real a.x = 4.0;
+//   Real a.y;
+//   Real a.z = 6.0;
+// end D;
+// "
+// ""
+// endResult

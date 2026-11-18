@@ -1,0 +1,145 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package SimCodeUtil
+
+import SimCode;
+import SimCodeFunction;
+import SimCodeVar;
+
+function sortEqSystems<T>
+  input T eqs;
+  output T outEqs;
+algorithm
+  assert(false, getInstanceName());
+end sortEqSystems;
+
+function eqInfo<T>
+  input T eq;
+  output SourceInfo info;
+algorithm
+  assert(false, getInstanceName());
+end eqInfo;
+
+function getSimCode
+  output SimCode.SimCode code;
+algorithm
+  assert(false, getInstanceName());
+end getSimCode;
+
+function isSimulationCodegen
+  "This compiler is built to compile functions; it generates no simulation."
+  output Boolean simulation;
+algorithm
+  simulation := false;
+end isSimulationCodegen;
+
+function cref2simvar<A,B>
+  input A inCref;
+  input B inCrefToSimVarHT;
+  output SimCodeVar.SimVar outSimVar;
+algorithm
+  assert(false, getInstanceName());
+end cref2simvar;
+
+function isJacobianColumnCref<A>
+  input A cr;
+  output Boolean b;
+algorithm
+  assert(false, getInstanceName());
+end isJacobianColumnCref;
+
+function isContiguousArrayCref<A,B>
+  input A inCref;
+  input B context;
+  output Boolean outContiguous;
+algorithm
+  assert(false, getInstanceName());
+end isContiguousArrayCref;
+
+function simVarExactFromHT<A,B>
+  input A inCref;
+  input B simCode;
+  output Option<SimCodeVar.SimVar> outSimVar;
+algorithm
+  assert(false, getInstanceName());
+end simVarExactFromHT;
+
+function simVarFromHT<A,B>
+  input A inCref;
+  input B simCode;
+  output SimCodeVar.SimVar outSimVar;
+algorithm
+  assert(false, getInstanceName());
+end simVarFromHT;
+
+function codegenExpSanityCheck
+  input output DAE.Exp e;
+  input SimCodeFunction.Context context;
+algorithm
+  /* Do nothing */
+end codegenExpSanityCheck;
+
+function unboxFunctionReferenceCall
+  input output DAE.Exp exp;
+algorithm
+  /* Do nothing */
+end unboxFunctionReferenceCall;
+
+function getExpNominal
+  input output DAE.Exp e;
+algorithm
+  /* Do nothing */
+end getExpNominal;
+
+function getValueReference
+  input SimCodeVar.SimVar inSimVar;
+  input SimCode.SimCode inSimCode;
+  input Boolean inElimNegAliases;
+  output String outValueReference;
+algorithm
+  /* Do nothing */
+end getValueReference;
+
+public function hashEqSystemMod
+  input SimCode.SimEqSystem eq;
+  input Integer mod;
+  output Integer hash = 0;
+algorithm
+  assert(false, getInstanceName());
+end hashEqSystemMod;
+
+annotation(__OpenModelica_Interface="backend");
+end SimCodeUtil;

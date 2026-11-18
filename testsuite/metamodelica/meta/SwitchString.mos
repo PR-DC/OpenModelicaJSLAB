@@ -1,0 +1,13 @@
+// status: correct
+// ticket: #3063
+// suite: metamodelica
+// cflags: -g=MetaModelica -d=noevalfunc,gen
+
+loadFile("SwitchString.mo");getErrorString();
+switchString();getErrorString();
+// Result:
+// true
+// ""
+// "bad"
+// ""
+// endResult

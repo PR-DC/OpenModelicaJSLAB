@@ -1,0 +1,235 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package ZeroCrossings
+" file:        ZeroCrossings.mo
+  package:     ZeroCrossings
+  description: This package contains utility functions for zero crossings
+               inside BackendDAE.
+
+"
+
+import BackendDAE;
+import BackendDAE.{ZeroCrossing,ZeroCrossingSet};
+import BackendDAE.ZeroCrossingSet.ZERO_CROSSING_SET;
+
+protected
+import DoubleEnded;
+import ExpressionBasics;
+
+public
+type Tree = ZeroCrossingTree.Tree;
+
+package ZeroCrossingTree "Lookup ZeroCrossing -> list<ZeroCrossing> (the cons-cell storing the ZC)"
+  extends BaseAvlTree;
+  redeclare type Key = ZeroCrossing;
+  redeclare type Value = list<ZeroCrossing>;
+  redeclare function extends keyStr
+  algorithm
+    outString := ExpressionBasics.printExpStr(inKey.relation_);
+  end keyStr;
+  redeclare function extends valueStr
+  protected
+    ZeroCrossing zc;
+  algorithm
+    zc := listGet(inValue,1);
+    outString := ExpressionBasics.printExpStr(zc.relation_);
+  end valueStr;
+  redeclare function extends keyCompare
+  algorithm
+    outResult := ZeroCrossings.compare(inKey1, inKey2);
+  end keyCompare;
+end ZeroCrossingTree;
+
+function new
+  output ZeroCrossingSet zc_set;
+algorithm
+  zc_set := ZERO_CROSSING_SET(DoubleEnded.fromList({}), arrayCreate(1, ZeroCrossingTree.new()));
+end new;
+
+function length
+  input ZeroCrossingSet zc_set;
+  output Integer i;
+protected
+  list<ZeroCrossing> zcs = DoubleEnded.toListNoCopyNoClear(zc_set.zc);
+algorithm
+  i := sum(zeroCrossingSize(zc) for zc in zcs);
+end length;
+
+function zeroCrossingSize
+  input ZeroCrossing zc;
+  output Integer s;
+algorithm
+  s := match zc.iter
+    local
+      list<BackendDAE.SimIterator> iter;
+    case SOME(iter) then BackendDAE.getSimIteratorSize(iter);
+    else 1;
+  end match;
+end zeroCrossingSize;
+
+function add
+  input ZeroCrossingSet zc_set;
+  input ZeroCrossing zc;
+protected
+  list<ZeroCrossing> addedCell;
+algorithm
+  if not contains(zc_set, zc) then
+    DoubleEnded.push_back(zc_set.zc, zc);
+    addedCell := DoubleEnded.currentBackCell(zc_set.zc);
+    arrayUpdate(zc_set.tree, 1, ZeroCrossingTree.add(arrayGet(zc_set.tree, 1), zc, addedCell));
+  end if;
+end add;
+
+function add_list
+  input ZeroCrossingSet zc_set;
+  input list<ZeroCrossing> zc_lst;
+algorithm
+  for zc in zc_lst loop
+    add(zc_set, zc);
+  end for;
+end add_list;
+
+function push "Appends without checking for duplicates; the lookup tree keeps the first occurrence."
+  input ZeroCrossingSet zc_set;
+  input ZeroCrossing zc;
+protected
+  list<ZeroCrossing> addedCell;
+algorithm
+  DoubleEnded.push_back(zc_set.zc, zc);
+  addedCell := DoubleEnded.currentBackCell(zc_set.zc);
+  arrayUpdate(zc_set.tree, 1, ZeroCrossingTree.add(arrayGet(zc_set.tree, 1), zc, addedCell, ZeroCrossingTree.addConflictKeep));
+end push;
+
+function push_list
+  input ZeroCrossingSet zc_set;
+  input list<ZeroCrossing> zc_lst;
+algorithm
+  for zc in zc_lst loop
+    push(zc_set, zc);
+  end for;
+end push_list;
+
+function count "Number of stored zero crossings; unlike length() this does not expand iterators."
+  input ZeroCrossingSet zc_set;
+  output Integer i;
+algorithm
+  i := DoubleEnded.length(zc_set.zc);
+end count;
+
+function toList
+  input ZeroCrossingSet zc;
+  output list<ZeroCrossing> lst = {};
+
+algorithm
+  lst := DoubleEnded.toListNoCopyNoClear(zc.zc);
+end toList;
+
+function updateIndices
+  input list<ZeroCrossing> ilst;
+  output list<ZeroCrossing> olst = {};
+protected
+  Integer i = 0;
+algorithm
+  for zc in ilst loop
+    zc.index := i;
+    olst := zc :: olst;
+    i := i + 1;
+  end for;
+  olst := listReverse(olst);
+end updateIndices;
+
+function contains
+  input ZeroCrossingSet zc_set;
+  input ZeroCrossing zc;
+  output Boolean matches;
+algorithm
+  matches := ZeroCrossingTree.hasKey(arrayGet(zc_set.tree,1), zc);
+end contains;
+
+function get
+  input ZeroCrossingSet zc_set;
+  input ZeroCrossing zc;
+  output ZeroCrossing outZc;
+algorithm
+  outZc::_ := ZeroCrossingTree.get(arrayGet(zc_set.tree,1), zc);
+end get;
+
+function equals "Returns true if both zero crossings have the same function expression"
+  input ZeroCrossing zc1;
+  input ZeroCrossing zc2;
+  output Boolean outBoolean;
+algorithm
+  outBoolean := 0==compare(zc1, zc2);
+end equals;
+
+function compare "Returns true if both zero crossings have the same function expression"
+  input ZeroCrossing zc1;
+  input ZeroCrossing zc2;
+  output Integer comp;
+algorithm
+  comp := match (zc1, zc2)
+    local
+      DAE.Exp e1, e2, e3, e4;
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("sample"), expLst={e1, _, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("sample"), expLst={e2, _, _})))
+      then ExpressionBasics.compare(e1,e2);
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("integer"), expLst={e1, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("integer"), expLst={e2, _})))
+      then ExpressionBasics.compare(e1,e2);
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("floor"), expLst={e1, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("floor"), expLst={e2, _})))
+      then ExpressionBasics.compare(e1,e2);
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("ceil"), expLst={e1, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("ceil"), expLst={e2, _})))
+      then ExpressionBasics.compare(e1,e2);
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("mod"), expLst={e1, e2, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("mod"), expLst={e3, e4, _})))
+      algorithm
+        comp := ExpressionBasics.compare(e1,e3);
+      then if comp==0 then ExpressionBasics.compare(e2, e4) else comp;
+
+    case (BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("div"), expLst={e1, e2, _})), BackendDAE.ZERO_CROSSING(relation_=DAE.CALL(path=Absyn.IDENT("div"), expLst={e3, e4, _})))
+      algorithm
+        comp := ExpressionBasics.compare(e1,e3);
+      then if comp==0 then ExpressionBasics.compare(e2, e4) else comp;
+
+    case (BackendDAE.ZERO_CROSSING(relation_=e1), BackendDAE.ZERO_CROSSING(relation_=e2))
+      then ExpressionBasics.compare(e1, e2);
+  end match;
+end compare;
+
+annotation(__OpenModelica_Interface="backend_types");
+end ZeroCrossings;

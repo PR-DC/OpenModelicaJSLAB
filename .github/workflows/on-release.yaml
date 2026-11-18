@@ -1,0 +1,33 @@
+name: on-release
+
+on:
+  workflow_dispatch:
+  push: # run only on push tags
+    tags:
+      - 'v*.*.*' # Trigger on version tags like v1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OMVERSION : ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Build Assets
+        run: |
+          export OMVERSION=`git describe --tags --match "v*.*" --always`
+          echo Version: $OMVERSION
+          echo "$OMVERSION" > OMVERSION.txt
+          cd ..
+          ln -s ${{ github.event.repository.name }} ${{ github.event.repository.name }}-$OMVERSION
+          zip ${{ github.event.repository.name }}/${{ github.event.repository.name }}-$OMVERSION-src-with-submodules.zip ${{ github.event.repository.name }}-$OMVERSION -r -x '*/.git/*'
+          rm -f ${{ github.event.repository.name }}-$OMVERSION
+      - name: Upload Release Assets
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: '*src-with-submodules.zip'

@@ -1,0 +1,285 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+#ifndef INSTNODETYPE_H
+#define INSTNODETYPE_H
+
+#include <memory>
+#include <unordered_map>
+
+#include "MetaModelica.h"
+
+namespace OpenModelica
+{
+  namespace Absyn
+  {
+    class Element;
+  };
+
+  class InstNode;
+
+  class InstNodeType
+  {
+    public:
+      //static std::unique_ptr<InstNodeType> fromAbsyn(Absyn::Element *element, InstNode *parent);
+      static std::unique_ptr<InstNodeType> fromNF(MetaModelica::Record value);
+      virtual std::unique_ptr<InstNodeType> clone() const = 0;
+
+      virtual ~InstNodeType() = default;
+
+      virtual bool isBaseClass() const { return false; }
+      virtual bool isUserdefinedClass() const { return false; }
+      virtual bool isRootClass() const { return false; }
+      virtual bool isDerivedClass() const { return false; }
+      virtual bool isTopScope() const { return false; }
+      virtual bool isGeneratedInner() const { return false; }
+      virtual bool isRedeclared() const { return false; }
+      virtual bool isBuiltin() const { return false; }
+      virtual bool hasName() const { return false; }
+
+      virtual InstNode* parent() const { return nullptr; }
+      virtual InstNode* redeclaredParent() const { return nullptr; }
+      virtual InstNode* rootParent() const { return nullptr; }
+      virtual InstNode* annotationScope() const { return nullptr; }
+      virtual InstNode* derivedParent() const { return nullptr; }
+
+      virtual InstNodeType* derivedType() const { return nullptr; }
+
+      virtual Absyn::Element* definition() const { return nullptr; }
+
+      virtual MetaModelica::Value toNF() const = 0;
+  };
+
+  // A class with no specific characteristics.
+  class NormalClassType : public InstNodeType
+  {
+    public:
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isUserdefinedClass() const override { return true; }
+      bool hasName() const override { return true; }
+
+      MetaModelica::Value toNF() const override;
+  };
+
+  // A base class extended by another class.
+  class BaseClassType : public InstNodeType
+  {
+    public:
+      BaseClassType(InstNode *parent, Absyn::Element *definition)
+        : _parent(parent), _definition(definition)
+      {
+      }
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isBaseClass() const override { return true; }
+      bool isUserdefinedClass() const override { return true; }
+      bool isBuiltin() const override;
+
+      InstNode* parent() const override { return _parent; }
+      InstNode* derivedParent() const override { return _parent; }
+
+      Absyn::Element* definition() const override { return _definition; }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      InstNode *_parent;
+      Absyn::Element *_definition;         // The extends clause definition.
+  };
+
+  // A short class definition.
+  class DerivedClassType : public InstNodeType
+  {
+    public:
+      DerivedClassType(std::unique_ptr<InstNodeType> ty)
+        : _ty{std::move(ty)}
+      {
+      }
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isUserdefinedClass() const override { return true; }
+      bool isDerivedClass() const override { return true; }
+
+      InstNode* parent() const override { return _ty ? _ty->parent() : nullptr; }
+      InstNode* rootParent() const override { return _ty ? _ty->rootParent() : nullptr; }
+
+      InstNodeType* derivedType() const override { return _ty.get(); }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      std::unique_ptr<InstNodeType> _ty; // The base node type not considering that it's a derived class.
+  };
+
+  // A builtin class.
+  class BuiltinClassType : public InstNodeType
+  {
+    public:
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isBuiltin() const override { return true; }
+      bool hasName() const override { return true; }
+
+      MetaModelica::Value toNF() const override;
+  };
+
+  // The unnamed class containing all the top-level classes.
+  class TopScopeType : public InstNodeType
+  {
+    public:
+      TopScopeType() = default;
+      TopScopeType(std::unique_ptr<InstNode> annotationScope);
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isTopScope() const override { return true; }
+
+      void setAnnotationScope(std::unique_ptr<InstNode> annotationScope) const;
+      InstNode* annotationScope() const override { return _annotationScope.get(); }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      std::unique_ptr<InstNode> _annotationScope;
+      std::unordered_map<std::string, std::unique_ptr<InstNode>> _generatedInners;
+  };
+
+  // The root of the instance tree, i.e. the class that the instantiation starts from.
+  class RootClassType : public InstNodeType
+  {
+    public:
+      RootClassType(InstNode *parent)
+        : _parent{parent}
+      {
+      }
+
+      RootClassType(MetaModelica::Record value);
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isRootClass() const override { return true; }
+      bool hasName() const override { return true; }
+
+      InstNode* parent() const override { return _parent; }
+      InstNode* rootParent() const override { return _parent; }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      InstNode *_parent;
+  };
+
+  // A normal component.
+  class NormalComponentType : public InstNodeType
+  {
+    public:
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      MetaModelica::Value toNF() const override;
+  };
+
+  // A redeclared component.
+  class RedeclaredComponentType : public InstNodeType
+  {
+    public:
+      RedeclaredComponentType(InstNode *parent)
+        : _parent{parent}
+      {
+      }
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isRedeclared() const override { return true; }
+
+      InstNode* parent() const override { return _parent; }
+      InstNode* redeclaredParent() const override { return _parent; }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      InstNode *_parent;
+  };
+
+  // A redeclared class.
+  class RedeclaredClassType : public InstNodeType
+  {
+    public:
+      RedeclaredClassType(InstNode *parent, std::unique_ptr<InstNodeType> ty)
+        : _parent{parent}, _ty{std::move(ty)}
+      {
+      }
+
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isUserdefinedClass() const override { return _ty->isUserdefinedClass(); }
+      bool isRedeclared() const override { return true; }
+      bool hasName() const override { return true; }
+
+      InstNode* parent() const override { return _parent; }
+
+      MetaModelica::Value toNF() const override;
+
+    private:
+      InstNode *_parent;
+      std::unique_ptr<InstNodeType> _ty;
+  };
+
+  // A generated inner element due to a missing outer.
+  class GeneratedInnerType : public InstNodeType
+  {
+    public:
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      bool isGeneratedInner() const override { return true; }
+
+      MetaModelica::Value toNF() const override;
+  };
+
+  // An implicit scope that's ignored when e.g. constructing a scope path.
+  // Not used by implicit scope nodes since those have no node type (they're
+  // implicitly implicit), but by e.g. the annotation scope.
+  class ImplicitScopeType : public InstNodeType
+  {
+    public:
+      std::unique_ptr<InstNodeType> clone() const override;
+
+      MetaModelica::Value toNF() const override;
+  };
+}
+
+#endif /* INSTNODETYPE_H */

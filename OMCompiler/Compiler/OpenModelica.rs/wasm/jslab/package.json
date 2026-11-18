@@ -1,0 +1,18 @@
+{
+  "name": "@pr-dc/openmodelica-jslab",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "pack:library": "node dev/pack-library.js",
+    "pack:web": "node dev/build-web.js",
+    "export:metadata": "electron tools/export-metadata.js",
+    "check:icons": "node tools/icon-audit.js",
+    "update:library": "node tools/update-library.js"
+  },
+  "devDependencies": {
+    "electron": "30.0.2",
+    "esbuild": "0.28.0",
+    "yauzl": "2.10.0"
+  }
+}

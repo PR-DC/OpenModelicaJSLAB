@@ -1,0 +1,20 @@
+// name:     MatchCase4
+// keywords: Match Cases
+// status:   correct
+// cflags:   +g=MetaModelica
+// suite: metamodelica
+//
+// Match Testing
+//
+loadFile("MatchCase4.mo");
+setCommandLineOptions("-d=noevalfunc,gen");
+MatchCase4.func("hej",1,8);
+getErrorString();
+
+// Result:
+// true
+// true
+// 4
+// "[metamodelica/meta/MatchCase4.mo:14:27-15:7:writable] Warning: 'i2' is used uninitialized and may cause unexpected behaviour. This is deprecated and will become an error in future releases.
+// "
+// endResult

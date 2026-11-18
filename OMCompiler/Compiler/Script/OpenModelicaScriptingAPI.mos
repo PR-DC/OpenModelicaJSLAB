@@ -1,0 +1,24 @@
+echo(false);
+(bool,a,b,c) := OpenModelica.Scripting.generateScriptingAPI(OpenModelica.Scripting, "OMCInterface");
+if bool then
+  a := stringReplace(a, "ValuesUtil.makeArray", "ValuesMake.makeArray");
+  a := stringReplace(a, "ValuesUtil.valString", "ValuesDump.valString");
+  OpenModelica.Scripting.writeFile("OpenModelicaScriptingAPI.tmp.mo","encapsulated package OpenModelicaScriptingAPI\n\n" + a + "annotation(__OpenModelica_Interface=\"backend_main\");\nend OpenModelicaScriptingAPI;\n");getErrorString();
+  setCommandLineOptions("-g=MetaModelica");
+  bool := OpenModelica.Scripting.loadFile("OpenModelicaScriptingAPI.tmp.mo");
+  if bool then
+    bool := OpenModelica.Scripting.compareFilesAndMove("OpenModelicaScriptingAPI.tmp.mo", "OpenModelicaScriptingAPI.mo");
+    OpenModelica.Scripting.deleteFile("OpenModelicaScriptingAPI.tmp.mo");
+  else
+    exit(1);
+  end if;
+  OpenModelica.Scripting.writeFile("OpenModelicaScriptingAPIQt.tmp.cpp", b);
+  bool := OpenModelica.Scripting.compareFilesAndMove("OpenModelicaScriptingAPIQt.tmp.cpp", "OpenModelicaScriptingAPIQt.cpp");
+  OpenModelica.Scripting.deleteFile("OpenModelicaScriptingAPIQt.tmp.cpp");
+  OpenModelica.Scripting.writeFile("OpenModelicaScriptingAPIQt.tmp.h", c);
+  bool := OpenModelica.Scripting.compareFilesAndMove("OpenModelicaScriptingAPIQt.tmp.h", "OpenModelicaScriptingAPIQt.h");
+  OpenModelica.Scripting.deleteFile("OpenModelicaScriptingAPIQt.tmp.h");
+end if;
+if not bool then
+  print("Failed to generate OpenModelicaScriptingAPI; falling back to old generated one until new tarball exists: " + getErrorString());
+end if;

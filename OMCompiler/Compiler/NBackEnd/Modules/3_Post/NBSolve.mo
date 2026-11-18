@@ -1,0 +1,2315 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NBSolve
+" file:         NBSolve.mo
+  package:      NBSolve
+  description:  This file contains all functions for the solving process.
+"
+
+import Module = NBModule;
+
+public
+  // OF imports
+  import Absyn.Path;
+  import AbsynUtil;
+
+  // NF imports
+  import Algorithm = NFAlgorithm;
+  import Call = NFCall;
+  import ComponentRef = NFComponentRef;
+  import Dimension = NFDimension;
+  import Expression = NFExpression;
+  import NFFunction.Function;
+  import NFInstNode.InstNode;
+  import Operator = NFOperator;
+  import SimplifyExp = NFSimplifyExp;
+  import ExpandExp = NFExpandExp;
+  import Subscript = NFSubscript;
+  import Type = NFType;
+  import Variable = NFVariable;
+
+  // backend imports
+  import BackendDAE = NBackendDAE;
+  import BackendUtil = NBBackendUtil;
+  import Causalize = NBCausalize;
+  import Differentiate = NBDifferentiate;
+  import NBEquation.{Equation, EquationPointer, EquationPointers, EqData, EquationAttributes, Iterator, IfEquationBody, WhenEquationBody, WhenStatement, SlicingStatus};
+  import NBVariable.{VariablePointer, VariablePointers, VarData};
+  import BVariable = NBVariable;
+  import Inline = NBInline;
+  import Replacements = NBReplacements;
+  import Slice = NBSlice;
+  import StrongComponent = NBStrongComponent;
+  import BPartition = NBPartition;
+  import NBPartition.Partition;
+  import Tearing = NBTearing;
+
+  type Status = enumeration(UNPROCESSED, EXPLICIT, IMPLICIT, UNSOLVABLE);
+  // TRUE -> relation must be inverted, FALSE -> relation must not be inverted, UNKNOWN -> TODO: make relation depend on derivative of the expr
+  type RelationInversion = enumeration(TRUE, FALSE, UNKNOWN);
+
+  function statusString
+    input Status status;
+    output String str;
+  algorithm
+    str := match status
+      case Status.UNPROCESSED then "Solve.UNPROCESSED";
+      case Status.EXPLICIT    then "Solve.EXPLICIT";
+      case Status.IMPLICIT    then "Solve.IMPLICIT";
+      case Status.UNSOLVABLE  then "Solve.UNSOLVABLE";
+                              else "Solve.FAILED";
+    end match;
+  end statusString;
+
+  function main
+    "solves each strong component and creates ALIAS strong components for each one already solved the exact same way."
+    extends Module.wrapper;
+  protected
+    Pointer<Integer> implicit_index_ptr = Pointer.create(1);
+    type StrongComponentLst = list<StrongComponent>;
+    UnorderedMap<StrongComponent, list<StrongComponent>> duplicate_map = UnorderedMap.new<StrongComponentLst>(StrongComponent.hash, StrongComponent.isEqual);
+  algorithm
+    bdae := match bdae
+      case BackendDAE.MAIN() algorithm
+        // The order here is important. Whatever comes first is declared the "original", same components afterwards will be alias
+        // Has to be the same order as in SimCode!
+        bdae.init       := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.init);
+        if isSome(bdae.init_0) then
+          bdae.init_0   := SOME(list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in Util.getOption(bdae.init_0)));
+        end if;
+        if isSome(bdae.dae) then
+          bdae.dae      := SOME(list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in Util.getOption(bdae.dae)));
+        end if;
+        bdae.ode        := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.ode);
+        bdae.algebraic  := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.algebraic);
+        bdae.ode_event  := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.ode_event);
+        bdae.alg_event  := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.alg_event);
+        bdae.clocked    := list(solvePartition(par, bdae.funcMap, implicit_index_ptr, duplicate_map, bdae.varData, bdae.eqData) for par in bdae.clocked);
+      then bdae;
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+      then fail();
+    end match;
+  end main;
+
+  function solvePartition
+    input output Partition partition;
+    input UnorderedMap<Path, Function> funcMap;
+    input Pointer<Integer> implicit_index_ptr;
+    input UnorderedMap<StrongComponent, list<StrongComponent>> duplicate_map;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    BPartition.Kind kind = Partition.getKind(partition);
+    type EquationPointerList = list<Pointer<Equation>>;
+    UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map = UnorderedMap.new<EquationPointerList>(ComponentRef.hash, ComponentRef.isEqual);
+    list<StrongComponent> solved_comps = {};
+    Integer implicit_index = Pointer.access(implicit_index_ptr);
+    Pointer<Integer> sliced_idx, comp_idx = Pointer.create(1);
+    ComponentRef name;
+    list<Pointer<Equation>> sliced_eqns;
+  algorithm
+    if isSome(partition.strongComponents) then
+      for comp in Util.getOption(partition.strongComponents) loop
+        solved_comps := match UnorderedMap.get(comp, duplicate_map)
+          local list<StrongComponent> alias_comps;
+          case SOME(alias_comps) algorithm
+            // strong component already solved -> get alias comps, they take up positions too
+            Pointer.update(comp_idx, Pointer.access(comp_idx) + listLength(alias_comps));
+          then listAppend(alias_comps, solved_comps);
+          else algorithm
+            // solve strong component -> create alias comps
+            (alias_comps, implicit_index) := solveStrongComponent(comp, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+            UnorderedMap.add(comp, list(StrongComponent.createAlias(kind, partition.index, comp_idx, c) for c in alias_comps), duplicate_map);
+          then listAppend(alias_comps, solved_comps);
+        end match;
+      end for;
+      partition.strongComponents := SOME(listArray(listReverse(solved_comps)));
+      // update sliced eqn names
+      for tpl in UnorderedMap.toList(slicing_map) loop
+        (name, sliced_eqns) := tpl;
+        if not listEmpty(sliced_eqns) then
+          sliced_idx := Pointer.create(1);
+          for eqn_ptr in sliced_eqns loop
+            Equation.subIdxName(eqn_ptr, sliced_idx);
+          end for;
+        end if;
+      end for;
+      Pointer.update(implicit_index_ptr, implicit_index);
+    else
+      Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " cannot solve partition without strong components: " + Partition.toString(partition) + "\n\n"});
+      fail();
+    end if;
+  end solvePartition;
+
+  function solveStrongComponent
+    input StrongComponent comp;
+    output list<StrongComponent> solved_comps = {};
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    Status solve_status;
+    StrongComponent implicit_comp;
+  algorithm
+    try
+      (solved_comps, solve_status) := match comp
+        local
+          Pointer<Equation> eqn_ptr;
+          Equation eqn;
+          Slice<VariablePointer> var_slice;
+          Slice<EquationPointer> eqn_slice;
+          ComponentRef var_cref;
+          StrongComponent generic_comp, solved_comp;
+          list<StrongComponent> entwined_slices = {};
+          Tearing strict;
+          list<StrongComponent> tmp, inner_comps = {}, failed_inner = {};
+          String err_str;
+
+          Algorithm alg;
+          list<ComponentRef> solved_crefs, inputs, outputs;
+          UnorderedSet<ComponentRef> output_crefs, input_crefs, solved_inputs;
+          list<tuple<ComponentRef, ComponentRef>> tmp_crefs;
+          list<Pointer<Variable>> tmp_vars;
+          Boolean is_mixed;
+          list<Pointer<Equation>> tmp_eqns;
+          Pointer<Integer> idx;
+          UnorderedMap<ComponentRef, ComponentRef> cref_repl;
+          UnorderedMap<ComponentRef, Expression> exp_repl;
+
+        case StrongComponent.SINGLE_COMPONENT() algorithm
+          (eqn, solve_status, implicit_index) := solveSingleStrongComponent(Pointer.access(comp.eqn), Pointer.access(comp.var), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+        then ({StrongComponent.SINGLE_COMPONENT(comp.var, Pointer.create(eqn), solve_status)}, solve_status);
+
+        // solve component that was simplified
+        case StrongComponent.MULTI_COMPONENT(vars = {var_slice}) guard(not Equation.isCompound(Slice.getT(comp.eqn))) algorithm
+          // var_slice can be a genuine partial slice; resolve the cref that actually
+          // occurs in the equation with the matching size instead of the bare declared
+          // name (var_cref is documented to carry subscripts, see the comment below).
+          var_cref := if Slice.isFull(var_slice) then BVariable.getVarName(Slice.getT(var_slice))
+            else Slice.resolveSlicedCref(BVariable.getVarName(Slice.getT(var_slice)), Pointer.access(Slice.getT(comp.eqn)), Slice.size(var_slice, function BVariable.size(resize = false)));
+          (solved_comps, implicit_index) := solveStrongComponent(StrongComponent.createSliceOrSingle(var_cref, var_slice, comp.eqn), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+        then (solved_comps, Status.UNPROCESSED); // status is unknown, but does not matter because errors were handled in the recursive call.
+
+        case StrongComponent.MULTI_COMPONENT() algorithm
+          eqn_ptr := Slice.getT(comp.eqn);
+          eqn := Pointer.access(eqn_ptr);
+          (solved_comp, solve_status) := match eqn
+            case Equation.ALGORITHM(alg = alg) algorithm
+              // X = set of solved variables
+              solved_crefs := list(BVariable.getVarName(Slice.getT(var)) for var in comp.vars);
+
+              // Y = set of inputs
+              inputs := List.flatten(list(BVariable.getRecordChildrenCrefOrSelf(i) for i in alg.inputs));
+              input_crefs := UnorderedSet.fromList(inputs, ComponentRef.hash, ComponentRef.isEqual);
+              // Y^ <- Y n X set of inputs that are solved (iteration vars, no need to create temporary variables)
+              solved_inputs := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+              for solved_cref in solved_crefs loop
+                if UnorderedSet.contains(solved_cref, input_crefs) then
+                  UnorderedSet.add(solved_cref, solved_inputs);
+                end if;
+              end for;
+
+              // Z = set of outputs
+              outputs := List.flatten(list(BVariable.getRecordChildrenCrefOrSelf(o) for o in alg.outputs));
+              output_crefs := UnorderedSet.fromList(outputs, ComponentRef.hash, ComponentRef.isEqual);
+              // Z^ <- Z \ X set of outputs that are not solved
+              for solved_cref in solved_crefs loop
+                UnorderedSet.remove(solved_cref, output_crefs);
+              end for;
+
+              if UnorderedSet.isEmpty(output_crefs) then
+                // EXPLICIT: no unsolved outputs
+                (eqn_slice, solve_status, implicit_index) := solveMultiStrongComponent(comp.eqn, comp.vars, funcMap, kind, implicit_index, slicing_map, Iterator.EMPTY(), varData, eqData);
+                solved_comp := StrongComponent.MULTI_COMPONENT(comp.vars, eqn_slice, solve_status);
+              else
+                // IMPLICIT: some outputs are not solved in the body
+                solve_status := Status.IMPLICIT;
+                idx := Pointer.create(0);
+                // create temporary variables for all outputs that are not solved for
+                tmp_crefs := list((cref, BVariable.makeTmpVar(cref)) for cref in UnorderedSet.toList(output_crefs));
+                tmp_vars := list(BVariable.getVarPointer(Util.tuple22(tpl), sourceInfo()) for tpl in tmp_crefs);
+
+                // create equations equalizing the temporary variables and the real ones
+                // res = z - z^ for z^ in Z^
+                tmp_eqns := list(Equation.makeAssignment(
+                  lhs   = Expression.fromCref(Util.tuple21(tpl)),
+                  rhs   = Expression.fromCref(Util.tuple22(tpl)),
+                  idx   = idx,
+                  str   = "TMP",
+                  iter  = Iterator.EMPTY(),
+                  attr  = EquationAttributes.default(NBEquation.EquationKind.CONTINUOUS, false)) for tpl in tmp_crefs);
+                // make residual equations
+                tmp_eqns := list(Equation.createResidual(e) for e in tmp_eqns);
+                // create z -> z^ replacements for the algorithm body and for the algorithm outputs
+                cref_repl := UnorderedMap.new<ComponentRef>(ComponentRef.hash, ComponentRef.isEqual);
+                exp_repl  := UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+                for tpl in tmp_crefs loop
+                  UnorderedMap.add(Util.tuple21(tpl), Util.tuple22(tpl), cref_repl);
+                  UnorderedMap.add(Util.tuple21(tpl), Expression.fromCref(Util.tuple22(tpl)), exp_repl);
+                end for;
+                // replace z -> z^ in the algorithm outputs and set the solved variables to those outputs
+                alg.outputs := list(UnorderedMap.getOrDefault(c, cref_repl, c) for c in eqn.alg.outputs);
+                comp.vars   := list(Slice.SLICE(BVariable.getVarPointer(c, sourceInfo()), {}) for c in alg.outputs);
+                comp.status := Status.EXPLICIT;
+                eqn.alg     := alg;
+                // replace z -> z^  in the algorithm body
+                Pointer.update(eqn_ptr, Equation.map(eqn, function Replacements.applySimpleExp(replacements = exp_repl)));
+                // create the algebraic loop, already torn
+                strict := Tearing.TEARING_SET(list(Slice.SLICE(BVariable.getVarPointer(c, sourceInfo()), {}) for c in UnorderedSet.toList(solved_inputs)), list(Slice.SLICE(e, {}) for e in tmp_eqns), listArray({comp}), NONE());
+                // a loop over discrete variables is mixed and must not get a Jacobian
+                is_mixed := List.any(list(Slice.getT(v) for v in strict.iteration_vars), function BVariable.isDiscontinuous(staticAsContinuous = Partition.kindIsInitial(kind)));
+                // ToDo: set the other booleans correctly
+                solved_comp := StrongComponent.ALGEBRAIC_LOOP(implicit_index, strict, NONE(), false, is_mixed, false, solve_status, true);
+
+                // add new equations and new variables
+                EqData.addTypedList(eqData, tmp_eqns, NBEquation.EqData.EqType.CONTINUOUS);
+                VarData.addTypedList(varData, tmp_vars, NBVariable.VarData.VarType.ALGEBRAIC);
+                // ToDo: create sub routine for this (?)
+              end if;
+            then (solved_comp, solve_status);
+
+            else algorithm
+              (eqn_slice, solve_status, implicit_index) := solveMultiStrongComponent(comp.eqn, comp.vars, funcMap, kind, implicit_index, slicing_map, Iterator.EMPTY(), varData, eqData);
+            then (StrongComponent.MULTI_COMPONENT(comp.vars, eqn_slice, solve_status), solve_status);
+          end match;
+        then ({solved_comp}, solve_status);
+
+        case StrongComponent.ALGEBRAIC_LOOP(strict = strict) algorithm
+          for index in arrayLength(strict.innerEquations):-1:1 loop
+            (tmp, implicit_index) := solveStrongComponent(strict.innerEquations[index], funcMap, kind, implicit_index, slicing_map, varData, eqData);
+            inner_comps := listAppend(tmp, inner_comps);
+            for elem in tmp loop
+              if StrongComponent.getSolveStatus(elem) <> NBSolve.Status.EXPLICIT then
+                failed_inner := elem :: failed_inner;
+              end if;
+            end for;
+          end for;
+          // throw an error if there are non explicit inner equations
+          if not listEmpty(failed_inner) then
+            if Flags.isSet(Flags.TEARING_DUMP) then
+              err_str := " Following inner equations could not be solved explicitely:\n"
+                + List.toString(failed_inner, function StrongComponent.toString(index = -1), List.Style.NEWLINE);
+            else
+              err_str := " Use -d=tearingdump for more information.";
+            end if;
+            Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed. " + err_str});
+            fail();
+          end if;
+
+          strict.innerEquations := listArray(inner_comps);
+          comp.strict := strict;
+          comp.status := Status.IMPLICIT;
+        then ({comp}, Status.IMPLICIT);
+
+        // a whole dimension in the cref to solve (e.g. x[i, :] for x[i, j] inside a reduction over j)
+        // does not determine the solved elements, solve each matched element separately
+        case StrongComponent.SLICED_COMPONENT() guard(StrongComponent.solvesInsideReduction(Slice.getT(comp.eqn), comp.var_cref)) algorithm
+          (tmp, solve_status) := solveSliceElementwise(comp.var, comp.eqn, funcMap);
+        then (tmp, solve_status);
+
+        case StrongComponent.SLICED_COMPONENT() guard(Equation.isForEquation(Slice.getT(comp.eqn))) algorithm
+          (generic_comp, solve_status, implicit_index) := solveGenericEquation(comp, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+        then ({generic_comp}, solve_status);
+
+        // a single row of an array equation solved for a scalar, e.g. x from row 1 of v = fill(1, 3) .* x
+        case StrongComponent.SLICED_COMPONENT() guard(Equation.isArrayEquation(Slice.getT(comp.eqn))
+          and List.hasOneElement(comp.eqn.indices) and not Type.isArray(ComponentRef.getSubscriptedType(comp.var_cref, true))) algorithm
+          eqn := Equation.arrayRow(Slice.getT(comp.eqn), listHead(comp.eqn.indices));
+          (eqn, solve_status, implicit_index) := solveSingleStrongComponent(eqn, Variable.fromCref(comp.var_cref), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+          if solve_status < Status.UNSOLVABLE then
+            comp.eqn := Slice.SLICE(Pointer.create(eqn), {});
+          else
+            (eqn_slice, implicit_index, solve_status) := solveForVarSlice(comp.eqn, comp.var, comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+            comp.eqn := eqn_slice;
+          end if;
+          comp.status := solve_status;
+        then ({comp}, solve_status);
+
+        case StrongComponent.SLICED_COMPONENT() guard(Equation.isArrayEquation(Slice.getT(comp.eqn))) algorithm
+          // array equation solved for the a sliced variable.
+          // get all slices of the variable occurring in the equation and select the slice that fits the indices
+          (eqn_slice, implicit_index, solve_status) := solveForVarSlice(comp.eqn, comp.var, comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+          comp.eqn := eqn_slice;
+          comp.status := solve_status;
+        then ({comp}, solve_status);
+
+        case StrongComponent.SLICED_COMPONENT() algorithm
+          // just a regular equation solved for a sliced variable
+          // use cref instead of var because it has subscripts!
+          (eqn, solve_status, implicit_index) := solveSingleStrongComponent(Pointer.access(Slice.getT(comp.eqn)),
+            Variable.fromCref(resizedCref(Pointer.access(Slice.getT(comp.eqn)), comp.var_cref)), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+          if solve_status == Status.EXPLICIT then
+            // successfully solved explicitly; use result directly
+            comp.eqn := Slice.SLICE(Pointer.create(eqn), {});
+            // the matched cref has resizable parameters in its subscripts replaced by
+            // their values (x[N+1] -> x[11]), the solved equation keeps them symbolic
+            comp.var_cref := solvedCref(eqn, comp.var_cref);
+          else
+            // IMPLICIT (cref hidden inside array expression) or UNSOLVABLE:
+            // try expanding array sums to find an explicit solution for the slice
+            (eqn_slice, implicit_index, solve_status) := solveForVarSlice(comp.eqn, comp.var, comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+            comp.eqn := eqn_slice;
+            if solve_status == Status.EXPLICIT then
+              comp.var_cref := solvedCref(Pointer.access(Slice.getT(eqn_slice)), comp.var_cref);
+            end if;
+          end if;
+          comp.status := solve_status;
+        then ({comp}, solve_status);
+
+        case StrongComponent.RESIZABLE_COMPONENT() algorithm
+          // a resizable component with trivial solution
+          // ToDo 1: resolve the eval order
+          // ToDo 2: resolve potential equation slicing
+          (eqn, solve_status, implicit_index, _) := solveEquation(Pointer.access(Slice.getT(comp.eqn)), comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+          eqn := Equation.applyForOrder(eqn, comp.order);
+          comp.eqn := Slice.SLICE(Pointer.create(eqn), comp.eqn.indices);
+          comp.status := solve_status;
+        then ({comp}, solve_status);
+
+        /* for now handle all entwined equations generically and don't try to solve */
+        case StrongComponent.ENTWINED_COMPONENT() algorithm
+          for slice in comp.entwined_slices loop
+            generic_comp := slice;
+            if isSome(comp.periodic_order) then
+              // the order of the iterations is given by the entwined component
+              () := match generic_comp
+                case StrongComponent.RESIZABLE_COMPONENT() algorithm
+                  (eqn, solve_status, implicit_index, _) := solveEquation(Pointer.access(Slice.getT(generic_comp.eqn)), generic_comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+                  generic_comp.eqn := Slice.SLICE(Pointer.create(eqn), generic_comp.eqn.indices);
+                  generic_comp.status := solve_status;
+                then ();
+                case _ guard(not List.any(StrongComponent.getEquations(generic_comp), Equation.isForEquation)) algorithm
+                  // a scalar slice is called once
+                  ({generic_comp}, implicit_index) := solveStrongComponent(generic_comp, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+                then ();
+                else algorithm
+                  (generic_comp, solve_status, implicit_index) := solveGenericEquation(slice, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+                then ();
+              end match;
+            else
+              (generic_comp, solve_status, implicit_index) := solveGenericEquation(slice, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+            end if;
+            // make loop on any solve_status != explicit
+            entwined_slices := generic_comp :: entwined_slices;
+          end for;
+          comp.entwined_slices := listReverse(entwined_slices);
+        then ({comp}, NBSolve.Status.EXPLICIT);
+
+        else ({comp}, Status.UNSOLVABLE);
+      end match;
+    else
+      // this fails in the next case because of the unsolvable status
+      (solved_comps, solve_status) := ({comp}, Status.UNSOLVABLE);
+    end try;
+
+    // solve implicit equation (algebraic loop is always implicit)
+    if solve_status == Status.IMPLICIT and List.hasOneElement(solved_comps) then
+      (implicit_comp, implicit_index)  := Tearing.implicit(
+        comp    = listHead(solved_comps),
+        funcMap = funcMap,
+        index   = implicit_index,
+        kind    = kind
+      );
+      solved_comps := {implicit_comp};
+    elseif solve_status > Status.EXPLICIT then
+      Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed with status = " + statusString(solve_status)
+        + " while trying to solve following strong component:\n" + StrongComponent.toString(comp) + "\n"});
+      fail();
+    end if;
+  end solveStrongComponent;
+
+  function solveGenericEquation
+    input output StrongComponent comp;
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    output Status solve_status;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input VarData varData;
+    input EqData eqData;
+  algorithm
+    (comp, solve_status) := match comp
+      local
+        Slice<VariablePointer> var_slice;
+        Slice<EquationPointer> eqn_slice;
+        Equation eqn;
+
+      case StrongComponent.SLICED_COMPONENT(var = var_slice, eqn = eqn_slice) guard(Equation.isForEquation(Slice.getT(eqn_slice))) algorithm
+        (comp, solve_status, implicit_index) := solveGenericEquationSlice(var_slice, eqn_slice, comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+      then (comp, solve_status);
+
+      // ToDo: make these actually resizable inside entwined equations (?)
+      case StrongComponent.RESIZABLE_COMPONENT(var = var_slice, eqn = eqn_slice) guard(Equation.isForEquation(Slice.getT(eqn_slice))) algorithm
+        eqn_slice := Slice.apply(eqn_slice, function Pointer.apply(func = function Equation.applyForOrder(order = comp.order)));
+        (comp, solve_status, implicit_index) := solveGenericEquationSlice(var_slice, eqn_slice, comp.var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+      then (comp, solve_status);
+
+      // Scalar component inside an entwined block (no subscripts, full slice)
+      case StrongComponent.SINGLE_COMPONENT() algorithm
+        (eqn, solve_status, implicit_index) := solveSingleStrongComponent(Pointer.access(comp.eqn), Pointer.access(comp.var), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+        comp := StrongComponent.SINGLE_COMPONENT(comp.var, Pointer.create(eqn), solve_status);
+      then (comp, solve_status);
+
+      // Scalar component with subscripted variable (e.g. x[1] = ...) inside an entwined block
+      case StrongComponent.SLICED_COMPONENT() algorithm
+        (eqn, solve_status, implicit_index) := solveSingleStrongComponent(Pointer.access(Slice.getT(comp.eqn)), Variable.fromCref(comp.var_cref), funcMap, kind, implicit_index, slicing_map, varData, eqData);
+        if solve_status < Status.UNSOLVABLE then
+          comp.eqn := Slice.SLICE(Pointer.create(eqn), comp.eqn.indices);
+        end if;
+        comp.status := solve_status;
+      then (comp, solve_status);
+
+      // Compound equation (when/algorithm/if) inside an entwined block
+      case StrongComponent.MULTI_COMPONENT() algorithm
+        (eqn_slice, solve_status, implicit_index) := solveMultiStrongComponent(comp.eqn, comp.vars, funcMap, kind, implicit_index, slicing_map, Iterator.EMPTY(), varData, eqData);
+        comp := StrongComponent.MULTI_COMPONENT(comp.vars, eqn_slice, solve_status);
+      then (comp, solve_status);
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for:\n" + StrongComponent.toString(comp) + "\n"});
+      then fail();
+    end match;
+  end solveGenericEquation;
+
+  function solveGenericEquationSlice
+    input Slice<VariablePointer> var_slice;
+    input Slice<EquationPointer> eqn_slice;
+    input ComponentRef cref;
+    output StrongComponent comp;
+    output Status solve_status;
+    input UnorderedMap<Path, Function> functions;
+    input BPartition.Kind kind;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    Pointer<Equation> eqn_ptr = Slice.getT(eqn_slice);
+    Equation eqn;
+    Slice<EquationPointer> solved_slice;
+    UnorderedMap<ComponentRef, Expression> replacements;
+    Option<ComponentRef> iter_cref;
+    ComponentRef solve_cref = cref;
+  algorithm
+    // single iterations of resizable loops stay generic, their index is only known at the analysis sizes
+    if List.hasOneElement(eqn_slice.indices) and isResizableForSlice(eqn_slice) then
+      iter_cref := iteratorCref(eqn_ptr, listHead(eqn_slice.indices), cref);
+    else
+      iter_cref := NONE();
+    end if;
+    if isSome(iter_cref) then
+      solve_cref := Util.getOption(iter_cref);
+      (eqn, solve_status, implicit_index, _) := solveEquation(Pointer.access(eqn_ptr), solve_cref, functions, kind, implicit_index, slicing_map, varData, eqData);
+      if solve_status >= Status.UNSOLVABLE then
+        // solve the single iteration instead
+        solve_cref := cref;
+        (eqn, solve_status) := Equation.singleSlice(eqn_ptr, listHead(eqn_slice.indices), Equation.sizes(eqn_ptr, true), cref,
+          UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual), functions);
+      end if;
+    elseif List.hasOneElement(eqn_slice.indices) then
+      replacements := UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+      // the index refers to the analysis sizes of resizable arrays
+      (eqn, solve_status) := Equation.singleSlice(eqn_ptr, listHead(eqn_slice.indices), Equation.sizes(eqn_ptr, Flags.getConfigBool(Flags.RESIZABLE_ARRAYS)), cref, replacements, functions);
+    else
+      (eqn, solve_status, implicit_index, _) := solveEquation(Pointer.access(eqn_ptr), cref, functions, kind, implicit_index, slicing_map, varData, eqData);
+    end if;
+
+    // ToDo: if solve_status not explicit -> algebraic loop with residual and Status.IMPLICIT
+    if solve_status < Status.UNSOLVABLE then
+      solved_slice := Slice.SLICE(Pointer.create(eqn), eqn_slice.indices);
+    else
+      (solved_slice, implicit_index, solve_status) := solveForVarSlice(eqn_slice, var_slice, cref, functions, kind, implicit_index, slicing_map, varData, eqData);
+    end if;
+
+    // create a generic component if its a for-equation, otherwise create a sliced component
+    if Equation.isForEquation(Slice.getT(solved_slice)) then
+      comp := StrongComponent.GENERIC_COMPONENT(solve_cref, var_slice, solved_slice);
+    else
+      comp := StrongComponent.SLICED_COMPONENT(cref, var_slice, solved_slice, solve_status);
+    end if;
+  end solveGenericEquationSlice;
+
+  function isResizableForSlice
+    "a slice of a for-equation with a scalar body over a resizable range"
+    input Slice<EquationPointer> eqn_slice;
+    output Boolean b = false;
+  protected
+    Pointer<Equation> eqn_ptr = Slice.getT(eqn_slice);
+    Iterator iter;
+  algorithm
+    if Flags.getConfigBool(Flags.RESIZABLE_ARRAYS) and Equation.isForEquation(eqn_ptr) then
+      iter := Equation.getForIterator(Pointer.access(eqn_ptr));
+      b := Iterator.isResizable(iter) and Equation.size(eqn_ptr, true) == Iterator.size(iter, true);
+    end if;
+  end isResizableForSlice;
+
+  function iteratorCref
+    "the occurrence of the variable of cref in the body of a for-equation that is
+     cref in the iteration of the scalar index"
+    input Pointer<Equation> eqn_ptr;
+    input Integer index;
+    input ComponentRef cref;
+    output Option<ComponentRef> res = NONE();
+  protected
+    UnorderedMap<ComponentRef, Expression> replacements = UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+    ComponentRef stripped = ComponentRef.stripSubscriptsAll(cref), target = ComponentRef.simplifySubscripts(cref);
+    Expression e;
+  algorithm
+    // the index is row major w.r.t. the frames, the location outermost frame first like the iterator
+    Iterator.createLocationReplacements(Equation.getForIterator(Pointer.access(eqn_ptr)),
+      listArray(listReverse(Slice.indexToLocation(index, listReverse(Equation.sizes(eqn_ptr, true))))), replacements);
+    for c in Equation.collectCrefs(Pointer.access(eqn_ptr), function sameVariable(stripped = stripped)) loop
+      e := SimplifyExp.simplify(Expression.map(Expression.fromCref(c), function Replacements.applySimpleExp(replacements = replacements)));
+      if Expression.isCref(e) and ComponentRef.isEqual(ComponentRef.simplifySubscripts(Expression.toCref(e)), target) then
+        res := SOME(c);
+        return;
+      end if;
+    end for;
+  end iteratorCref;
+
+  function sameVariable extends Slice.filterCref;
+    input ComponentRef stripped;
+  algorithm
+    if ComponentRef.isEqual(ComponentRef.stripSubscriptsAll(cref), stripped) then
+      UnorderedSet.add(cref, acc);
+    end if;
+  end sameVariable;
+
+  function solveSliceElementwise
+    "Solves each matched element of a sliced for-equation separately for its variable element.
+    Used if the variable occurs inside a reduction over one of its dimensions, e.g. solving
+    y[i] = sum(x[i, j] for j in 1:n) for x[i, 1]: the reductions are expanded for each element."
+    input Slice<VariablePointer> var_slice;
+    input Slice<EquationPointer> eqn_slice;
+    input UnorderedMap<Path, Function> funcMap;
+    output list<StrongComponent> comps = {};
+    output Status solve_status = Status.EXPLICIT;
+  protected
+    Pointer<Equation> eqn_ptr = Slice.getT(eqn_slice);
+    Pointer<Variable> var_ptr = Slice.getT(var_slice);
+    list<Integer> eqn_sizes = Equation.sizes(eqn_ptr);
+    list<Dimension> dims = Type.arrayDims(Variable.typeOf(Pointer.access(var_ptr)));
+    list<Integer> var_sizes = list(Dimension.size(dim) for dim in dims);
+    list<Integer> vals;
+    list<Subscript> subs;
+    ComponentRef cref;
+    Equation eqn;
+    Status status;
+  algorithm
+    // equation and variable indices are aligned by the matching
+    for tpl in List.zip(eqn_slice.indices, var_slice.indices) loop
+      // the scalar element of the variable
+      vals := listReverse(Slice.indexToLocation(Util.tuple22(tpl), var_sizes));
+      subs := list(Subscript.nth(dim, val + 1) threaded for dim in dims, val in vals);
+      cref := ComponentRef.mergeSubscripts(subs, BVariable.getVarName(var_ptr), true, true);
+      // the scalar equation with expanded reductions
+      (eqn, _) := Equation.singleSlice(eqn_ptr, Util.tuple21(tpl), eqn_sizes, ComponentRef.EMPTY(),
+        UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual), funcMap);
+      eqn := Equation.map(eqn, expandReduction);
+      (eqn, status, _) := solveBody(eqn, cref, funcMap);
+      solve_status := if status > solve_status then status else solve_status;
+      comps := StrongComponent.SLICED_COMPONENT(cref, Slice.SLICE(var_ptr, {Util.tuple22(tpl)}),
+        Slice.SLICE(Pointer.create(eqn), {}), status) :: comps;
+    end for;
+    comps := listReverse(comps);
+  end solveSliceElementwise;
+
+  function expandReduction
+    "expands sum and product reductions over constant ranges and of arrays, e.g.
+    sum(x[1, j] for j in 1:3) -> x[1, 1] + x[1, 2] + x[1, 3], sum(x[1, :]) -> x[1, 1] + x[1, 2]"
+    input output Expression exp;
+  protected
+    Call call;
+    String name;
+    Type ty;
+    Operator op;
+    Expression default_exp, range, arg;
+    Boolean expanded;
+    list<tuple<NFInstNode.InstNode, Expression>> iters = {};
+  algorithm
+    exp := match exp
+      case Expression.CALL(call = call as Call.TYPED_CALL(arguments = {arg})) algorithm
+        name := AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn));
+        ty := Type.arrayElementType(Expression.typeOf(arg));
+        if not (name == "sum" or name == "product") or not Type.isArray(Expression.typeOf(arg)) or Type.isRecord(ty) then
+          return;
+        end if;
+        (arg, expanded) := ExpandExp.expand(arg, true);
+        if not expanded then
+          return;
+        end if;
+        (default_exp, op) := if name == "sum" then (Expression.makeZero(ty), Operator.makeAdd(ty))
+                             else (Expression.makeOne(ty), Operator.makeMul(ty));
+      then SimplifyExp.simplify(List.fold(Expression.arrayScalarElements(arg), function makeBinary(op = op), default_exp));
+
+      case Expression.CALL(call = call as Call.TYPED_REDUCTION()) algorithm
+        name := AbsynUtil.pathString(Function.name(call.fn));
+        ty := Expression.typeOf(call.exp);
+        if not (name == "sum" or name == "product") or Type.isRecord(Type.arrayElementType(ty)) then
+          return;
+        end if;
+        for iter in call.iters loop
+          (range, expanded) := ExpandExp.expand(Util.tuple22(iter));
+          if not expanded then
+            return;
+          end if;
+          iters := (Util.tuple21(iter), range) :: iters;
+        end for;
+        (default_exp, op) := if name == "sum" then (Expression.makeZero(ty), Operator.makeAdd(ty))
+                             else (Expression.makeOne(ty), Operator.makeMul(ty));
+      then SimplifyExp.simplify(Expression.foldReduction(call.exp, listReverse(iters), default_exp,
+        function SimplifyExp.simplify(includeScope = false), function makeBinary(op = op)));
+      else exp;
+    end match;
+  end expandReduction;
+
+  function makeBinary
+    input Expression exp1;
+    input Expression exp2;
+    input Operator op;
+    output Expression exp = Expression.BINARY(exp1, op, exp2);
+  end makeBinary;
+
+  function resizedCref
+    "The cref of the equation that is var_cref at the analysis sizes, e.g. x[N]
+    for the matched x[4]. Without resizable arrays or if there is none, var_cref."
+    input Equation eqn;
+    input output ComponentRef var_cref;
+  protected
+    list<ComponentRef> candidates;
+  algorithm
+    if not Flags.getConfigBool(Flags.RESIZABLE_ARRAYS) then
+      return;
+    end if;
+    candidates := Equation.collectCrefs(eqn, function Slice.getSliceCandidates(name = ComponentRef.stripSubscriptsAll(var_cref)));
+    candidates := list(c for c guard(ComponentRef.isEqual(var_cref,
+      ComponentRef.simplifySubscripts(ComponentRef.mapExp(c, Expression.replaceResizableParameter)))) in candidates);
+    candidates := UnorderedSet.unique_list(candidates, ComponentRef.hash, ComponentRef.isEqual);
+    if List.hasOneElement(candidates) then
+      var_cref := listHead(candidates);
+    end if;
+  end resizedCref;
+
+  function solvedCref
+    "The cref an explicitly solved equation assigns, if it is the variable of
+    var_cref (same name, possibly other but equal subscripts), else var_cref.
+    Only without scalarization: scalarized, the evaluated element is the variable."
+    input Equation eqn;
+    input output ComponentRef var_cref;
+  algorithm
+    if Flags.getConfigBool(Flags.SIM_CODE_SCALARIZE) then
+      return;
+    end if;
+    var_cref := match Equation.getLHS(eqn)
+      local
+        ComponentRef lhs;
+      case SOME(Expression.CREF(cref = lhs))
+        guard ComponentRef.isEqual(ComponentRef.stripSubscriptsAll(lhs), ComponentRef.stripSubscriptsAll(var_cref))
+        then lhs;
+      else var_cref;
+    end match;
+  end solvedCref;
+
+  function solveSingleStrongComponent
+    input output Equation eqn;
+    input Variable var;
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    output Status status;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    ComponentRef var_cref;
+  algorithm
+    if ComponentRef.isEmpty(var.name) then
+      // empty variable name implies equation without return value
+      (eqn, status) := (eqn, Status.EXPLICIT);
+    else
+      (var_cref, status) := getVarSlice(var.name, SOME(var.name), eqn);
+      var_cref := if status < Status.UNSOLVABLE then var_cref else var.name;
+      (eqn, status, implicit_index, _) := solveEquation(eqn, var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+    end if;
+  end solveSingleStrongComponent;
+
+  function solveMultiStrongComponent
+    input output Slice<EquationPointer> eqn_slice;
+    input list<Slice<VariablePointer>> var_slices;
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    output Status status;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input Iterator iter;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    Equation eqn = Pointer.access(Slice.getT(eqn_slice));
+  algorithm
+    (eqn_slice, status) := match eqn
+      local
+        Equation solved_eqn;
+        IfEquationBody if_body;
+
+      case Equation.IF_EQUATION() algorithm
+        (if_body, status, implicit_index) := solveIfBody(eqn.body, VariablePointers.fromList(list(Slice.getT(v) for v in var_slices)), funcMap, kind, implicit_index, slicing_map, iter, varData, eqData);
+        // keep the original equation if a branch is implicit, it is used as the residual
+        if status == Status.EXPLICIT then
+          eqn.body := if_body;
+          eqn_slice := Slice.SLICE(Pointer.create(eqn), eqn_slice.indices);
+        end if;
+      then (eqn_slice, status);
+
+      // ToDo: inverse algorithms
+      case Equation.ALGORITHM()
+      then (Slice.SLICE(Pointer.clone(Slice.getT(eqn_slice)), eqn_slice.indices), Status.EXPLICIT);
+
+      // for now assume they are solved
+      case Equation.WHEN_EQUATION()
+      then (Slice.SLICE(Pointer.clone(Slice.getT(eqn_slice)), eqn_slice.indices), Status.EXPLICIT);
+
+      // solve record and tuple equations
+      case Equation.RECORD_EQUATION() algorithm
+        (solved_eqn, status) := solveMultiRecordStrongComponent(eqn, var_slices, funcMap);
+      then (Slice.SLICE(Pointer.create(solved_eqn), eqn_slice.indices), status);
+
+      // solve arrays of record and tuple equations
+      case Equation.ARRAY_EQUATION() algorithm
+        (solved_eqn, status) := solveMultiRecordStrongComponent(eqn, var_slices, funcMap);
+      then (Slice.SLICE(Pointer.create(solved_eqn), eqn_slice.indices), status);
+
+      // for-equation of a tuple, e.g. (a[i], b[i]) = f(x[i]), solved for all elements of the tuple
+      case Equation.FOR_EQUATION(body = {solved_eqn as Equation.RECORD_EQUATION()}) algorithm
+        (solved_eqn, status) := solveMultiRecordStrongComponent(solved_eqn, var_slices, funcMap, true);
+        eqn.body := {solved_eqn};
+      then (Slice.SLICE(Pointer.create(eqn), eqn_slice.indices), status);
+
+      // dummy equation implies removed equation (occurs only in simulation systems)
+      case Equation.DUMMY_EQUATION() then (eqn_slice, Status.EXPLICIT);
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for equation:\n" + Slice.toString(eqn_slice, function Equation.pointerToString(str = ""))});
+      then fail();
+    end match;
+  end solveMultiStrongComponent;
+
+  function solveMultiRecordStrongComponent
+    input Equation eqn "has to be RECORD_EQUATION or ARRAY_EQUATION";
+    input list<Slice<Pointer<Variable>>> var_slices;
+    output Equation solved_eqn = eqn;
+    input UnorderedMap<Path, Function> funcMap;
+    output Status status = Status.UNPROCESSED;
+    input Boolean inFor = false "true if the equation is the body of a for-equation, its tuple elements are iterated slices of the vars";
+  protected
+    list<Pointer<Variable>> vars = list(Slice.getT(v) for v in var_slices);
+    Expression lhs = Util.getOption(Equation.getLHS(eqn));
+    Expression rhs = Util.getOption(Equation.getRHS(eqn));
+    UnorderedSet<ComponentRef> record_crefs;
+    ComponentRef var_cref;
+  algorithm
+    (solved_eqn, status) := match (lhs, rhs)
+      local
+        Expression exp;
+
+      // handle tuples
+      case (exp as Expression.TUPLE(), _) guard(tupleSolvable(exp.elements, vars, inFor)) then (solved_eqn, Status.EXPLICIT);
+      case (_, exp as Expression.TUPLE()) guard(tupleSolvable(exp.elements, vars, inFor)) algorithm
+        solved_eqn := Equation.setRHS(solved_eqn, lhs);
+        solved_eqn := Equation.setLHS(solved_eqn, rhs);
+      then (solved_eqn, Status.EXPLICIT);
+
+      // handle records
+      else algorithm
+        // check if all belong to the same record
+        record_crefs := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+        for var_slice in var_slices loop
+          var_cref := BVariable.getVarName(Slice.getT(var_slice));
+          (var_cref, status) := getVarSlice(var_cref, SOME(var_cref), eqn);
+          UnorderedSet.add(var_cref, record_crefs);
+          if status == Status.UNSOLVABLE then break; end if;
+        end for;
+
+        solved_eqn := match (UnorderedSet.toList(record_crefs), status)
+          case ({var_cref}, Status.UNPROCESSED) algorithm
+            (solved_eqn, status, _) := solveBody(eqn, var_cref, funcMap);
+          then solved_eqn;
+          else eqn;
+        end match;
+
+      then (solved_eqn, status);
+    end match;
+  end solveMultiRecordStrongComponent;
+
+  function solveEquation
+    input output Equation eqn;
+    input ComponentRef cref;
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    output Status status;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    output RelationInversion invertRelation     "If the equation represents a relation, this tells if the sign should be inverted";
+    input VarData varData;
+    input EqData eqData;
+  algorithm
+    (eqn, status, invertRelation) := match eqn
+      local
+        Equation body;
+        Slice<EquationPointer> body_slice;
+        Pointer<Variable> indexed_var;
+        Iterator dummy;
+
+      // For equations are expected to only have one body equation at this point
+      case Equation.FOR_EQUATION(body = {body as Equation.IF_EQUATION()}) algorithm
+        // create indexed variable to trick matching algorithm to solve for it
+        indexed_var := BVariable.makeVarPtr(BVariable.getVar(cref, sourceInfo()), cref);
+        dummy := Iterator.dummy(eqn.iter);
+        (body_slice, status, implicit_index) := solveMultiStrongComponent(Slice.SLICE(Pointer.create(body), {}), {Slice.SLICE(indexed_var, {})}, funcMap, kind, implicit_index, slicing_map, dummy, varData, eqData);
+        eqn.body := {Pointer.access(Slice.getT(body_slice))};
+      then (eqn, status, RelationInversion.FALSE);
+
+      case Equation.FOR_EQUATION(body = {body}) algorithm
+        (body, status, invertRelation) := solveBody(body, cref, funcMap);
+        eqn.body := {body};
+      then (eqn, status, invertRelation);
+
+      case Equation.FOR_EQUATION() algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName()
+            + " failed to solve a for-equation with multiple body eqns for a single cref. Please iterate over body elements individually.\n"
+            + "cref: " + ComponentRef.toString(cref) + " in equation:\n" + Equation.toString(eqn)});
+      then fail();
+
+      // dummy equation implies removed equation (occurs only in simulation systems)
+      case Equation.DUMMY_EQUATION() then (eqn, Status.EXPLICIT, RelationInversion.FALSE);
+
+      else solveBody(eqn, cref, funcMap);
+    end match;
+  end solveEquation;
+
+  function singleElement
+    "expands an array expression of size one and returns its only scalar element"
+    input Expression exp;
+    output Option<Expression> element = NONE();
+  protected
+    Expression expanded;
+    Boolean success;
+  algorithm
+    if not Type.isArray(Expression.typeOf(exp)) then
+      element := SOME(exp);
+      return;
+    end if;
+
+    (expanded, success) := ExpandExp.expand(exp, true);
+    if success then
+      element := match expanded
+        case Expression.ARRAY() guard(arrayLength(expanded.elements) == 1) then singleElement(expanded.elements[1]);
+        else NONE();
+      end match;
+    end if;
+  end singleElement;
+
+  function scalarElementEquation
+    "the scalar equation of the only element of an array equation that contains the cref, unchanged if there is none"
+    input Equation eqn;
+    input ComponentRef cref;
+    output Equation result = eqn;
+  protected
+    Expression lhs, rhs;
+    Boolean success_lhs, success_rhs;
+    Integer idx = 0;
+  algorithm
+    () := match eqn
+      case Equation.ARRAY_EQUATION() algorithm
+        (lhs, success_lhs) := ExpandExp.expand(eqn.lhs, true);
+        (rhs, success_rhs) := ExpandExp.expand(eqn.rhs, true);
+        if success_lhs and success_rhs then
+          () := match (lhs, rhs)
+            case (Expression.ARRAY(), Expression.ARRAY()) guard(arrayLength(lhs.elements) == arrayLength(rhs.elements)) algorithm
+              for i in 1:arrayLength(lhs.elements) loop
+                if Expression.containsCref(lhs.elements[i], cref) or Expression.containsCref(rhs.elements[i], cref) then
+                  // the cref has to be in exactly one element
+                  idx := if idx == 0 then i else -1;
+                end if;
+              end for;
+              if idx > 0 then
+                result := Equation.SCALAR_EQUATION(Type.arrayElementType(eqn.ty), lhs.elements[idx], rhs.elements[idx], eqn.source, eqn.attr);
+              end if;
+            then ();
+            else ();
+          end match;
+        end if;
+      then ();
+      else ();
+    end match;
+  end scalarElementEquation;
+
+  function arrayElementEquation
+    "the element equation x[k] = e[k] of an array equation x = e"
+    input Equation eqn;
+    input ComponentRef cref;
+    output Equation result = eqn;
+  protected
+    ComponentRef name = ComponentRef.stripSubscriptsAll(cref);
+    list<Subscript> subs = ComponentRef.subscriptsAllWithWholeFlat(cref);
+  algorithm
+    result := match eqn
+      local
+        ComponentRef side;
+      case Equation.ARRAY_EQUATION(lhs = Expression.CREF(cref = side)) guard(ComponentRef.isEqual(side, name))
+      then Equation.SCALAR_EQUATION(Type.arrayElementType(eqn.ty), Expression.fromCref(cref), Expression.applySubscripts(subs, eqn.rhs, true), eqn.source, eqn.attr);
+      case Equation.ARRAY_EQUATION(rhs = Expression.CREF(cref = side)) guard(ComponentRef.isEqual(side, name))
+      then Equation.SCALAR_EQUATION(Type.arrayElementType(eqn.ty), Expression.applySubscripts(subs, eqn.lhs, true), Expression.fromCref(cref), eqn.source, eqn.attr);
+      // expanding the equation for every element is quadratic, only do it for small arrays
+      case Equation.ARRAY_EQUATION() guard(Type.sizeOf(eqn.ty) <= 64) then scalarElementEquation(eqn, cref);
+      else eqn;
+    end match;
+  end arrayElementEquation;
+
+  function solveIfBranches
+    "solves every branch of an if-equation with a single equation per branch for the cref"
+    input output Equation eqn;
+    input ComponentRef cref;
+    input UnorderedMap<Path, Function> funcMap;
+    output Status status;
+  protected
+    IfEquationBody body;
+  algorithm
+    (eqn, status) := match eqn
+      case Equation.IF_EQUATION() algorithm
+        (body, status) := solveIfBranchesBody(eqn.body, cref, funcMap);
+        eqn.body := body;
+      then (eqn, status);
+      else (eqn, Status.UNSOLVABLE);
+    end match;
+  end solveIfBranches;
+
+  function solveIfBranchesBody
+    input output IfEquationBody body;
+    input ComponentRef cref;
+    input UnorderedMap<Path, Function> funcMap;
+    output Status status;
+  protected
+    Equation branch_eqn;
+    IfEquationBody else_if;
+    list<ComponentRef> crefs;
+  algorithm
+    if not List.hasOneElement(body.then_eqns) then
+      status := Status.UNSOLVABLE;
+      return;
+    end if;
+    branch_eqn := Pointer.access(listHead(body.then_eqns));
+    // solve for the element that occurs in the branch, e.g. p[2] for p
+    crefs := UnorderedSet.unique_list(Equation.collectCrefs(branch_eqn, function Slice.getSliceCandidates(name = ComponentRef.stripSubscriptsAll(cref))), ComponentRef.hash, ComponentRef.isEqual);
+    if not List.hasOneElement(crefs) then
+      status := Status.UNSOLVABLE;
+      return;
+    end if;
+    (branch_eqn, status, _) := solveBody(branch_eqn, listHead(crefs), funcMap);
+    if status <> Status.EXPLICIT then
+      return;
+    end if;
+    body.then_eqns := {Pointer.create(branch_eqn)};
+    if isSome(body.else_if) then
+      (else_if, status) := solveIfBranchesBody(Util.getOption(body.else_if), cref, funcMap);
+      body.else_if := SOME(else_if);
+    end if;
+  end solveIfBranchesBody;
+
+  function solveBody
+    input output Equation eqn;
+    input ComponentRef cref;
+    input UnorderedMap<Path, Function> funcMap = UnorderedMap.new<Function>(AbsynUtil.pathHash, AbsynUtil.pathEqual);
+    output Status status;
+    output RelationInversion invertRelation "If the equation represents a relation, this tells if the sign should be inverted";
+  protected
+    Type ty;
+    ComponentRef fixed_cref;
+    Expression residual, derivative;
+    Differentiate.DifferentiationArguments diffArgs;
+  algorithm
+    // a row of a for-equation with an if-equation body, solve every branch
+    if Equation.isIfEquation(Pointer.create(eqn)) then
+      (eqn, status) := solveIfBranches(eqn, cref, funcMap);
+      invertRelation := RelationInversion.FALSE;
+      return;
+    end if;
+
+    // fix crefs where the array is of size one
+    fixed_cref := ComponentRef.stripSubscriptsAll(cref);
+    ty := ComponentRef.getSubscriptedType(fixed_cref, true);
+    if Type.isArray(ty) and Type.sizeOf(ty) == 1 then
+      fixed_cref := getVarSlice(fixed_cref, SOME(cref), eqn);
+    else
+      fixed_cref := cref;
+      // a scalar solved from a single element array equation, e.g. mXi = m * Xi for Real[1] mXi, Xi:
+      // use the scalar equation, otherwise the solution is array valued
+      eqn := match eqn
+        local
+          Option<Expression> lhs, rhs;
+        case Equation.ARRAY_EQUATION(recordSize = NONE()) guard(not Type.isArray(ty) and Type.sizeOf(eqn.ty) == 1) algorithm
+          lhs := singleElement(eqn.lhs);
+          rhs := singleElement(eqn.rhs);
+        then if isSome(lhs) and isSome(rhs) then Equation.SCALAR_EQUATION(Type.arrayElementType(eqn.ty), Util.getOption(lhs), Util.getOption(rhs), eqn.source, eqn.attr) else eqn;
+        // a scalar solved from a bigger array equation, e.g. {v, i} = if c then {a, b} else {d, e}
+        case Equation.ARRAY_EQUATION(recordSize = NONE()) guard(not Type.isArray(ty) and Type.sizeOf(eqn.ty) > 1)
+        then scalarElementEquation(eqn, cref);
+        // an array element solved from an equation for the whole array, e.g. S[2] from S = v .* i
+        case Equation.ARRAY_EQUATION(recordSize = NONE()) guard(not Type.isArray(ComponentRef.getSubscriptedType(cref, true)))
+        then arrayElementEquation(eqn, cref);
+        else eqn;
+      end match;
+    end if;
+
+    if Flags.isSet(Flags.DUMP_SOLVE) then
+      solvePrintInput(eqn, fixed_cref);
+    end if;
+
+    (eqn, status, invertRelation) := solveSimple(eqn, fixed_cref);
+    // if the equation does not have a simple structure try to solve with other strategies
+    if status == Status.UNPROCESSED then
+      residual := Equation.getResidualExp(eqn);
+      // call general solving routine, can solve an equation, if a cref is contained once in the equation
+      (eqn, status) := solveUnique(eqn, residual, fixed_cref);
+      if status == Status.EXPLICIT then
+        invertRelation := RelationInversion.UNKNOWN; // TODO: make me depend on the derivative
+      else
+        diffArgs := Differentiate.DifferentiationArguments.simpleCref(fixed_cref, funcMap);
+        try
+          (derivative, diffArgs) := Differentiate.differentiateExpressionDump(residual, diffArgs, getInstanceName());
+          derivative := SimplifyExp.simplifyDump(derivative, true, getInstanceName());
+        else
+          // not everything can be differentiated, e.g. functions with function inputs
+          derivative := Expression.fromCref(fixed_cref);
+        end try;
+
+        if Expression.isZero(derivative) then
+          invertRelation := RelationInversion.FALSE;
+          // an array that only occurs element wise, e.g. f({x[1], x[2]}), has to be solved implicitly
+          status := if Type.isArray(ComponentRef.getSubscriptedType(fixed_cref, true)) and not Expression.containsCref(residual, fixed_cref)
+            and not listEmpty(Equation.collectCrefs(eqn, function Slice.getSliceCandidates(name = ComponentRef.stripSubscriptsAll(fixed_cref))))
+            then Status.IMPLICIT else Status.UNSOLVABLE;
+        elseif not Expression.containsCref(derivative, fixed_cref) then
+          // If eqn is linear in cref:
+          eqn := solveLinear(eqn, residual, derivative, diffArgs, fixed_cref);
+          // If the derivative is negative, invert possible inequality sign
+          invertRelation := if Expression.isPositive(derivative) then RelationInversion.FALSE else if Expression.isNegative(derivative) then RelationInversion.TRUE else RelationInversion.UNKNOWN;
+          status := Status.EXPLICIT;
+        else
+          invertRelation := RelationInversion.FALSE;
+          if Flags.isSet(Flags.FAILTRACE) and status <> Status.EXPLICIT then
+            Error.addCompilerWarning(getInstanceName() + " cref: " + ComponentRef.toString(fixed_cref)
+              + " has to be solved implicitely in equation:\n" + Equation.toString(eqn));
+          end if;
+        end if;
+      end if;
+    end if;
+    eqn := Equation.simplify(eqn, getInstanceName());
+    if Flags.isSet(Flags.DUMP_SOLVE) then
+      solvePrintOutput(eqn, status);
+    end if;
+  end solveBody;
+
+  function solveIfBody
+    input output IfEquationBody body;
+    input VariablePointers vars;
+    input UnorderedMap<Path, Function> funcMap;
+    output Status status;
+    input BPartition.Kind kind;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input Iterator iter;
+    input VarData varData;
+    input EqData eqData;
+  protected
+    IfEquationBody else_if;
+    list<StrongComponent> comps, solved_comps;
+    list<Pointer<Equation>> new_then_eqns = {};
+    Boolean explicit = true;
+  algorithm
+    // causalize this branch equations for the unknowns
+    (_, comps) := Causalize.simple(vars, EquationPointers.fromList(body.then_eqns), kind, iter = iter);
+    // solve each strong component explicitly and save equations to branch
+    for comp in comps loop
+      (solved_comps, implicit_index) := solveStrongComponent(comp, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+      for solved_comp in solved_comps loop
+        if StrongComponent.getSolveStatus(solved_comp) == Status.EXPLICIT then
+          new_then_eqns := StrongComponent.toSolvedEquation(solved_comp) :: new_then_eqns;
+        else
+          explicit := false;
+        end if;
+      end for;
+    end for;
+
+    // a branch that can only be solved implicitly makes the whole if equation implicit
+    if not explicit then
+      status := Status.IMPLICIT;
+      return;
+    end if;
+
+    body.then_eqns := listReverse(new_then_eqns);
+    // if there is an else branch -> go deeper
+    if isSome(body.else_if) then
+      (else_if, status, implicit_index) := solveIfBody(Util.getOption(body.else_if), vars, funcMap, kind, implicit_index, slicing_map, iter, varData, eqData);
+      body.else_if := SOME(else_if);
+    else
+      // StrongComponent.toSolvedEquation fails for everything that is not explicitly solvable so at this point one can assume it is
+      status := Status.EXPLICIT;
+    end if;
+  end solveIfBody;
+
+  function solveSimple
+    input output Equation eqn;
+    input ComponentRef cref;
+    output Status status;
+    output RelationInversion invertRelation;
+  algorithm
+    (eqn, status, invertRelation) := match eqn
+      local
+        Equation body;
+        IfEquationBody if_body;
+
+      // check lhs and rhs for simple structure
+      case Equation.SCALAR_EQUATION() then solveSimpleLhsRhs(eqn.lhs, eqn.rhs, cref, eqn);
+      case Equation.ARRAY_EQUATION()  then solveSimpleLhsRhs(eqn.lhs, eqn.rhs, cref, eqn);
+      case Equation.RECORD_EQUATION() then solveSimpleLhsRhs(eqn.lhs, eqn.rhs, cref, eqn);
+
+      // ToDo: need to check if implicit
+      case Equation.WHEN_EQUATION() then solveSimpleWhen(eqn.body, cref, eqn);
+
+      case Equation.FOR_EQUATION(body = {body}) algorithm
+        (body, status, invertRelation) := solveSimple(body, cref);
+        if status == Status.EXPLICIT then
+          eqn.body := {body};
+        else
+          status := Status.UNPROCESSED;
+        end if;
+      then (eqn, status, invertRelation);
+
+      case Equation.IF_EQUATION() algorithm
+        (if_body, status, invertRelation) := solveSimpleIf(eqn.body, cref);
+        if status == Status.EXPLICIT then
+          eqn.body := if_body;
+        else
+          status := Status.UNPROCESSED;
+        end if;
+      then (eqn, status, invertRelation);
+
+      // ToDo: more cases
+      // ToDo: tuples, record elements, array constructors
+
+      else (eqn, Status.UNPROCESSED, RelationInversion.FALSE);
+    end match;
+  end solveSimple;
+
+protected
+  function solveSimpleLhsRhs
+    input Expression lhs;
+    input Expression rhs;
+    input ComponentRef cref;
+    input output Equation eqn;
+    output Status status;
+    output RelationInversion invertRelation;
+  algorithm
+    (eqn, status, invertRelation) := match (lhs, rhs)
+      local
+        ComponentRef checkCref;
+        Expression exp;
+        list<Expression> elements;
+
+      // always checks if exp is independent of cref!
+
+      // 1. already solved
+      // cref = exp
+      case (Expression.CREF(cref = checkCref), exp)
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (eqn, Status.EXPLICIT, RelationInversion.FALSE);
+
+      // 2. only swap lsh and rhs
+      // exp = cref
+      case (exp, Expression.CREF(cref = checkCref))
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (Equation.swapLHSandRHS(eqn), Status.EXPLICIT, RelationInversion.TRUE);
+
+      // 3.1 negate (MINUS) lhs and rhs
+      // -cref = exp
+      case (Expression.UNARY(exp = Expression.CREF(cref = checkCref)), exp)
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (Equation.updateLHSandRHS(eqn, Expression.negate(lhs), Expression.negate(rhs)), Status.EXPLICIT, RelationInversion.TRUE);
+
+      // 3.2 negate (NOT) lhs and rhs
+      // not cref = exp
+      case (Expression.LUNARY(exp = Expression.CREF(cref = checkCref)), exp)
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (Equation.updateLHSandRHS(eqn, Expression.logicNegate(lhs), Expression.logicNegate(rhs)), Status.EXPLICIT, RelationInversion.FALSE);
+
+      // 4.1 negate (MINUS) and swap lhs and rhs
+      // exp = -cref
+      case (exp, Expression.UNARY(exp = Expression.CREF(cref = checkCref)))
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (Equation.updateLHSandRHS(eqn, Expression.negate(rhs), Expression.negate(lhs)), Status.EXPLICIT, RelationInversion.FALSE);
+
+      // 4.2 negate (NOT) and swap lhs and rhs
+      // exp = not cref
+      case (exp, Expression.LUNARY(exp = Expression.CREF(cref = checkCref)))
+        guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(exp, cref))
+      then (Equation.updateLHSandRHS(eqn, Expression.logicNegate(rhs), Expression.logicNegate(lhs)), Status.EXPLICIT, RelationInversion.FALSE);
+
+      // simple solve tuples
+      case (exp as Expression.TUPLE(), _) guard(tupleSolvable(exp.elements, {BVariable.getVarPointer(cref, sourceInfo())})) then (eqn, Status.EXPLICIT, RelationInversion.FALSE);
+      case (_, exp as Expression.TUPLE()) guard(tupleSolvable(exp.elements, {BVariable.getVarPointer(cref, sourceInfo())})) then (Equation.swapLHSandRHS(eqn), Status.EXPLICIT, RelationInversion.FALSE);
+
+      else (eqn, Status.UNPROCESSED, RelationInversion.FALSE);
+    end match;
+  end solveSimpleLhsRhs;
+
+  function solveSimpleWhen
+    input WhenEquationBody body;
+    input ComponentRef cref;
+    input Equation eqn;
+    output Equation eqnOut = eqn "don't change the equation";
+    output Status status = Status.UNSOLVABLE;
+    output RelationInversion invertRelation = RelationInversion.FALSE;
+  algorithm
+    for stmt in body.when_stmts loop
+      status := match stmt
+        local
+          ComponentRef checkCref;
+        case WhenStatement.ASSIGN(lhs = Expression.CREF(cref = checkCref))
+          guard(ComponentRef.isEqual(cref, checkCref) and not Expression.containsCref(stmt.rhs, cref))
+        then Status.EXPLICIT;
+        else Status.UNSOLVABLE;
+      end match;
+
+      if status == Status.EXPLICIT then
+        break;
+      end if;
+    end for;
+  end solveSimpleWhen;
+
+  function solveSimpleIf
+    input output IfEquationBody body;
+    input ComponentRef cref;
+    output Status status = Status.EXPLICIT;
+    output RelationInversion invertRelation = RelationInversion.FALSE;
+  protected
+    IfEquationBody else_if;
+    Equation eqn;
+  algorithm
+    if isSome(body.else_if) then
+      (else_if, status, _) := solveSimpleIf(Util.getOption(body.else_if), cref);
+      if status == Status.EXPLICIT then
+        body.else_if := SOME(else_if);
+      end if;
+    end if;
+
+    if status == Status.EXPLICIT and List.hasOneElement(body.then_eqns) then
+      eqn := Pointer.access(listHead(body.then_eqns));
+      (eqn, status, _) := solveSimple(eqn, cref);
+      if status == Status.EXPLICIT then
+        Pointer.update(listHead(body.then_eqns), eqn);
+      end if;
+    else
+      status := Status.UNPROCESSED;
+    end if;
+  end solveSimpleIf;
+
+  function solveLinear
+    "author: kabdelhak, phannebohm
+    solves a linear equation with one newton step
+    0 = f(x)  ---> x = -f(0)/f`(0)"
+    input output Equation eqn;
+    input Expression residual;
+    input Expression derivative;
+    input Differentiate.DifferentiationArguments diffArgs;
+    input ComponentRef cref;
+  protected
+    Expression crefExp, numerator;
+    Operator mulOp, uminOp;
+    Type ty;
+  algorithm
+    crefExp := Expression.fromCref(cref);
+    ty := ComponentRef.getSubscriptedType(cref, true);
+    numerator := replaceUndelayed(residual, crefExp, Expression.makeZero(ty));
+    mulOp := Operator.makeMul(ty);
+    uminOp := Operator.makeUMinus(ty);
+    // Set eqn: cref = - f/f'
+    eqn := Equation.setLHS(eqn, crefExp);
+    eqn := Equation.setRHS(eqn, Expression.UNARY(uminOp, Expression.MULTARY({numerator},{derivative}, mulOp)));
+  end solveLinear;
+
+  function replaceUndelayed
+    "replaces old by new, but not in the delayed expressions. delay(expr, ...) does not
+    depend on the current value of expr."
+    input output Expression exp;
+    input Expression old;
+    input Expression new;
+  algorithm
+    exp := match exp
+      local
+        Call call;
+        Expression delayed;
+        list<Expression> args;
+      case _ guard(Expression.isEqual(exp, old)) then new;
+      case Expression.CALL(call = call as Call.TYPED_CALL(arguments = delayed :: args))
+        guard(AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)) == "delay") algorithm
+        exp.call := Call.setArguments(call, delayed :: list(replaceUndelayed(arg, old, new) for arg in args));
+      then exp;
+      else Expression.mapShallow(exp, function replaceUndelayed(old = old, new = new));
+    end match;
+  end replaceUndelayed;
+
+  function solveUnique
+    "author: linuslangenkamp
+    solves a generic equation in terms of a cref that is contained only once
+    returns Status.IMPLICIT if the equation can't be solved or the cref is contained multiple times"
+    input output Equation eqn;
+    input Expression residual;
+    input ComponentRef cref;
+    output Status status;
+  protected
+    Expression crefExp = Expression.fromCref(cref), solvedRHS;
+    Boolean crefFound;
+    list<Expression> inverseInstructions = {};
+    Type ty = ComponentRef.getSubscriptedType(cref, true);
+  algorithm
+    // find a list of inverse operations or detect that a cref is contained more than once
+    (crefFound, inverseInstructions, status) := solveUniqueFindInstructions(residual, cref, false, inverseInstructions);
+
+    if Flags.isSet(Flags.DUMP_SOLVE) then
+      solveUniquePrintInstructions(inverseInstructions, status);
+    end if;
+
+    // apply the inverse operations or return if implicit
+    eqn := match status
+      case Status.IMPLICIT
+        then eqn;
+      else algorithm
+        if not crefFound then
+          // cref was not found in the residual expression; cannot solve explicitly
+          status := Status.IMPLICIT;
+        else
+          status := Status.EXPLICIT;
+          solvedRHS := Expression.makeZero(ty);
+          for instruction in inverseInstructions loop
+            solvedRHS := applyInstruction(solvedRHS, instruction);
+          end for;
+          eqn := Equation.setLHS(eqn, crefExp);
+          eqn := Equation.setRHS(eqn, solvedRHS);
+        end if;
+        then eqn;
+    end match;
+  end solveUnique;
+
+  function solveUniqueFindInstructions
+    "performs the recursion steps"
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status = Status.EXPLICIT; // just set this per default, since the algorithm detects implicit equations
+  protected
+    Expression substExp = NBVariable.toExpression(Pointer.create(NBVariable.SUBST_VARIABLE));
+    Type ty = ComponentRef.getSubscriptedType(cref, true);
+    Call call;
+  algorithm
+    // TODO: update crefFounds, hard to read!
+    // TODO: potential types
+    // TODO: add missing cases
+    if crefFound then
+      // cref was already found elsewhere
+      if Expression.containsCref(exp, cref) then
+        // cref appears more than once, abort
+        status := Status.IMPLICIT;
+      else
+        // set crefFound = false, since the cref is not found in this branch
+        crefFound := false;
+      end if;
+      return;
+    end if;
+
+    () := match exp
+      case Expression.REAL() then ();
+      case Expression.INTEGER() then ();
+      case Expression.CREF() algorithm
+        if ComponentRef.isEqual(cref, exp.cref) then
+          crefFound := true;
+        end if;
+        then ();
+      case Expression.CAST() algorithm
+        (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsCast(substExp, exp, cref, crefFound, inverseInstructions);
+        then ();
+      case Expression.MULTARY() algorithm
+        (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsMultary(substExp, exp, cref, crefFound, inverseInstructions);
+        then ();
+      case Expression.BINARY() algorithm
+        () := match exp.operator
+          case Operator.OPERATOR(op = NFOperator.Op.POW) algorithm
+            (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsBinaryPow(ty, substExp, exp, cref, crefFound, inverseInstructions);
+            then ();
+          case Operator.OPERATOR(op = NFOperator.Op.ADD) algorithm
+            (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsBinaryComOp(substExp, exp, cref, crefFound, inverseInstructions);
+            then ();
+          case Operator.OPERATOR(op = NFOperator.Op.MUL) algorithm
+            (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsBinaryComOp(substExp, exp, cref, crefFound, inverseInstructions);
+            then ();
+        else algorithm // fallback -> set implicit
+          if Flags.isSet(Flags.DUMP_SOLVE) then
+            solveUniquePrintImplicitFallback(exp);
+          end if;
+          status := Status.IMPLICIT;
+          then ();
+        end match;
+        then ();
+      case Expression.UNARY() algorithm
+        () := match exp.operator
+          case Operator.OPERATOR(op = NFOperator.Op.UMINUS) algorithm
+            (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsUnaryUminus(ty, substExp, exp, cref, crefFound, inverseInstructions);
+            then ();
+          else algorithm // fallback -> set implicit
+            if Flags.isSet(Flags.DUMP_SOLVE) then
+              solveUniquePrintImplicitFallback(exp);
+            end if;
+            status := Status.IMPLICIT;
+            then ();
+        end match;
+        then ();
+
+      // cases where the cref does not appear
+      case Expression.CALL(call = call as Call.TYPED_CALL())              guard(List.none(Call.arguments(exp.call), function solveUniqueExpressionNoCref(cref = cref))) then ();
+      case Expression.CALL(call = call as Call.TYPED_ARRAY_CONSTRUCTOR()) guard(List.none(Call.arguments(exp.call), function solveUniqueExpressionNoCref(cref = cref))) then ();
+      case Expression.CALL(call = call as Call.TYPED_REDUCTION())         guard(List.none(Call.arguments(exp.call), function solveUniqueExpressionNoCref(cref = cref))) then ();
+
+      // a function with an inverse annotation
+      case Expression.CALL(call = call as Call.TYPED_CALL()) guard(arrayLength(call.fn.inverses) > 0) algorithm
+        (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsCallInverse(substExp, exp, cref, crefFound, inverseInstructions);
+        then ();
+
+      // check if invertable if occurs
+      case Expression.CALL(call = call as Call.TYPED_CALL()) guard(List.hasOneElement(Call.arguments(exp.call))) algorithm
+        (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsCallOneArg(ty, substExp, exp, cref, crefFound, inverseInstructions);
+        then ();
+      case Expression.CALL(call = call as Call.TYPED_CALL()) guard(listLength(Call.arguments(exp.call)) == 2) algorithm
+        (crefFound, inverseInstructions, status) := solveUniqueFindInstructionsCallTwoArgs(ty, substExp, exp, cref, crefFound, inverseInstructions);
+        then ();
+
+      // fallback -> set implicit
+      else algorithm
+        if Flags.isSet(Flags.DUMP_SOLVE) then
+          solveUniquePrintImplicitFallback(exp);
+        end if;
+        status := Status.IMPLICIT;
+        then ();
+    end match;
+  end solveUniqueFindInstructions;
+
+  function solveUniqueFindInstructionsMultary
+    "find instructions for a multary"
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status = Status.EXPLICIT; // just set this per default, since the algorithm detects implicit equations
+  protected
+    list<Expression> argList = {}, invargList = {};
+    Boolean crefFoundInRecursion;
+  algorithm
+    () := match exp
+      case Expression.MULTARY() algorithm
+        for arg in exp.arguments loop
+          (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(arg, cref, crefFound, inverseInstructions);
+          if status == Status.IMPLICIT then
+            return;
+          end if;
+          if not crefFoundInRecursion then
+            argList := arg :: argList;
+          else
+            crefFound := true;
+          end if;
+        end for;
+        if crefFound then
+          if List.any(exp.inv_arguments, function Expression.containsCref(cref=cref)) then
+            status := Status.IMPLICIT;
+            return;
+          else
+            // inverse multary for cref in args
+            inverseInstructions := Expression.MULTARY(substExp :: exp.inv_arguments, argList, exp.operator) :: inverseInstructions;
+          end if;
+        else
+          for invarg in exp.inv_arguments loop
+            (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(invarg, cref, crefFound, inverseInstructions);
+            if status == Status.IMPLICIT then
+              return;
+            end if;
+            if not crefFoundInRecursion then
+              invargList := invarg :: invargList;
+            else
+              crefFound := true;
+            end if;
+          end for;
+          if crefFound then
+            // inverse multary for cref in invargs
+            inverseInstructions := Expression.MULTARY(argList, substExp :: invargList, exp.operator) :: inverseInstructions;
+          end if;
+        end if;
+      then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.MULTARY."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsMultary;
+
+  function solveUniqueFindInstructionsBinaryPow
+    "find instructions for a binary with power operator"
+    input Type ty;
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+    Expression local_exp1, local_exp2;
+  algorithm
+    () := match exp
+      case Expression.BINARY() algorithm
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(exp.exp1, cref, crefFound, inverseInstructions);
+        if status == Status.IMPLICIT then
+          return;
+        end if;
+        if crefFoundInRecursion then
+          // case for f(cref) ^ exp2 -> $SUBST_CREF^(1 / exp2)
+          crefFound := true;
+          if Expression.containsCref(exp.exp2, cref) then
+            status := Status.IMPLICIT;
+          else
+            inverseInstructions := Expression.BINARY(substExp, exp.operator, Expression.MULTARY({}, {exp.exp2}, Operator.makeMul(ty))) :: inverseInstructions;
+          end if;
+        else
+          (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(exp.exp2, cref, crefFound, inverseInstructions);
+          if status == Status.IMPLICIT then
+            return;
+          end if;
+          if crefFoundInRecursion then
+            // case for exp1 ^ f(cref) -> log($SUBST_CREF)/log(exp1)
+            crefFound := true;
+            local_exp1 := Expression.CALL(Call.makeTypedCall(
+            fn          = NFBuiltinFuncs.LOG_REAL,
+            args        = {substExp},
+            variability = Expression.variability(substExp),
+            purity      = NFPrefixes.Purity.PURE
+            ));
+            local_exp2 := Expression.CALL(Call.makeTypedCall(
+            fn          = NFBuiltinFuncs.LOG_REAL,
+            args        = {exp.exp1},
+            variability = Expression.variability(exp.exp1),
+            purity      = NFPrefixes.Purity.PURE
+            ));
+            // split the instructions, s.t. only top level search for substExp/dummyCref has to be performed in applyInstruction
+            inverseInstructions := local_exp1 :: Expression.MULTARY({substExp}, {local_exp2}, Operator.makeMul(ty)) :: inverseInstructions;
+          end if;
+        end if;
+        then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.BINARY with operator POW."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsBinaryPow;
+
+  function solveUniqueFindInstructionsBinaryComOp
+    "find instructions for a binary with commutative operator
+    simply calls multary with the corresponding op"
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+  algorithm
+    () := match exp
+      case Expression.BINARY() algorithm
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructionsMultary(substExp,
+                               Expression.MULTARY({exp.exp1, exp.exp2}, {}, exp.operator), cref, crefFound, inverseInstructions);
+        if status == Status.IMPLICIT then
+          return;
+        end if;
+        if crefFoundInRecursion then
+          crefFound := true;
+        end if;
+        then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.BINARY with commutative operator."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsBinaryComOp;
+
+  function solveUniqueFindInstructionsCast
+    "find instructions for a cast"
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+  algorithm
+    () := match exp
+      case Expression.CAST() algorithm
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(exp.exp, cref, crefFound, inverseInstructions);
+        if status == Status.IMPLICIT then
+          return;
+        end if;
+        if crefFoundInRecursion then
+          crefFound := true;
+        end if;
+        then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.CAST."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsCast;
+
+  function solveUniqueFindInstructionsUnaryUminus
+    "find instructions for an unary with uminus operator"
+    input Type ty;
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+  algorithm
+    () := match exp
+      case Expression.UNARY() algorithm
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(exp.exp, cref, crefFound, inverseInstructions);
+            if status == Status.IMPLICIT then
+              return;
+            end if;
+            if crefFoundInRecursion then
+              // case for -(f(cref)) -> -($SUBST_CREF)
+              crefFound := true;
+              inverseInstructions := Expression.UNARY(Operator.makeUMinus(ty), substExp) :: inverseInstructions;
+            end if;
+            then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.BINARY with commutative operator."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsUnaryUminus;
+
+  function solveUniqueFindInstructionsCallOneArg
+    "find instructions for a call with one argument"
+    input Type ty;
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+    Expression argExp;
+    Call call;
+    String name;
+  algorithm
+    () := match exp
+      case Expression.CALL(call = call as Call.TYPED_CALL()) guard List.hasOneElement(Call.arguments(exp.call)) algorithm
+        argExp := listHead(Call.arguments(call));
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(argExp, cref, crefFound, inverseInstructions);
+        if status == Status.IMPLICIT then
+          return;
+        end if;
+        if crefFoundInRecursion then
+          // case for call(f(cref)) -> call^{-1}($SUBST_CREF)
+          crefFound := true;
+          name := AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn));
+          inverseInstructions := match name
+            case "sqrt" then // sqrt(f(cref)) -> $SUBST_CREF^2
+              Expression.BINARY(substExp, Operator.makePow(ty, true), Expression.REAL(2)) :: inverseInstructions;
+            case "cos" then // cos(f(cref)) -> acos($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ACOS_REAL, substExp, inverseInstructions);
+            case "sin" then // sin(f(cref)) -> asin($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ASIN_REAL, substExp, inverseInstructions);
+            case "tan" then // tan(f(cref)) -> atan($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ATAN_REAL, substExp, inverseInstructions);
+            case "acos" then // acos(f(cref)) -> cos($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.COS_REAL, substExp, inverseInstructions);
+            case "asin" then // asin(f(cref)) -> sin($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.SIN_REAL, substExp, inverseInstructions);
+            case "atan" then // atan(f(cref)) -> tan($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.TAN_REAL, substExp, inverseInstructions);
+            case "cosh" then // cosh(f(cref)) -> acosh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ACOSH_REAL, substExp, inverseInstructions);
+            case "sinh" then // sinh(f(cref)) -> asinh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ASINH_REAL, substExp, inverseInstructions);
+            case "tanh" then // tanh(f(cref)) -> atanh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.ATANH_REAL, substExp, inverseInstructions);
+            case "acosh" then // acosh(f(cref)) -> cosh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.COSH_REAL, substExp, inverseInstructions);
+            case "asinh" then // asinh(f(cref)) -> sinh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.SINH_REAL, substExp, inverseInstructions);
+            case "atanh" then // atanh(f(cref)) -> tanh($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.TANH_REAL, substExp, inverseInstructions);
+            case "exp" then // exp(f(cref)) -> log($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.LOG_REAL, substExp, inverseInstructions);
+            case "log" then // log(f(cref)) -> exp($SUBST_CREF)
+              solveUniqueCreateSubstCall(NFBuiltinFuncs.EXP_REAL, substExp, inverseInstructions);
+            case "log10" then // log_10(f(cref)) -> 10^($SUBST_CREF)
+              Expression.BINARY(Expression.REAL(10), Operator.makePow(ty, false), substExp) :: inverseInstructions;
+            else algorithm // fallback -> set implicit
+              if Flags.isSet(Flags.DUMP_SOLVE) then
+                solveUniquePrintImplicitFallback(exp);
+              end if;
+              status := Status.IMPLICIT;
+              then inverseInstructions;
+          end match;
+        end if;
+        then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.CALL with one argument."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsCallOneArg;
+
+  function solveUniqueFindInstructionsCallTwoArgs
+    "find instructions for a call with two arguments"
+    input Type ty;
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status;
+  protected
+    Boolean crefFoundInRecursion;
+    Expression argExp1, argExp2;
+    Call call;
+    String name;
+  algorithm
+    () := match exp
+      case Expression.CALL(call = call as Call.TYPED_CALL()) guard(listLength(Call.arguments(exp.call)) == 2) algorithm
+        name := AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn));
+        {argExp1, argExp2} := Call.arguments(call);
+        (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(argExp1, cref, crefFound, inverseInstructions);
+        if status == Status.IMPLICIT then
+          return;
+        end if;
+        if crefFoundInRecursion then
+          crefFound := true;
+          if Expression.containsCref(argExp2, cref) then
+            status := Status.IMPLICIT;
+          else
+            // calc inverse w.r.t first argument and append to instructions
+            inverseInstructions := match name
+              case "atan2" algorithm // atan2(x,y) -> x=y*tan($SUBST_CREF)
+                inverseInstructions := Expression.MULTARY({substExp, argExp2}, {}, Operator.makeMul(ty)) :: inverseInstructions;
+                then solveUniqueCreateSubstCall(NFBuiltinFuncs.TAN_REAL, substExp, inverseInstructions);
+              else algorithm // fallback -> set implicit
+                if Flags.isSet(Flags.DUMP_SOLVE) then
+                  solveUniquePrintImplicitFallback(exp);
+                end if;
+                status := Status.IMPLICIT;
+                then inverseInstructions;
+            end match;
+          end if;
+        else
+          (crefFoundInRecursion, inverseInstructions, status) := solveUniqueFindInstructions(argExp2, cref, crefFound, inverseInstructions);
+          if status == Status.IMPLICIT then
+            return;
+          end if;
+          if crefFoundInRecursion then
+            crefFound := true;
+            // calc inverse w.r.t second argument and append to instructions
+            inverseInstructions := match name
+              case "atan2" algorithm // atan2(x,y) -> y=x/tan($SUBST_CREF)
+                inverseInstructions := Expression.MULTARY({argExp1}, {substExp}, Operator.makeMul(ty)) :: inverseInstructions;
+                then solveUniqueCreateSubstCall(NFBuiltinFuncs.TAN_REAL, substExp, inverseInstructions);
+              else algorithm // fallback -> set implicit
+                if Flags.isSet(Flags.DUMP_SOLVE) then
+                  solveUniquePrintImplicitFallback(exp);
+                end if;
+                status := Status.IMPLICIT;
+                then inverseInstructions;
+            end match;
+          end if;
+        end if;
+        then ();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only be called for Expression.CALL with two arguments."});
+        then fail();
+    end match;
+  end solveUniqueFindInstructionsCallTwoArgs;
+
+  function solveUniqueFindInstructionsCallInverse
+    "find instructions for a call to a function with an inverse annotation:
+     f(args) -> args[i] = inverse call with the inputs of f replaced by the arguments and its output by $SUBST_CREF"
+    input Expression substExp;
+    input Expression exp;
+    input ComponentRef cref;
+    input output Boolean crefFound;
+    input output list<Expression> inverseInstructions;
+    output Status status = Status.EXPLICIT;
+  protected
+    Function fn;
+    list<Expression> args;
+    Integer i = 0, found = 0;
+    Expression arg, inv;
+    Option<Expression> oinv = NONE();
+    String name;
+    InstNode output_node;
+    UnorderedMap<ComponentRef, Expression> replacements;
+  algorithm
+    Expression.CALL(call = Call.TYPED_CALL(fn = fn, arguments = args)) := exp;
+
+    // the cref has to occur in exactly one argument
+    arg := listHead(args); // HACK makes the Rust compiler happy
+    for a in args loop
+      i := i + 1;
+      if Expression.containsCref(a, cref) then
+        if found <> 0 then
+          if Flags.isSet(Flags.DUMP_SOLVE) then
+            solveUniquePrintImplicitFallback(exp);
+          end if;
+          status := Status.IMPLICIT;
+          return;
+        end if;
+        found := i;
+        arg := a;
+      end if;
+    end for;
+    if found == 0 then
+      return;
+    end if;
+
+    if listLength(fn.inputs) <> listLength(args) or listLength(fn.outputs) <> 1 then
+      // FIXME not sure if these can occur or what should happen in these cases
+      // probably some error or Status.IMPLICIT
+      return;
+    end if;
+
+    // search the inverse for the input that contains the cref
+    name := InstNode.name(listGet(fn.inputs, found));
+    for fnInv in fn.inverses loop
+      if ComponentRef.firstName(fnInv.inputParam) == name then
+        oinv := SOME(fnInv.inverseCall);
+        break;
+      end if;
+    end for;
+    if isNone(oinv) then
+      // there is no inverse
+      // TODO try to invert the function symbolically
+      if Flags.isSet(Flags.DUMP_SOLVE) then
+        solveUniquePrintImplicitFallback(exp);
+      end if;
+      status := Status.IMPLICIT;
+      return;
+    end if;
+
+    (true, inverseInstructions, status) := solveUniqueFindInstructions(arg, cref, crefFound, inverseInstructions);
+    if status == Status.IMPLICIT then
+      return;
+    end if;
+    crefFound := true;
+
+    replacements := UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+    // replace the output by $SUBST_CREF
+    output_node := InstNode.fromHandle(listHead(fn.outputs));
+    UnorderedMap.add(ComponentRef.fromNode(output_node, InstNode.getType(output_node)), substExp, replacements);
+    // replace the inputs by the corresponding arguments
+    for node in fn.inputs loop
+      arg :: args := args;
+      UnorderedMap.add(ComponentRef.fromNode(node, InstNode.getType(node)), arg, replacements);
+    end for;
+    inv := Expression.map(Util.getOption(oinv), function Replacements.applySimpleExp(replacements = replacements));
+    inverseInstructions := inv :: inverseInstructions;
+  end solveUniqueFindInstructionsCallInverse;
+
+  function solveUniqueCreateSubstCall
+    "helper to create call with substitute cref and to the instructions"
+    input Function fn;
+    input Expression exp;
+    input output list<Expression> inverseInstructions;
+  algorithm
+    inverseInstructions := Expression.CALL(Call.makeTypedCall(
+                                           fn          = fn,
+                                           args        = {exp},
+                                           variability = Expression.variability(exp),
+                                           purity      = NFPrefixes.Purity.PURE
+                                           )) :: inverseInstructions;
+  end solveUniqueCreateSubstCall;
+
+  function solveUniqueExpressionNoCref
+    "checks if the expression does not contain the cref"
+    input Expression exp;
+    input ComponentRef cref;
+    output Boolean b;
+  protected
+    Pointer<Boolean> res = Pointer.create(false);
+    function solveUniqueExpressionNoCrefTraverse
+      "traversal helper"
+      input output Expression exp;
+      input ComponentRef cref;
+      input Pointer<Boolean> res;
+    algorithm
+      // check if cref was already found for early abort
+      if not Pointer.access(res) then
+        exp := match exp
+          case Expression.CREF() algorithm
+            Pointer.update(res, ComponentRef.isEqual(exp.cref, cref));
+          then exp;
+          else Expression.mapShallow(exp, function solveUniqueExpressionNoCrefTraverse(cref = cref, res = res));
+        end match;
+      end if;
+    end solveUniqueExpressionNoCrefTraverse;
+  algorithm
+    Expression.fakeMap(exp, function solveUniqueExpressionNoCrefTraverse(cref = cref, res = res));
+    b := Pointer.access(res);
+  end solveUniqueExpressionNoCref;
+
+  function solvePrintInput
+    input Equation eqn;
+    input ComponentRef crefExp;
+  algorithm
+    print("\n##########################################\nSTART - Solve\n\n");
+    print("Solve Input:\n");
+    print("### Variable:\n\t" + ComponentRef.toString(crefExp) + "\n### Equation:\n\t" + Equation.toString(eqn) + "\n\n");
+  end solvePrintInput;
+
+  function solvePrintOutput
+    input Equation eqn;
+    input Status status;
+  algorithm
+    print("Solve Output:\n");
+    print("### Status:\n\t" + statusString(status) + "\n");
+    print("### Equation:\n\t" + Equation.toString(eqn) + "\n");
+    print("\nEND - Solve\n##########################################\n\n");
+  end solvePrintOutput;
+
+  function solveUniquePrintInstructions
+    input list<Expression> inverseInstructions;
+    input Status status;
+  algorithm
+    print("SolveUnique Instructions (substitute from top to bottom):\n");
+    print("\t0 (is initial)\n");
+    for instruction in inverseInstructions loop
+      print("\t" + Expression.toString(instruction) + "\n");
+    end for;
+    print("### Status:\n\t" + statusString(status) + "\n");
+    print("\n");
+  end solveUniquePrintInstructions;
+
+  function solveUniquePrintImplicitFallback
+    input Expression exp;
+  algorithm
+    print("Setting Status.Implicit (fallback) due to:\n");
+    print("### Expression:\n\t" + Expression.toString(exp) + "\n");
+    print("\n");
+  end solveUniquePrintImplicitFallback;
+
+  function applyInstruction
+    "substitute insertExp for $SUBST_CREF in instruction"
+    input output Expression insertExp;
+    input Expression instruction;
+  algorithm
+    insertExp := match instruction
+      case Expression.MULTARY() algorithm
+        instruction.arguments     := list(replaceSubstitute(arg, insertExp) for arg in instruction.arguments);
+        instruction.inv_arguments := list(replaceSubstitute(arg, insertExp) for arg in instruction.inv_arguments);
+      then instruction;
+      case Expression.BINARY() algorithm
+        if Expression.isSubstitute(instruction.exp1) then
+          instruction.exp1 := insertExp;
+        end if;
+        if Expression.isSubstitute(instruction.exp2) then
+          instruction.exp2 := insertExp;
+        end if;
+      then instruction;
+      case Expression.UNARY() algorithm
+        if Expression.isSubstitute(instruction.exp) then
+          instruction.exp := insertExp;
+        end if;
+      then instruction;
+      // the substitute can be nested in the arguments of an inverse call
+      case Expression.CALL(call = Call.TYPED_CALL())
+      then Expression.map(instruction, function replaceSubstitute(insertExp = insertExp));
+      case Expression.CALL() algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " can only handle TYPED_CALL."});
+      then fail();
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed for instruction: " + Expression.toString(instruction)});
+      then fail();
+    end match;
+  end applyInstruction;
+
+  function replaceSubstitute
+    input output Expression exp;
+    input Expression insertExp;
+  algorithm
+    if Expression.isSubstitute(exp) then
+      exp := insertExp;
+    end if;
+  end replaceSubstitute;
+
+  function tupleSolvable
+    "checks if the tuple expression contains all variables we need to solve for. other elements
+    are solved by other slices of the same equation, evaluating the call again does not change them."
+    input list<Expression> tuple_exps;
+    input list<Pointer<Variable>> vars;
+    input Boolean inFor = false "elements are one iteration of the (sliced) variables";
+    output Boolean b = false;
+  protected
+    list<Expression> filtered_exps = list(e for e guard(not Expression.isWildCref(e)) in tuple_exps);
+    UnorderedMap<ComponentRef, Boolean> map;
+    UnorderedMap<ComponentRef, Integer> sizes;
+    ComponentRef stripped;
+  algorithm
+    if List.compareLength(filtered_exps, vars) >= 0 then
+      map   := UnorderedMap.new<Boolean>(ComponentRef.hash, ComponentRef.isEqual);
+      sizes := UnorderedMap.new<Integer>(ComponentRef.hash, ComponentRef.isEqual);
+      // add all variables to solve for
+      for var in vars loop
+        UnorderedMap.add(BVariable.getVarName(var), false, map);
+        UnorderedMap.add(BVariable.getVarName(var), BVariable.size(var), sizes);
+      end for;
+      // set the map entry for all variables that occur to true
+      for exp in filtered_exps loop
+        () := match exp
+          case Expression.CREF() guard(UnorderedMap.contains(exp.cref, map)) algorithm
+            UnorderedMap.add(exp.cref, true, map);
+          then ();
+
+          // a subscripted element that covers the whole variable, e.g. x[1] for Real[1] x
+          case Expression.CREF() algorithm
+            stripped := ComponentRef.stripSubscriptsAll(exp.cref);
+            if UnorderedMap.contains(stripped, map) and (inFor or UnorderedMap.getSafe(stripped, sizes, sourceInfo()) == Type.sizeOf(Expression.typeOf(exp))) then
+              UnorderedMap.add(stripped, true, map);
+            elseif UnorderedMap.contains(stripped, map) then
+              return;
+            end if;
+          then ();
+
+          else algorithm return; then ();
+        end match;
+      end for;
+      // check if all variables occured
+      b := List.all(UnorderedMap.valueList(map), Util.id);
+    end if;
+  end tupleSolvable;
+
+  function expandArraySumExp
+    "Replaces sum(arrayCref) with arrayCref[1] + ... + arrayCref[n] for 1D arrays.
+    sum(A) without explicit iterator is represented as TYPED_CALL, not TYPED_REDUCTION."
+    input output Expression exp;
+    input ComponentRef arrayCref;
+  protected
+    Call call;
+    Type arrTy, elemTy;
+    list<Dimension> dims;
+    list<Integer> sizes;
+    list<Expression> elements;
+
+    ComponentRef arg_cref, elemCref;
+    Expression new_exp;
+  algorithm
+    exp := match exp
+      case Expression.CALL(call = call as Call.TYPED_CALL(arguments = {Expression.CREF(cref = arg_cref)}))
+      guard(AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)) == "sum" and ComponentRef.isEqual(arg_cref, arrayCref)) algorithm
+        arrTy     := ComponentRef.getSubscriptedType(arrayCref, true);
+        elemTy    := Type.arrayElementType(arrTy);
+        dims      := Type.arrayDims(arrTy);
+        sizes     := list(Dimension.size(dim) for dim in dims);
+        elements  := expandArraySumExpDim(sizes, arrayCref, elemTy);
+        new_exp   := Expression.MULTARY(listReverse(elements), {}, Operator.makeAdd(elemTy));
+      then new_exp;
+
+      // a*x and x*a with vectors a and x -> a[1]*x[1] + ... + a[n]*x[n]
+      case Expression.BINARY(operator = Operator.OPERATOR(op = NFOperator.Op.SCALAR_PRODUCT))
+      guard(isCrefExp(exp.exp1, arrayCref) or isCrefExp(exp.exp2, arrayCref)) algorithm
+        elemTy    := Operator.typeOf(exp.operator);
+        elements  := {};
+        for i in 1:Dimension.size(listHead(Type.arrayDims(Expression.typeOf(exp.exp1)))) loop
+          elements := Expression.BINARY(
+            SimplifyExp.simplify(Expression.applySubscripts({Subscript.INDEX(Expression.INTEGER(i))}, exp.exp1)),
+            Operator.makeMul(elemTy),
+            SimplifyExp.simplify(Expression.applySubscripts({Subscript.INDEX(Expression.INTEGER(i))}, exp.exp2))) :: elements;
+        end for;
+      then Expression.MULTARY(listReverse(elements), {}, Operator.makeAdd(elemTy));
+
+      else exp;
+    end match;
+  end expandArraySumExp;
+
+  function isCrefExp
+    input Expression exp;
+    input ComponentRef cref;
+    output Boolean b;
+  algorithm
+    b := match exp
+      case Expression.CREF() then ComponentRef.isEqual(exp.cref, cref);
+      else false;
+    end match;
+  end isCrefExp;
+
+  function expandArraySumExpDim
+    input list<Integer> sizes;
+    input ComponentRef arrayCref;
+    input Type elemTy;
+    input list<Subscript> subs = {};
+    input output list<Expression> elements = {};
+  algorithm
+    elements := match sizes
+      local
+        Integer n;
+        list<Integer> rest;
+        ComponentRef elemCref;
+
+      // create all combinations of the current subscript
+      case n :: rest algorithm
+        for i in 1:n loop
+          elements := expandArraySumExpDim(rest, arrayCref, elemTy, Subscript.INDEX(Expression.INTEGER(i)) :: subs, elements);
+        end for;
+      then elements;
+
+      // no further subscripts, add the element
+      else algorithm
+        elemCref := ComponentRef.mergeSubscripts(listReverse(subs), arrayCref);
+      then Expression.CREF(elemTy, elemCref) :: elements;
+    end match;
+  end expandArraySumExpDim;
+
+  function getVarSlice
+    input output ComponentRef var_cref;
+    input Option<ComponentRef> reference;
+    input Equation eqn;
+    output Status solve_status;
+  protected
+    Pointer<Variable> var_ptr = BVariable.getVarPointer(var_cref, sourceInfo());
+    list<ComponentRef> slices_lst, filtered;
+    Option<Pointer<Variable>> record_parent;
+    function checkReference
+      input ComponentRef var_cref;
+      input Option<ComponentRef> reference_opt;
+      output Boolean fit;
+    algorithm
+      fit := match reference_opt
+        local
+          ComponentRef reference;
+        case SOME(reference) then Type.sizeOf(ComponentRef.getSubscriptedType(var_cref), true) == Type.sizeOf(ComponentRef.getSubscriptedType(reference), true);
+        else true;
+      end match;
+    end checkReference;
+  algorithm
+    slices_lst := Equation.collectCrefs(eqn, function Slice.getSliceCandidates(name = var_cref));
+
+    if List.hasOneElement(slices_lst) then
+      var_cref := listHead(slices_lst);
+      // only accept the cref if it has the same size as the one we are trying to solve for
+      if checkReference(var_cref, reference) then
+        solve_status := Status.UNPROCESSED;
+      else
+        solve_status := Status.IMPLICIT;
+      end if;
+    else
+      // check if the record parents occur (todo: vice versa?)
+      record_parent := BVariable.getParent(BVariable.getVarPointer(var_cref, sourceInfo()));
+      if isSome(record_parent) then
+        // do not pass reference for record elements
+        (var_cref, solve_status) := getVarSlice(BVariable.getVarName(Util.getOption(record_parent)), NONE(), eqn);
+      elseif listEmpty(slices_lst) then
+        solve_status := Status.UNSOLVABLE;
+      else
+        // more than one candidate slice occurs (e.g. the whole variable on one side and
+        // a partial slice on the other) -- narrow down with the same size check used for
+        // the single-candidate case above.
+        filtered := list(c for c guard(checkReference(c, reference)) in slices_lst);
+        if List.hasOneElement(filtered) then
+          var_cref := listHead(filtered);
+          solve_status := Status.UNPROCESSED;
+        else
+          solve_status := Status.IMPLICIT;
+        end if;
+      end if;
+    end if;
+  end getVarSlice;
+
+  function solveForVarSlice
+    input output Slice<EquationPointer> eqn_slice;
+    input Slice<VariablePointer> var_slice;
+    input ComponentRef cref;
+    input UnorderedMap<Path, Function> funcMap;
+    input BPartition.Kind kind;
+    input output Integer implicit_index;
+    input UnorderedMap<ComponentRef, list<Pointer<Equation>>> slicing_map;
+    input VarData varData;
+    input EqData eqData;
+    output Status solve_status;
+  protected
+    Equation eqn;
+    ComponentRef var_cref;
+  algorithm
+    eqn := Pointer.access(Slice.getT(eqn_slice));
+    (var_cref, solve_status) := getVarSlice(BVariable.getVarName(Slice.getT(var_slice)), SOME(cref), eqn);
+
+    if solve_status < Status.IMPLICIT then
+      (eqn, solve_status, implicit_index, _) := solveEquation(eqn, var_cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+      eqn_slice := Slice.SLICE(Pointer.create(eqn), {});
+    elseif solve_status == Status.IMPLICIT then
+      // var_cref is a parent array containing cref as a slice; expand array sums to enable explicit solving
+      eqn := Equation.map(eqn, function expandArraySumExp(arrayCref = var_cref));
+      (eqn, solve_status, implicit_index, _) := solveEquation(eqn, cref, funcMap, kind, implicit_index, slicing_map, varData, eqData);
+      if solve_status < Status.UNSOLVABLE then
+        eqn_slice := Slice.SLICE(Pointer.create(eqn), eqn_slice.indices);
+      else
+        // all expansion tactics failed; allow implicit solution as last resort
+        solve_status := Status.IMPLICIT;
+      end if;
+    end if;
+  end solveForVarSlice;
+
+  annotation(__OpenModelica_Interface="nbackend");
+end NBSolve;

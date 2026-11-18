@@ -1,0 +1,1017 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+#include "OMPlot.h"
+#include "PlotWindow.h"
+#include "Legend.h"
+#include "PlotGrid.h"
+#include "LinearScaleEngine.h"
+#include "ScaleDraw.h"
+#include "PlotZoomer.h"
+#include "PlotPanner.h"
+#include "PlotPicker.h"
+#include "PlotCurve.h"
+
+#include "qwt_plot_canvas.h"
+#include "qwt_plot_layout.h"
+#include "qwt_scale_widget.h"
+#if QWT_VERSION < 0x060000
+#include "qwt_legend_item.h"
+#endif
+#include "qwt_text_label.h"
+#include "qwt_plot_item.h"
+#include "qwt_scale_map.h"
+
+#include <QtMath>
+#include <QFontMetrics>
+#include <QPainter>
+#include <QMouseEvent>
+#include <QResizeEvent>
+#include <QChildEvent>
+
+#include <algorithm>
+#include <QRubberBand>
+
+namespace OMPlot{
+
+/*! Returns a mouse event's global position across supported Qt versions.
+ * Qt 6 replaced QMouseEvent::globalPos() with globalPosition().
+ * \param event Mouse event to read.
+ * \return Event position in global coordinates.
+ */
+static QPoint mouseGlobalPosition(const QMouseEvent *event)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+  return event->globalPosition().toPoint();
+#else
+  return event->globalPos();
+#endif
+}
+
+/*! Maps a global position into the canvas and bounds it to valid canvas pixels.
+ * Axis-originated events can lie outside the canvas, but Qwt's zoomer maps its
+ * input positions through the canvas coordinate system.
+ * \param canvas Plot canvas receiving the zoom selection.
+ * \param globalPosition Position to map.
+ * \return Clamped position in canvas coordinates.
+ */
+static QPoint clampedCanvasPosition(QWidget *canvas, const QPoint &globalPosition)
+{
+  QPoint position = canvas->mapFromGlobal(globalPosition);
+  const QRect rect = canvas->rect();
+  position.setX(qBound(rect.left(), position.x(), qMax(rect.left(), rect.right())));
+  position.setY(qBound(rect.top(), position.y(), qMax(rect.top(), rect.bottom())));
+  return position;
+}
+
+/*!
+ * \class StackLanes
+ * Draws the lanes of the stacked curves of one y-axis: each band shaded, the
+ * name of its curve above it.
+ */
+class StackLanes : public QwtPlotItem
+{
+public:
+  StackLanes(Plot *pPlot, bool right)
+    : mpPlot(pPlot), mRight(right)
+  {
+    setYAxis(right ? QwtPlot::yRight : QwtPlot::yLeft);
+    setZ(5); // below the grid and the curves
+    setItemAttribute(QwtPlotItem::AutoScale, false);
+    setItemAttribute(QwtPlotItem::Legend, false);
+  }
+  int rtti() const override {return QwtPlotItem::Rtti_PlotUserItem;}
+  void draw(QPainter *painter, const QwtScaleMap &xMap, const QwtScaleMap &yMap, const QRectF &canvasRect) const override
+  {
+    Q_UNUSED(xMap);
+    QColor shade = OMPlot::isDarkMode() ? mpPlot->palette().color(QPalette::Text) : QColor(Qt::black);
+    shade.setAlpha(OMPlot::isDarkMode() ? 32 : 24);
+    painter->save();
+    painter->setFont(mpPlot->canvas()->font());
+    foreach (PlotCurve *pPlotCurve, mpPlot->axisCurves(mRight)) {
+      if (!pPlotCurve->isStacked()) {
+        continue;
+      }
+      const double top = yMap.transform(pPlotCurve->getStackOffset() + pPlotCurve->getStackHeight());
+      const double bottom = yMap.transform(pPlotCurve->getStackOffset());
+      if (bottom > top) {
+        painter->fillRect(QRectF(canvasRect.left(), top, canvasRect.width(), bottom - top), shade);
+      }
+      painter->setPen(pPlotCurve->pen().color());
+      painter->drawText(QPointF(canvasRect.left() + 4, top - painter->fontMetrics().descent() - 2), pPlotCurve->title().text());
+    }
+    painter->restore();
+  }
+private:
+  Plot *mpPlot;
+  bool mRight;
+};
+
+Plot::Plot(PlotWindow *pParent)
+  : QwtPlot(pParent)
+{
+  setAutoReplot(false);
+  mpParentPlotWindow = pParent;
+  enableAxis(QwtPlot::yRight);
+  // create an instance of legend
+  mpLegend = new Legend(this);
+  insertLegend(mpLegend, QwtPlot::TopLegend);
+  // create an instance of grid
+  mpPlotGrid = new PlotGrid(this);
+  (new StackLanes(this, false))->attach(this);
+  (new StackLanes(this, true))->attach(this);
+  // create the scale engine
+  LinearScaleEngine *pXLinearScaleEngine = new LinearScaleEngine;
+  setAxisScaleEngine(QwtPlot::xBottom, pXLinearScaleEngine);
+  setAxisAutoScale(QwtPlot::xBottom);
+  LinearScaleEngine *pYLinearScaleEngine = new LinearScaleEngine;
+  setAxisScaleEngine(QwtPlot::yLeft, pYLinearScaleEngine);
+  setAxisAutoScale(QwtPlot::yLeft);
+  setAxisVisible(QwtPlot::yRight, false);   // y axis initially hidden
+  // create the scale draw
+  mpXScaleDraw = new ScaleDraw(true, this);
+  setAxisScaleDraw(QwtPlot::xBottom, mpXScaleDraw);
+  mpYScaleDraw = new ScaleDraw(false, this);
+  setAxisScaleDraw(QwtPlot::yLeft, mpYScaleDraw);
+  mpYRightScaleDraw = new ScaleDraw(false, this);
+  setAxisScaleDraw(QwtPlot::yRight, mpYRightScaleDraw);
+  // create an instance of zoomer
+  mpPlotZoomer = new PlotZoomer(QwtPlot::xBottom, QwtPlot::yLeft, canvas());
+  // Qwt's rubber band is confined to the canvas; this transparent overlay also
+  // shows the drag preview over axes and other plot areas outside the canvas.
+  mpZoomRubberBand = new QRubberBand(QRubberBand::Rectangle, this);
+  mpZoomRubberBand->setAttribute(Qt::WA_TransparentForMouseEvents);
+  mpZoomRubberBand->setAttribute(Qt::WA_NoSystemBackground);
+  mpZoomRubberBand->hide();
+  // create an instance of panner
+  mpPlotPanner = new PlotPanner(canvas(), this);
+  // create an instance of picker
+  mpPlotPicker = new PlotPicker(canvas(), this);
+  mpPlotPicker->setTrackerPen(QPen(OMPlot::isDarkMode() ? palette().color(QPalette::Text) : QColor(Qt::black)));
+  mpPlotPicker->setTrackerMode(QwtPicker::AlwaysOn);
+  // set canvas arrow
+  QwtPlotCanvas *pPlotCanvas = static_cast<QwtPlotCanvas*>(canvas());
+  pPlotCanvas->setFrameStyle(QFrame::NoFrame);  /* Ticket #2679 point 6. Remove the default frame from the canvas. */
+#if defined(__EMSCRIPTEN__)
+  // wasm: the offscreen BackingStore pixmap shows up black, so paint directly;
+  // ImmediatePaint makes replot() repaint synchronously.
+  pPlotCanvas->setPaintAttribute(QwtPlotCanvas::BackingStore, false);
+  pPlotCanvas->setPaintAttribute(QwtPlotCanvas::ImmediatePaint, true);
+#endif
+  setCanvasBackground(OMPlot::isDarkMode() ? palette().color(QPalette::Base) : QColor(Qt::white));
+  setContentsMargins(10, 10, 10, 10);
+  /* Ticket #2679 point 2. */
+  // No gap between axis backbone and canvas
+  // Zeroing the margins makes the canvas and scale widgets flush. At a fractional device
+  // pixel ratio (e.g. 125%) Qt rounds every widget's device rect independently, so the
+  // boundary seam can move by one device pixel during a resize and the opaque canvas
+  // intermittently covers the axis backbone. ScaleDraw::drawBackbone() compensates for this
+  // by insetting the backbone one device pixel into the scale widget when dpr != 1.0.
+  for (int i = 0; i < QwtPlot::axisCnt; i++) {
+    QwtScaleWidget *pScaleWidget = axisWidget(i);
+    if (pScaleWidget) {
+      pScaleWidget->setContentsMargins(0, 0, 0, 0);
+      pScaleWidget->setMargin(0);
+      pScaleWidget->setBorderDist(0, 0);
+    }
+  }
+  // Remove the plot layout's own margins from all axes
+  plotLayout()->setCanvasMargin(0);
+  plotLayout()->setAlignCanvasToScales(true);
+  // Use monospaced font for better readability.
+  QFont monospaceFont("Monospace");
+  monospaceFont.setStyleHint(QFont::TypeWriter);
+  // set the bottom axis title font size small.
+  QwtText bottomTitle = axisTitle(QwtPlot::xBottom);
+  bottomTitle.setFont(QFont(monospaceFont.family(), 11));
+  setAxisTitle(QwtPlot::xBottom, bottomTitle);
+  // set the left and right axis title font size small.
+  QwtText leftTitle = axisTitle(QwtPlot::yLeft);
+  leftTitle.setFont(QFont(monospaceFont.family(), 11));
+  setAxisTitle(QwtPlot::yLeft, leftTitle);
+  QwtText rightTitle = axisTitle(QwtPlot::yRight);
+  rightTitle.setFont(QFont(monospaceFont.family(), 11));
+  setAxisTitle(QwtPlot::yRight, rightTitle);
+  // Observe the plot itself and its non-canvas children so a drag can start anywhere.
+  installEventFilter(this);
+  installZoomEventFilters(this);
+  // fill colors list
+  fillColorsList();
+  setAutoReplot(true);
+}
+
+/*! Captures zoom gestures begun outside the canvas and forwards them to Qwt.
+ * The visible selection is drawn in plot coordinates; synthetic events sent to
+ * Qwt are clamped to canvas coordinates so axis labels do not enter the zoom range.
+ * Newly added child widgets are also watched, while native canvas gestures remain
+ * under Qwt's own event handling.
+ * \param object Object receiving the original event.
+ * \param event Event delivered by Qt.
+ * \return The result from QwtPlot::eventFilter.
+ */
+bool Plot::eventFilter(QObject *object, QEvent *event)
+{
+  if (!canvas()) {
+    return QwtPlot::eventFilter(object, event);
+  }
+
+  if (event->type() == QEvent::ChildAdded) {
+    QObject *child = static_cast<QChildEvent*>(event)->child();
+    if (QWidget *childWidget = qobject_cast<QWidget*>(child)) {
+      if (childWidget != canvas()) {
+        // Plot layout widgets may be created after construction; include their
+        // descendants so drags begun on them are handled consistently.
+        childWidget->installEventFilter(this);
+        installZoomEventFilters(childWidget);
+      }
+    }
+  } else if (event->type() == QEvent::MouseButtonPress) {
+    QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+    if (mouseEvent->button() == Qt::LeftButton) {
+      startZoomFromGlobalPosition(mouseGlobalPosition(mouseEvent), mouseEvent->modifiers());
+    }
+  } else if (event->type() == QEvent::MouseMove && mZoomingFromOutsideCanvas) {
+    QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+    updateZoomFromGlobalPosition(mouseGlobalPosition(mouseEvent), mouseEvent->buttons(), mouseEvent->modifiers());
+  } else if (event->type() == QEvent::MouseButtonRelease && mZoomingFromOutsideCanvas) {
+    QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+    if (mouseEvent->button() == Qt::LeftButton) {
+      finishZoomFromGlobalPosition(mouseGlobalPosition(mouseEvent), mouseEvent->buttons(), mouseEvent->modifiers());
+    }
+  }
+
+  return QwtPlot::eventFilter(object, event);
+}
+
+/*! Installs this plot's event filter on existing non-canvas descendants.
+ * The canvas is deliberately excluded because Qwt already handles gestures there.
+ * \param widget Parent whose direct child widgets should be watched recursively.
+ */
+void Plot::installZoomEventFilters(QWidget *widget)
+{
+  const QList<QWidget*> children = widget->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+  for (QWidget *child : children) {
+    if (child == canvas()) {
+      continue;
+    }
+    child->installEventFilter(this);
+    installZoomEventFilters(child);
+  }
+}
+
+/*! Starts a zoom drag from a position outside the canvas.
+ * \param globalPosition Mouse press position in global coordinates.
+ * \param modifiers Keyboard modifiers held during the press.
+ */
+void Plot::startZoomFromGlobalPosition(const QPoint &globalPosition, Qt::KeyboardModifiers modifiers)
+{
+  if (mZoomingFromOutsideCanvas || !mpPlotZoomer->isEnabled()) {
+    return;
+  }
+
+  mZoomStartPosition = mapFromGlobal(globalPosition);
+  // Draw our plot-wide preview instead of Qwt's canvas-only rubber band.
+  mpPlotZoomer->setRubberBand(QwtPicker::NoRubberBand);
+  QMouseEvent pressEvent(QEvent::MouseButtonPress, clampedCanvasPosition(canvas(), globalPosition),
+                         Qt::LeftButton, Qt::LeftButton, modifiers);
+  mpPlotZoomer->handleMouseEvent(&pressEvent);
+  mZoomingFromOutsideCanvas = true;
+  mpZoomRubberBand->setGeometry(QRect(mZoomStartPosition, QSize(1, 1)));
+  mpZoomRubberBand->raise();
+  mpZoomRubberBand->show();
+}
+
+/*! Updates the plot-wide preview and forwards a bounded move to Qwt.
+ * \param globalPosition Current mouse position in global coordinates.
+ * \param buttons Mouse buttons currently held.
+ * \param modifiers Keyboard modifiers currently held.
+ */
+void Plot::updateZoomFromGlobalPosition(const QPoint &globalPosition, Qt::MouseButtons buttons,
+                                       Qt::KeyboardModifiers modifiers)
+{
+  const QPoint position = mapFromGlobal(globalPosition);
+  mpZoomRubberBand->setGeometry(QRect(mZoomStartPosition, position).normalized());
+  mpZoomRubberBand->raise();
+  QMouseEvent moveEvent(QEvent::MouseMove, clampedCanvasPosition(canvas(), globalPosition),
+                        Qt::NoButton, buttons, modifiers);
+  mpPlotZoomer->handleMouseEvent(&moveEvent);
+}
+
+/*! Completes the Qwt zoom selection and removes the temporary preview.
+ * \param globalPosition Mouse release position in global coordinates.
+ * \param buttons Mouse buttons still held at release.
+ * \param modifiers Keyboard modifiers held at release.
+ */
+void Plot::finishZoomFromGlobalPosition(const QPoint &globalPosition, Qt::MouseButtons buttons,
+                                        Qt::KeyboardModifiers modifiers)
+{
+  QMouseEvent releaseEvent(QEvent::MouseButtonRelease, clampedCanvasPosition(canvas(), globalPosition),
+                           Qt::LeftButton, buttons, modifiers);
+  mpPlotZoomer->handleMouseEvent(&releaseEvent);
+  // Restore Qwt's normal rubber band for subsequent drags that start on the canvas.
+  mpPlotZoomer->setRubberBand(QwtPicker::RectRubberBand);
+  mpZoomRubberBand->hide();
+  mZoomingFromOutsideCanvas = false;
+}
+
+Plot::~Plot()
+{
+
+}
+
+void Plot::fillColorsList()
+{
+  if (isDarkMode()) {
+    // Lighter variants of the light mode colors so curves stay readable on the dark canvas.
+    mColorsList.append(QColor(255, 82, 82));
+    mColorsList.append(QColor(79, 195, 247));
+    mColorsList.append(QColor(105, 240, 174));
+    mColorsList.append(QColor(186, 104, 200));
+    mColorsList.append(QColor(217, 122, 255));
+    mColorsList.append(QColor(255, 167, 38));
+    mColorsList.append(QColor(255, 138, 128));
+    mColorsList.append(QColor(144, 202, 249));
+    mColorsList.append(QColor(129, 199, 132));
+    mColorsList.append(QColor(77, 208, 225));
+    mColorsList.append(QColor(206, 147, 216));
+    mColorsList.append(QColor(255, 241, 118));
+  } else {
+    mColorsList.append(QColor(Qt::red));
+    mColorsList.append(QColor(Qt::blue));
+    mColorsList.append(QColor(85,170,0));     // Ticket #3098
+    mColorsList.append(QColor(170,85,255));   // Ticket #3098
+    mColorsList.append(QColor(Qt::magenta));
+    mColorsList.append(QColor(255, 110, 25));  // Ticket #6399
+    mColorsList.append(QColor(Qt::darkRed));
+    mColorsList.append(QColor(Qt::darkBlue));
+    mColorsList.append(QColor(Qt::darkGreen));
+    mColorsList.append(QColor(Qt::darkCyan));
+    mColorsList.append(QColor(Qt::darkMagenta));
+    mColorsList.append(QColor(Qt::darkYellow));
+  }
+}
+
+PlotWindow* Plot::getParentPlotWindow()
+{
+  return mpParentPlotWindow;
+}
+
+void Plot::setLegend(Legend *pLegend)
+{
+  mpLegend = pLegend;
+}
+
+Legend* Plot::getLegend()
+{
+  return mpLegend;
+}
+
+PlotPicker* Plot::getPlotPicker()
+{
+  return mpPlotPicker;
+}
+
+PlotGrid* Plot::getPlotGrid()
+{
+  return mpPlotGrid;
+}
+
+PlotZoomer* Plot::getPlotZoomer()
+{
+  return mpPlotZoomer;
+}
+
+PlotPanner* Plot::getPlotPanner()
+{
+  return mpPlotPanner;
+}
+
+QList<PlotCurve*> Plot::getPlotCurvesList()
+{
+  return mPlotCurvesList;
+}
+
+PlotCurve* Plot::getPlotCurve(QString nameStructure)
+{
+  foreach (PlotCurve *pPlotCurve, mPlotCurvesList)
+  {
+    if (pPlotCurve->getNameStructure().compare(nameStructure) == 0)
+      return pPlotCurve;
+  }
+  return 0;
+}
+
+void Plot::addPlotCurve(PlotCurve *pCurve)
+{
+  mPlotCurvesList.append(pCurve);
+}
+
+void Plot::removeCurve(PlotCurve *pCurve)
+{
+  mPlotCurvesList.removeOne(pCurve);
+  if (pCurve->getPointMarker()) {
+    pCurve->getPointMarker()->setVisible(false);
+  }
+}
+
+QSize Plot::preferredSizeAdjustment() const
+{
+  return QwtPlot::sizeHint() - QwtPlot::minimumSizeHint();
+}
+
+QColor Plot::getUniqueColor(int index, int total)
+{
+  if (mColorsList.size() < total)
+    return QColor::fromHsvF(index/(total + 1.0), 1, 1);
+  else
+    return mColorsList.at(index);
+}
+
+void Plot::setFontSizes(double titleFontSize, double verticalAxisTitleFontSize, double verticalAxisNumbersFontSize,
+                        double rightVerticalAxisTitleFontSize, double rightVerticalAxisNumbersFontSize, double horizontalAxisTitleFontSize,
+                        double horizontalAxisNumbersFontSize, double footerFontSize, double legendFontSize)
+{
+  // title
+  QFont font = titleLabel()->font();
+  font.setPointSizeF(titleFontSize);
+  titleLabel()->setFont(font);
+  // vertical axis title
+  QwtText verticalTitle = axisWidget(QwtPlot::yLeft)->title();
+  font = verticalTitle.font();
+  font.setPointSizeF(verticalAxisTitleFontSize);
+  verticalTitle.setFont(font);
+  axisWidget(QwtPlot::yLeft)->setTitle(verticalTitle);
+  // vertical axis numbers
+  font = axisWidget(QwtPlot::yLeft)->font();
+  font.setPointSizeF(verticalAxisNumbersFontSize);
+  axisWidget(QwtPlot::yLeft)->setFont(font);
+  // right vertical axis title
+  QwtText verticalRightTitle = axisWidget(QwtPlot::yRight)->title();
+  font = verticalRightTitle.font();
+  font.setPointSizeF(rightVerticalAxisTitleFontSize);
+  verticalRightTitle.setFont(font);
+  axisWidget(QwtPlot::yRight)->setTitle(verticalRightTitle);
+  // right vertical axis numbers
+  font = axisWidget(QwtPlot::yRight)->font();
+  font.setPointSizeF(rightVerticalAxisNumbersFontSize);
+  axisWidget(QwtPlot::yRight)->setFont(font);
+  // horizontal axis title
+  QwtText horizontalTitle = axisWidget(QwtPlot::xBottom)->title();
+  font = horizontalTitle.font();
+  font.setPointSizeF(horizontalAxisTitleFontSize);
+  horizontalTitle.setFont(font);
+  axisWidget(QwtPlot::xBottom)->setTitle(horizontalTitle);
+  // horizontal axis numbers
+  font = axisWidget(QwtPlot::xBottom)->font();
+  font.setPointSizeF(horizontalAxisNumbersFontSize);
+  axisWidget(QwtPlot::xBottom)->setFont(font);
+  // footer
+  font = footerLabel()->font();
+  font.setPointSizeF(footerFontSize);
+  footerLabel()->setFont(font);
+  // legend
+  font = mpParentPlotWindow->getLegendFont();
+  font.setPointSizeF(legendFontSize);
+  mpParentPlotWindow->setLegendFont(font);
+}
+
+/*!
+ * \brief Plot::prefixableUnit
+ * Returns true if the unit is prefixable.
+ * \param unit
+ * \return
+ */
+bool Plot::prefixableUnit(const QString &unit)
+{
+  static const QSet<QString> prefixableUnits = {
+    "s",
+    "m",
+    "m/s",
+    "m/s2",
+    "rad",
+    "rad/s",
+    "rad/s2",
+    "rpm",
+    "Hz",
+    "N",
+    "N.m",
+    "Pa",
+    "Pa.s",
+    "J",
+    "eV",
+    "J/kg",
+    "J/(kg.K)",
+    "K",
+    "V",
+    "V/m",
+    "A",
+    "C",
+    "F",
+    "T",
+    "Wb",
+    "Wb/m",
+    "H",
+    "Ohm",
+    "S",
+    "W",
+    "V.A",
+    "W/m",
+    "W/m2",
+    "Wh",
+    "var"
+  };
+  return prefixableUnits.contains(unit);
+}
+
+/*!
+ * \brief Plot::convertUnitToSymbol
+ * Converts the unit to a symbol.
+ * \param displayUnit
+ * \return
+ */
+QString Plot::convertUnitToSymbol(const QString &displayUnit)
+{
+  QString symbol = displayUnit;
+  // if symbol startswith u then convert it to QChar(0x03BC)
+  if (symbol.startsWith("u")) {
+    symbol.replace(0, 1, QChar(0x03BC));
+  }
+  // if symbol contains "Ohm" then convert it to QChar(937) i.e., Greek Omega
+  if (symbol.contains("Ohm")) {
+    symbol.replace("Ohm", QChar(937));
+  }
+  // if symbol contains "degC" then convert it to QString("%1C").arg(QChar(176))
+  if (symbol.contains("degC")) {
+    symbol.replace("degC", QString("%1C").arg(QChar(176)));
+  }
+
+  return symbol;
+}
+
+/*!
+ * \brief Plot::convertSymbolToUnit
+ * Converts the symbol to a unit.
+ * \param symbol
+ * \return
+ */
+QString Plot::convertSymbolToUnit(const QString &symbol)
+{
+  QString unit = symbol;
+  // if unit startswith QChar(0x03BC) then convert it to u
+  if (unit.startsWith(QChar(0x03BC))) {
+    unit.replace(0, 1, "u");
+  }
+  // if unit contains QChar(937) i.e., Greek Omega then convert it to "Ohm"
+  if (unit.contains(QChar(937))) {
+    unit.replace(QChar(937), "Ohm");
+  }
+  // if unit contains QString("%1C").arg(QChar(176)) then convert it to "degC"
+  if (unit.contains(QString("%1C").arg(QChar(176)))) {
+    unit.replace(QString("%1C").arg(QChar(176)), "degC");
+  }
+
+  return unit;
+}
+
+/*!
+ * \brief Plot::getUnitPrefixAndExponent
+ * \param lowerBound
+ * \param upperBound
+ * \param unitPrefix
+ * \param exponent
+ */
+void Plot::getUnitPrefixAndExponent(double lowerBound, double upperBound, QString &unitPrefix, int &exponent)
+{
+  /* Since log(1900) returns 3.278 so we need to round down for positive values to make it 3
+   * And log(0.0011) return -2.95 so we also need to round down for negative value to make it -3
+   * log(0) is undefined so avoid it
+   */
+
+  if (!(qFuzzyCompare(lowerBound, 0.0) && qFuzzyCompare(upperBound, 0.0))) {
+    if (fabs(lowerBound) > fabs(upperBound)) {
+      exponent = qFloor(std::log10(fabs(lowerBound)));
+    } else {
+      exponent = qFloor(std::log10(fabs(upperBound)));
+    }
+
+    // We don't do anything for exponent values between -1 and 2.
+    if ((exponent < -1) || (exponent > 2)) {
+      if (exponent > 2) {
+        if (exponent >= 3 && exponent < 6) {
+          unitPrefix = "k";
+          exponent = 3;
+        } else if (exponent >= 6 && exponent < 9) {
+          unitPrefix = "M";
+          exponent = 6;
+        } else if (exponent >= 9 && exponent < 12) {
+          unitPrefix = "G";
+          exponent = 9;
+        } else if (exponent >= 12 && exponent < 15) {
+          unitPrefix = "T";
+          exponent = 12;
+        } else {
+          unitPrefix = "P";
+          exponent = 15;
+        }
+      } else if (exponent < -1) {
+        if (exponent <= -2 && exponent > -6) {
+          unitPrefix = "m";
+          exponent = -3;
+        } else if (exponent <= -6 && exponent > -9) {
+          unitPrefix = "u";
+          exponent = -6;
+        } else if (exponent <= -9 && exponent > -12) {
+          unitPrefix = "n";
+          exponent = -9;
+        } else if (exponent <= -12 && exponent > -15) {
+          unitPrefix = "p";
+          exponent = -12;
+        } else {
+          unitPrefix = "f";
+          exponent = -15;
+        }
+      }
+    } else {
+      unitPrefix = "";
+      exponent = 0;
+    }
+  }
+}
+
+/*!
+ * \brief Plot::resizeEvent
+ * Reimplementation of QWidget::resizeEvent.
+ * Recomputes the number of axis major ticks whenever the plot is resized so
+ * that the labels adapt to the available canvas size (see #15788).
+ * \param event
+ */
+void Plot::resizeEvent(QResizeEvent *event)
+{
+  QwtPlot::resizeEvent(event);
+  updateMaxMajorSteps();
+}
+
+/*!
+ * \brief Plot::minimumSizeHint
+ * Reimplementation of QWidget::minimumSizeHint().
+ * QwtPlot::sizeHint() returns a size that grows with the number of major axis
+ * ticks (the default minimumSizeHint() delegates to sizeHint()). Since the
+ * tick labels are already reduced to fit the available canvas size by
+ * updateMaxMajorSteps() (see #15788), we must not ask for extra space that is
+ * proportional to the current tick count, otherwise the plot window can not be
+ * shrunk vertically.
+ */
+QSize Plot::minimumSizeHint() const
+{
+  return QwtPlot::minimumSizeHint();
+}
+
+/*!
+ * \brief Plot::sizeHint
+ * Reimplementation of QWidget::sizeHint().
+ * QwtPlot::sizeHint() adds dh/dw proportional to the number of major axis ticks
+ * (see QwtPlot::sizeHint()), which makes the plot (and its containing window or
+ * MDI subwindow) impossible to shrink below a height driven by the tick count.
+ * Since the tick labels are already kept small enough for the canvas by
+ * updateMaxMajorSteps() (see #15788), we return the true minimum size instead
+ * so the plot can be shrunk as far as desired.
+ */
+QSize Plot::sizeHint() const
+{
+  return QwtPlot::minimumSizeHint();
+}
+
+/*!
+ * \brief Plot::updateMaxMajorSteps
+ * Reduces the number of axis tick labels in order to allow smaller plots.
+ * When the plot (and thus its canvas) is small only a few major ticks fit,
+ * so we decrease the number of major steps that Qwt uses to build the scale
+ * division. The labels are then spread further apart which lets the plot be
+ * shrunk more before labels start to overlap. See #15788.
+ */
+void Plot::updateMaxMajorSteps()
+{
+  if (!canvas()) {
+    return;
+  }
+
+  const int canvasWidth = canvas()->width();
+  const int canvasHeight = canvas()->height();
+
+  // x-axis (bottom): fit the labels horizontally.
+  int maxMajorX = 8;  // Qwt default
+  if (canvasWidth > 0) {
+    QFontMetrics xFm(axisWidget(QwtPlot::xBottom)->font());
+    // A typical numeric label is a few characters wide. Use a fixed sample to
+    // estimate the label width when no unit prefix is active, otherwise the
+    // scaled values are shorter (e.g. "12k").
+    const int sampleWidth = xFm.horizontalAdvance("1000");
+    const int labelWidth = qMax(sampleWidth, 20) + 8;  // + spacing/borders
+    maxMajorX = qBound(2, canvasWidth / labelWidth, 8);
+  }
+  if (axisMaxMajor(QwtPlot::xBottom) != maxMajorX) {
+    setAxisMaxMajor(QwtPlot::xBottom, maxMajorX);
+  }
+
+  // y-axis (left): fit the labels vertically.
+  int maxMajorY = 8;  // Qwt default
+  if (canvasHeight > 0) {
+    QFontMetrics yFm(axisWidget(QwtPlot::yLeft)->font());
+    const int labelHeight = yFm.height() + 6;  // + spacing between labels
+    maxMajorY = qBound(2, canvasHeight / labelHeight, 8);
+  }
+  // an axis that names values has a tick per value, see applyValueScales
+  if (axisMaxMajor(QwtPlot::yLeft) != maxMajorY && !hasValueScale(false)) {
+    setAxisMaxMajor(QwtPlot::yLeft, maxMajorY);
+  }
+
+  // y-axis (right): use the same density as the left axis.
+  if (axisMaxMajor(QwtPlot::yRight) != maxMajorY && !hasValueScale(true)) {
+    setAxisMaxMajor(QwtPlot::yRight, maxMajorY);
+  }
+}
+
+/*!
+ * \brief Plot::axisCurves
+ * The visible curves of the left or the right y-axis.
+ * \param right
+ * \return
+ */
+QList<PlotCurve*> Plot::axisCurves(bool right) const
+{
+  QList<PlotCurve*> curves;
+  foreach (PlotCurve *pPlotCurve, mPlotCurvesList) {
+    if (pPlotCurve->isVisible() && pPlotCurve->isYAxisRight() == right) {
+      curves.append(pPlotCurve);
+    }
+  }
+  return curves;
+}
+
+/*!
+ * \brief Plot::autoStack
+ * Whether the curves go in lanes without being asked to: all of them Booleans,
+ * Integers or enumerations, and not all of one Boolean or enumeration type
+ * on an axis, which names the values already.
+ * \return
+ */
+bool Plot::autoStack() const
+{
+  int curves = 0;
+  foreach (PlotCurve *pPlotCurve, mPlotCurvesList) {
+    if (pPlotCurve->isVisible()) {
+      if (!pPlotCurve->isDiscrete()) {
+        return false;
+      }
+      curves++;
+    }
+  }
+  return curves > 1 && !((axisCurves(false).isEmpty() || commonValueLabels(false))
+                         && (axisCurves(true).isEmpty() || commonValueLabels(true)));
+}
+
+/*!
+ * \brief Plot::updateStack
+ * Stacked, each curve of an axis gets a band of its own, the first curve on top:
+ * a Boolean or an enumeration one unit per value, any other curve two units
+ * between its minimum and maximum. The bands are 1.5 units apart, so that they
+ * stand out from the values within a band.
+ * \param stack
+ */
+void Plot::updateStack(bool stack)
+{
+  foreach (PlotCurve *pPlotCurve, mPlotCurvesList) {
+    pPlotCurve->clearStack();
+    pPlotCurve->getPointMarker()->setVisible(false);
+  }
+  if (stack) {
+    for (bool right : {false, true}) {
+      QList<PlotCurve*> curves = axisCurves(right);
+      double offset = 0;
+      for (int i = curves.size() - 1 ; i >= 0 ; i--) {
+        PlotCurve *pPlotCurve = curves.at(i);
+        if (pPlotCurve->hasValueLabels()) {
+          const double height = pPlotCurve->getValueLabels().size() - 1;
+          pPlotCurve->setStack(offset, pPlotCurve->getValueLabelBase(), 1, height);
+          offset += height + 1.5;
+        } else {
+          double low = 0, high = 0;
+          if (!pPlotCurve->mYAxisVector.isEmpty()) {
+            low = high = pPlotCurve->mYAxisVector.first();
+            foreach (double value, pPlotCurve->mYAxisVector) {
+              low = qMin(low, value);
+              high = qMax(high, value);
+            }
+          }
+          pPlotCurve->setStack(offset, low, high > low ? 2 / (high - low) : 0, high > low ? 2 : 0);
+          offset += high > low ? 3.5 : 1.5;
+        }
+      }
+    }
+  }
+  foreach (PlotCurve *pPlotCurve, mPlotCurvesList) {
+    pPlotCurve->applyStack();
+  }
+}
+
+/*!
+ * \brief Plot::applyValueScales
+ * Puts the ticks of a stacked y-axis on the values of its bands, and those of a
+ * y-axis whose curves are all of one Boolean or enumeration type on its values.
+ */
+void Plot::applyValueScales()
+{
+  for (bool right : {false, true}) {
+    const int axis = right ? QwtPlot::yRight : QwtPlot::yLeft;
+    QList<PlotCurve*> curves = axisCurves(right);
+    QList<double> ticks;
+    QStringList labels;
+    int base = 0;
+    if (!curves.isEmpty() && curves.first()->isStacked()) {
+      foreach (PlotCurve *pPlotCurve, curves) {
+        if (pPlotCurve->hasValueLabels()) {
+          for (int k = 0 ; k <= pPlotCurve->getStackHeight() ; k++) {
+            ticks.append(pPlotCurve->getStackOffset() + k);
+          }
+        } else {
+          ticks.append(pPlotCurve->getStackOffset());
+          if (pPlotCurve->getStackHeight() > 0) {
+            ticks.append(pPlotCurve->getStackOffset() + pPlotCurve->getStackHeight());
+          }
+        }
+      }
+    } else if (commonValueLabels(right, &labels, &base)) {
+      for (int k = 0 ; k < labels.size() ; k++) {
+        ticks.append(base + k);
+      }
+    } else {
+      continue;
+    }
+    std::sort(ticks.begin(), ticks.end());
+    // room above the top lane for its name
+    const double top = ticks.last() + (curves.first()->isStacked() ? 1 : 0.5);
+    // the range too, for whenever Qwt divides the scale again
+    setAxisScale(axis, ticks.first() - 0.5, top, 1);
+    setAxisScaleDiv(axis, QwtScaleDiv(ticks.first() - 0.5, top, QList<double>(), QList<double>(), ticks));
+  }
+}
+
+/*!
+ * \brief Plot::stackedCurveAt
+ * The stacked curve whose band holds value.
+ * \param right
+ * \param value
+ * \return
+ */
+PlotCurve* Plot::stackedCurveAt(bool right, double value) const
+{
+  foreach (PlotCurve *pPlotCurve, axisCurves(right)) {
+    if (pPlotCurve->isStacked() && value >= pPlotCurve->getStackOffset() - 1e-9
+        && value <= pPlotCurve->getStackOffset() + pPlotCurve->getStackHeight() + 1e-9) {
+      return pPlotCurve;
+    }
+  }
+  return nullptr;
+}
+
+/*!
+ * \brief Plot::hasValueScale
+ * Whether an axis names values, stacked or of one Boolean or enumeration type.
+ * \param right
+ * \return
+ */
+bool Plot::hasValueScale(bool right) const
+{
+  QList<PlotCurve*> curves = axisCurves(right);
+  return !curves.isEmpty() && (curves.first()->isStacked() || commonValueLabels(right));
+}
+
+/*!
+ * \brief Plot::commonValueLabels
+ * Whether all curves of an axis name their values the same way, a Boolean's or
+ * one enumeration's.
+ * \param right
+ * \param pLabels
+ * \param pBase
+ * \return
+ */
+bool Plot::commonValueLabels(bool right, QStringList *pLabels, int *pBase) const
+{
+  QList<PlotCurve*> curves = axisCurves(right);
+  if (curves.isEmpty() || !curves.first()->hasValueLabels()) {
+    return false;
+  }
+  foreach (PlotCurve *pPlotCurve, curves) {
+    if (pPlotCurve->getValueLabels() != curves.first()->getValueLabels()
+        || pPlotCurve->getValueLabelBase() != curves.first()->getValueLabelBase()) {
+      return false;
+    }
+  }
+  if (pLabels) {
+    *pLabels = curves.first()->getValueLabels();
+  }
+  if (pBase) {
+    *pBase = curves.first()->getValueLabelBase();
+  }
+  return true;
+}
+
+// just overloaded this function to get colors for curves.
+void Plot::replot()
+{
+  mpXScaleDraw->invalidateCache();
+  mpYScaleDraw->invalidateCache();
+  mpYRightScaleDraw->invalidateCache();
+
+  // Recompute the number of major axis ticks so that labels do not overlap
+  // when the plot is small. Disable autoscaling replot while doing this to
+  // avoid recursing back into Plot::replot() (setAxisMaxMajor triggers an
+  // autoRefresh when autoReplot is enabled).
+  const bool doAutoReplot = autoReplot();
+  setAutoReplot(false);
+  updateMaxMajorSteps();
+  setAutoReplot(doAutoReplot);
+
+  QwtPlot::replot();
+
+  // Now we need to again loop through curves to set the color and title.
+  // Also display y-axis (left or right) only if axis is assigned to at least one curve
+  // if no curves are present then display left y-axis by default. See #14894. The window size is too small without any y-axes.
+  bool leftAxisVisible = mPlotCurvesList.isEmpty() ? true : false;
+  bool rightAxisVisible = false;
+  for (int i = 0 ; i < mPlotCurvesList.length() ; i++) {
+    // if user has set the custom color for the curve then dont get automatic color for it
+    if (!mPlotCurvesList[i]->hasCustomColor()) {
+      QPen pen = mPlotCurvesList[i]->pen();
+      pen.setColor(getUniqueColor(i, mPlotCurvesList.length()));
+      mPlotCurvesList[i]->setPen(pen);
+    }
+    mPlotCurvesList[i]->setTitleLocal();
+    rightAxisVisible = rightAxisVisible || mPlotCurvesList[i]->isYAxisRight();
+    leftAxisVisible = leftAxisVisible || (!mPlotCurvesList[i]->isYAxisRight());
+  }
+  setAxisVisible(QwtPlot::yLeft, leftAxisVisible);
+  setAxisVisible(QwtPlot::yRight, rightAxisVisible);
+
+  if (mpParentPlotWindow->getXCustomLabel().isEmpty()) {
+    // ScaleDraw::getUnitPrefix is only set when time is on x-axis
+    const QString timeUnit = mpXScaleDraw->getUnitPrefix() + mpParentPlotWindow->getTimeUnit();
+    if (mpParentPlotWindow->isPlot()
+        || mpParentPlotWindow->isPlotAll()
+        || mpParentPlotWindow->isPlotInteractive()) {
+      setAxisTitle(QwtPlot::xBottom, QString("%1 (%2)").arg(mpParentPlotWindow->getXLabel(), timeUnit));
+    } else if (mpParentPlotWindow->isPlotArray()) {
+      setAxisTitle(QwtPlot::xBottom, mpParentPlotWindow->getXLabel());
+    } else {
+      setAxisTitle(QwtPlot::xBottom, "");
+    }
+  } else {
+    setAxisTitle(QwtPlot::xBottom, mpParentPlotWindow->getXCustomLabel());
+  }
+
+  if (mpParentPlotWindow->getYCustomLabel().isEmpty()) {
+    setAxisTitle(QwtPlot::yLeft, "");
+  } else {
+    setAxisTitle(QwtPlot::yLeft, mpParentPlotWindow->getYCustomLabel());
+  }
+
+  if (mpParentPlotWindow->getYRightCustomLabel().isEmpty()) {
+    setAxisTitle(QwtPlot::yRight, "");
+  } else {
+    setAxisTitle(QwtPlot::yRight, mpParentPlotWindow->getYRightCustomLabel());
+  }
+}
+
+} // namespace OMPlot

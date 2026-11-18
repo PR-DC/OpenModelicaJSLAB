@@ -1,0 +1,1412 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated uniontype NBResizable
+" file:         NBResizable.mo
+  package:      NBResizable
+  description:  This file contains util functions for resizable parameters.
+"
+
+protected
+  // frontend imports
+  import NFBackendExtension.{BackendInfo, VariableAttributes};
+  import Binding = NFBinding;
+  import Call = NFCall;
+  import ComponentRef = NFComponentRef;
+  import Dimension = NFDimension;
+  import Expression = NFExpression;
+  import SimplifyExp = NFSimplifyExp;
+  import Subscript = NFSubscript;
+  import Type = NFType;
+  import Operator = NFOperator;
+  import Variable = NFVariable;
+
+  // backend imports
+  import NFInstNode.InstNode;
+  import NBEquation.{Equation, Iterator, EquationPointers, EquationAttributes, EquationKind};
+  import NBVariable.{VarData, VariablePointers};
+  import BVariable = NBVariable;
+  import Differentiate = NBDifferentiate;
+  import NBDifferentiate.DifferentiationArguments;
+  import Replacements = NBReplacements;
+  import Solve = NBSolve;
+public
+  constant Boolean debug = false; // SET TO TRUE FOR DEBUGGING
+  type EvalOrder = enumeration(INDEPENDENT, FORWARD, BACKWARD, FAILED);
+
+  function resize
+    "this resizes the resizable parameters to the optimal value to get the smallest possible system"
+    input output EquationPointers equations;
+    input output VarData varData;
+  protected
+    UnorderedSet<ComponentRef> parameters, min_parameters;
+    UnorderedMap<ComponentRef, Expression> optimal_values;
+    // c2p: constraint to parameters map
+    // p2c: parameter to constraints map
+    // i: inequality constraints
+    // e: equality constraints
+    UnorderedMap<Expression, ParameterList> c2pi, c2pe;
+    UnorderedMap<ComponentRef, ConstraintList> p2ci, p2ce;
+    partial function applyFunc
+      input output Type ty;
+    end applyFunc;
+    applyFunc func;
+  algorithm
+    varData := match varData
+      // only do something if there are resizable variables
+      case VarData.VAR_DATA_SIM() guard(VariablePointers.size(varData.resizables) > 0) algorithm
+        // prepare sets and maps
+        parameters        := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+        min_parameters    := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+        optimal_values    := UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+        c2pi              := UnorderedMap.new<ParameterList>(Expression.hash, Expression.isEqual);
+        c2pe              := UnorderedMap.new<ParameterList>(Expression.hash, Expression.isEqual);
+
+        // find the optimal values for iterators
+        EquationPointers.map(equations, function findOptimalResizableValues(parameters = parameters, min_parameters = min_parameters, optimal_values = optimal_values, c2pi = c2pi, c2pe = c2pe));
+
+        // initialize the optimal values for parameters with their min or max attribute (or 0 if none available)
+        parameters := UnorderedSet.selfMap(parameters, function setInitialValues(min_parameters = min_parameters, optimal_values = optimal_values));
+
+        if debug then
+          print(optimalValuesToString(optimal_values, StringUtil.headline_2("[debug] Initial Resizable Parameter Values:") + "\n"));
+          print(StringUtil.headline_2("[debug] Final Inequality Constraints:"));
+          if UnorderedMap.isEmpty(c2pi) then
+            print("  <No Constraints>\n\n");
+          else
+            print(List.toStringCustom(UnorderedMap.keyList(c2pi), Expression.toString, "", "  0 >= ", "\n  0 >= ", "\n") + "\n");
+          end if;
+          print(StringUtil.headline_2("[debug] Final Equality Constraints:"));
+          if UnorderedMap.isEmpty(c2pe) then
+            print("  <No Constraints>\n\n");
+          else
+            print(List.toStringCustom(UnorderedMap.keyList(c2pe), Expression.toString, "", "  0 = ", "\n  0 = ", "\n") + "\n");
+          end if;
+        end if;
+
+        // compute the optimal values by checking constraints
+        p2ci := invertConstraintParameterMap(c2pi, parameters);
+        p2ce := invertConstraintParameterMap(c2pe, parameters);
+        computeOptimalValues(optimal_values, c2pi, p2ci, c2pe, p2ce);
+
+        // traverse the model and update all values depending on these resizable parameters
+        func := function Type.applyToDims(func = function updateDimension(optimal_values = optimal_values));
+        // update variables
+        varData.variables := VariablePointers.map(varData.variables, function Variable.applyToType(func = func));
+        varData.variables := VariablePointers.mapPtr(varData.variables, function BVariable.updateResizableParameter(optimal_values = optimal_values));
+        varData.variables := VariablePointers.mapPtr(varData.variables, function BVariable.mapExp(funcExp = function Expression.applyToType(func = func), mapFunc = Expression.map));
+        // update equations
+        EquationPointers.mapPtr(equations, function Equation.applyToType(func = func));
+        equations := EquationPointers.mapExp(equations, function Expression.applyToType(func = func));
+        EquationPointers.mapRes(equations, function BVariable.applyToType(func = func));
+
+        if Flags.isSet(Flags.DUMP_RESIZABLE) or debug then
+          print(optimalValuesToString(optimal_values));
+        end if;
+        varData.resizable := true;
+      then varData;
+
+      else algorithm
+        if Flags.isSet(Flags.DUMP_RESIZABLE) or debug then
+          print(StringUtil.headline_2("[dumpResizable] No resizable parameters were detected in the model."));
+        end if;
+      then varData;
+    end match;
+  end resize;
+
+  function detect
+    "this function detects if an equation is resizable"
+    input Equation eqn;
+    input ComponentRef cref_to_solve;
+    output UnorderedMap<ComponentRef, EvalOrder> order = UnorderedMap.new<EvalOrder>(ComponentRef.hash, ComponentRef.isEqual);
+  protected
+    Pointer<Variable> var_ptr = BVariable.getVarPointer(cref_to_solve, sourceInfo());
+    UnorderedSet<ComponentRef> var_occurences = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    UnorderedSet<ComponentRef> ite_occurences;
+    list<ComponentRef> occ_lst, iterators;
+    list<list<Subscript>> subs;
+    list<Subscript> subs_to_solve, local_subs;
+    Subscript sub_to_solve;
+    ComponentRef iter;
+    DifferentiationArguments args;
+    Option<Integer> opt_factor;
+    Integer factor;
+    Integer shift_value, v2;
+    EvalOrder eval;
+    Boolean stop;
+  algorithm
+    order := match eqn
+      case Equation.FOR_EQUATION() algorithm
+        for body in eqn.body loop
+          Equation.map(body, function collectVars(func = function BVariable.equalName(var_ptr2 = var_ptr), collector = var_occurences));
+          occ_lst := UnorderedSet.toList(var_occurences);
+          (iterators, _)  := Iterator.getFrames(Equation.getForIterator(eqn));
+          order := UnorderedMap.fromLists(iterators, list(EvalOrder.INDEPENDENT for i in iterators), ComponentRef.hash, ComponentRef.isEqual);
+          if not List.hasOneElement(occ_lst) then
+            subs  := list(ComponentRef.subscriptsAllWithWholeFlat(cref) for cref in occ_lst);
+            subs  := List.transposeList(subs);
+            subs_to_solve := ComponentRef.subscriptsAllWithWholeFlat(cref_to_solve);
+            stop := false;
+            for dim in List.zip(subs, subs_to_solve) loop
+              (local_subs, sub_to_solve) := dim;
+              ite_occurences := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+              for sub in local_subs loop
+                Subscript.mapExp(sub, function collectVars(func = BVariable.isIterator, collector = ite_occurences));
+              end for;
+              iterators := UnorderedSet.toList(ite_occurences);
+              () := match iterators
+                // literal subscripts in this dimension do not restrict the order
+                case {} then ();
+
+                case {iter} algorithm
+                  eval := UnorderedMap.getSafe(iter, order, sourceInfo());
+                  if eval < EvalOrder.FAILED then
+                    args := DifferentiationArguments.simpleCref(iter);
+                    opt_factor := NONE();
+                    for sub in local_subs loop
+                      factor := getFactor(Subscript.toExp(sub), args, opt_factor);
+                      opt_factor := SOME(factor);
+                    end for;
+
+                    () := match opt_factor
+                      case SOME(factor) guard(factor <> 0) algorithm
+                        try
+                          Expression.INTEGER(shift_value) := getShift(Subscript.toExp(sub_to_solve), iter);
+                          for sub in local_subs loop
+                            Expression.INTEGER(v2) := getShift(Subscript.toExp(sub), iter);
+                            eval := match eval
+                              case EvalOrder.INDEPENDENT  guard(shift_value == v2)  then EvalOrder.INDEPENDENT;
+                              case EvalOrder.INDEPENDENT  guard(shift_value > v2)   then EvalOrder.FORWARD;
+                              case EvalOrder.INDEPENDENT  guard(shift_value < v2)   then EvalOrder.BACKWARD;
+                              case EvalOrder.FORWARD      guard(shift_value >= v2)  then EvalOrder.FORWARD;
+                              case EvalOrder.BACKWARD     guard(shift_value <= v2)  then EvalOrder.BACKWARD;
+                              else EvalOrder.FAILED;
+                            end match;
+                          end for;
+                          if eval == EvalOrder.FAILED then break; end if;
+                        else
+                          eval := EvalOrder.FAILED;
+                        end try;
+                        UnorderedMap.add(iter, eval, order);
+                      then ();
+                      else ();
+                    end match;
+                  end if;
+                then ();
+
+                else algorithm
+                  for it in iterators loop
+                    UnorderedMap.add(it, EvalOrder.FAILED, order);
+                  end for;
+                  stop := true;
+                then ();
+              end match;
+              if stop then break; end if;
+            end for;
+          end if;
+        end for;
+      then order;
+      else algorithm
+        order := UnorderedMap.fromLists({ComponentRef.EMPTY()}, {EvalOrder.FAILED}, ComponentRef.hash, ComponentRef.isEqual);
+      then order;
+    end match;
+  end detect;
+
+  function addDimensionParameters
+    "A dimension of a resizable array that is an expression of parameters (N-1,
+    nT+1) gets an Integer parameter $DIM_k with the expression as start value.
+    The init.xml refers to it by value reference like to a plain size parameter,
+    and the generated function updateStructuralParameters computes it from the
+    start values of the other parameters (possibly changed with -override) before
+    the runtime allocates the arrays."
+    input output VarData varData;
+  protected
+    list<Expression> dim_exps = {};
+    list<Pointer<Variable>> dim_params = {};
+    Pointer<Variable> var_ptr;
+    Variable var;
+    ComponentRef cref;
+    Integer idx = 1;
+  algorithm
+    varData := match varData
+      case VarData.VAR_DATA_SIM() algorithm
+        // all lists: e.g. the function alias variables of the initialization are not in variables
+        for v in List.flatten(list(VariablePointers.toList(l) for l in {varData.variables, varData.unknowns,
+            varData.knowns, varData.initials, varData.auxiliaries, varData.aliasVars, varData.nonTrivialAlias})) loop
+          // calculated size parameters (s.N = N) have no start value at runtime
+          Pointer.update(v, Variable.applyToType(Pointer.access(v), function Type.applyToDims(func = resolveSizeParameters)));
+          for dim in Type.arrayDims(Variable.typeOf(Pointer.access(v))) loop
+            dim_exps := match dim
+              case Dimension.RESIZABLE() guard isDimensionExpression(dim.exp) and not List.isMemberOnTrue(dim.exp, dim_exps, Expression.isEqual)
+                then dim.exp :: dim_exps;
+              case Dimension.EXP() guard isDimensionExpression(dim.exp) and not List.isMemberOnTrue(dim.exp, dim_exps, Expression.isEqual)
+                then dim.exp :: dim_exps;
+              else dim_exps;
+            end match;
+          end for;
+        end for;
+        for e in listReverse(dim_exps) loop
+          (var_ptr, cref) := BVariable.makeAuxVar("$DIM", idx, Type.INTEGER(), true);
+          var := BVariable.setStartAttribute(Pointer.access(var_ptr), e, true);
+          Pointer.update(var_ptr, var);
+          dim_params := var_ptr :: dim_params;
+          idx := idx + 1;
+        end for;
+        if not listEmpty(dim_params) then
+          dim_params := listReverse(dim_params);
+          varData.variables := VariablePointers.addList(dim_params, varData.variables);
+          varData.knowns := VariablePointers.addList(dim_params, varData.knowns);
+          varData.resizables := VariablePointers.addList(dim_params, varData.resizables);
+        end if;
+      then varData;
+      else varData;
+    end match;
+  end addDimensionParameters;
+
+  function resolveSizeParameters
+    "replaces Integer parameters with a non-literal binding in a resizable
+    dimension by their binding, e.g. s.N with binding N"
+    input output Dimension dim;
+  algorithm
+    dim := match dim
+      case Dimension.RESIZABLE() algorithm
+        dim.exp := Expression.map(dim.exp, resolveSizeParameter);
+      then dim;
+      else dim;
+    end match;
+  end resolveSizeParameters;
+
+  function resolveSizeParameter
+    input output Expression exp;
+  protected
+    Pointer<Variable> var_ptr;
+    Variable var;
+  algorithm
+    exp := match exp
+      case Expression.CREF(ty = Type.INTEGER()) guard InstNode.isVar(ComponentRef.node(exp.cref)) algorithm
+        var_ptr := BVariable.getVarPointer(exp.cref, sourceInfo());
+        var := Pointer.access(var_ptr);
+      then match Binding.getExpOpt(var.binding)
+        local
+          Expression b;
+        case SOME(b) guard BVariable.isParamOrConst(var_ptr) and not Expression.isLiteral(b)
+          then Expression.map(b, resolveSizeParameter);
+        else exp;
+      end match;
+      else exp;
+    end match;
+  end resolveSizeParameter;
+
+  function isDimensionExpression
+    "true for a dimension that is neither a literal nor a plain parameter"
+    input Expression exp;
+    output Boolean b;
+  algorithm
+    b := match exp
+      case Expression.INTEGER() then false;
+      case Expression.CREF() then false;
+      else not Expression.isLiteral(exp);
+    end match;
+  end isDimensionExpression;
+
+  function orderFailed
+    input EvalOrder eo;
+    output Boolean b = eo == EvalOrder.FAILED;
+  end orderFailed;
+
+  function orderString
+    input EvalOrder eo;
+    output String str;
+  algorithm
+    str := match eo
+      case EvalOrder.INDEPENDENT then "INDEPENDENT";
+      case EvalOrder.FORWARD then "FORWARD";
+      case EvalOrder.BACKWARD then "BACKWARD";
+      else "FAILED";
+    end match;
+  end orderString;
+
+protected
+  type ParameterList = list<ComponentRef>;
+  type ConstraintList = list<Expression>;
+  type Occurences = UnorderedSet<Expression>;
+  constant tuple<ComponentRef, Expression> END_TPL = (ComponentRef.EMPTY(), Expression.END());
+
+  function findOptimalResizableValues
+    input output Equation eqn;
+    input UnorderedSet<ComponentRef> parameters;
+    input UnorderedSet<ComponentRef> min_parameters;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    input UnorderedMap<Expression, ParameterList> c2pi;
+    input UnorderedMap<Expression, ParameterList> c2pe;
+  protected
+    UnorderedMap<ComponentRef, Expression> resizables, replacements;
+    UnorderedMap<ComponentRef, Occurences> occs;
+    UnorderedSet<ComponentRef> constrained_vars = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    Dimension lhs_dim, rhs_dim;
+    Expression const;
+  algorithm
+    if debug then
+      print("[debug] checking equation:\n" + Equation.toString(eqn) + "\n");
+    end if;
+
+    () := match eqn
+      // Main Routine: collect iterators and resizable parameter constraints and target equations
+      case Equation.FOR_EQUATION() algorithm
+        resizables    := getResizableIterators(eqn.iter);
+        replacements  := getVarReplacements(eqn.iter);
+
+        // add all resizable iterators with empty occurence sets to intialize
+        occs := UnorderedMap.new<Occurences>(ComponentRef.hash, ComponentRef.isEqual);
+        for res in UnorderedMap.keyList(resizables) loop
+          UnorderedMap.add(res, UnorderedSet.new(Expression.hash, Expression.isEqual), occs);
+        end for;
+
+        // fill the occurence sets traversing the body of the equation
+        for body in eqn.body loop
+          Equation.map(body, function collectOccurences(occs = occs));
+          // the branches of if-expressions are guarded by their conditions (e.g. x[i + 1] for i < n)
+          Equation.map(body, function collectUnguardedVars(func = BVariable.isArray, collector = constrained_vars), NONE(), Expression.fakeMap);
+        end for;
+        findOptimalValue(eqn, occs, resizables, parameters, min_parameters, optimal_values, c2pi);
+        UnorderedSet.fold(constrained_vars, function addVariableConstraint(eqn = eqn, replacements = SOME(replacements)), c2pi);
+      then ();
+
+      case Equation.ARRAY_EQUATION() algorithm
+        Equation.map(eqn, function collectVars(func = BVariable.isResizable, collector = constrained_vars));
+        UnorderedSet.fold(constrained_vars, function addVariableConstraint(eqn = eqn, replacements = NONE()), c2pi);
+        for tpl in List.zip(Type.arrayDims(Expression.typeOf(eqn.lhs)), Type.arrayDims(Expression.typeOf(eqn.rhs))) loop
+          (lhs_dim, rhs_dim) := tpl;
+          if Dimension.isResizable(lhs_dim) or Dimension.isResizable(rhs_dim) then
+            const := Expression.MULTARY({Dimension.sizeExp(lhs_dim)}, {Dimension.sizeExp(rhs_dim)}, Operator.makeAdd(Type.INTEGER()));
+            try
+              addConstraint(const, NONE(), c2pe, Expression.isZero, "array dimension", "=");
+              Expression.map(const, function collectResizables(collector = parameters));
+            else
+              Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed.\nViolation of implicit constraint `" + Dimension.toString(lhs_dim) + " = " + Dimension.toString(rhs_dim)
+                + "` for LHS and RHS type dimensions in equation:\n" + Equation.toString(eqn)});
+              fail();
+            end try;
+          end if;
+        end for;
+      then ();
+
+      else algorithm
+        // create dummy replacements (no iterators to replace)
+        Equation.map(eqn, function collectVars(func = BVariable.isResizable, collector = constrained_vars));
+        // subs: [n] dim [m] --> m >= n --> implication on split?
+        // subs: [10] dim [m] --> m >= 10 also implication on split values
+        UnorderedSet.fold(constrained_vars, function addVariableConstraint(eqn = eqn, replacements = NONE()), c2pi);
+      then ();
+    end match;
+
+    if debug then
+      print("\n");
+    end if;
+  end findOptimalResizableValues;
+
+  function getResizableIterators
+    input Iterator iter;
+    output UnorderedMap<ComponentRef, Expression> resizables = UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+  protected
+    list<ComponentRef> names;
+    list<Expression> ranges;
+  algorithm
+    (names, ranges) := Iterator.getFrames(iter);
+    for tpl in List.zip(names, ranges) loop
+      if iteratorIsResizable(Util.tuple22(tpl)) then
+        UnorderedMap.add(Util.tuple21(tpl), Util.tuple22(tpl), resizables);
+      end if;
+    end for;
+  end getResizableIterators;
+
+  function getVarReplacements
+    input Iterator iter;
+    output UnorderedMap<ComponentRef, Expression> replacements = UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+  protected
+    list<ComponentRef> names;
+    list<Expression> ranges;
+    ComponentRef name;
+    Expression range, max_call;
+  algorithm
+    (names, ranges) := Iterator.getFrames(iter);
+    for tpl in List.zip(names, ranges) loop
+      (name, range) := tpl;
+      () := match range
+        case Expression.RANGE() algorithm
+          if isSome(range.step) and Expression.isNegative(Util.getOption(range.step)) then
+            UnorderedMap.add(name, range.start, replacements);
+          elseif isNone(range.step) or Expression.isPositive(Util.getOption(range.step)) then
+            UnorderedMap.add(name, range.stop, replacements);
+          else
+            max_call := Expression.CALL(Call.makeTypedCall(
+              fn          = NFBuiltinFuncs.MAX_INT,
+              args        = {range.start, range.stop},
+              variability = Expression.variability(range.start),
+              purity      = NFPrefixes.Purity.PURE
+            ));
+            UnorderedMap.add(name, max_call, replacements);
+          end if;
+        then ();
+        else ();
+      end match;
+    end for;
+  end getVarReplacements;
+
+public
+  function restrictIterator
+    "The iterator restricted to the box of iterations given by flat slice indices
+     at the analysis sizes (zero based, last frame fastest). Positions near the
+     start of a range are counted from its start, positions near its end from
+     its stop, so the restriction holds for every value of the resizable
+     parameters. NONE() if the indices are no box or a bound is ambiguous."
+    input Iterator iter;
+    input list<Integer> indices;
+    output Option<Iterator> res = NONE();
+  protected
+    list<ComponentRef> names;
+    list<Expression> ranges, new_ranges = {};
+    list<Option<Iterator>> maps;
+    array<Integer> sizes, lo, hi;
+    list<Integer> uniq;
+    Integer n, tmp, p, count = 1;
+    Option<Expression> range;
+  algorithm
+    (names, ranges, maps) := Iterator.getFrames(iter);
+    if listEmpty(indices) or List.any(maps, isSome) then
+      return;
+    end if;
+    sizes := listArray(list(Expression.rangeSize(r, true) for r in ranges));
+    n := arrayLength(sizes);
+    lo := arrayCopy(sizes);
+    hi := arrayCreate(n, -1);
+    uniq := UnorderedSet.toList(UnorderedSet.fromList(indices, Util.id, intEq));
+    for idx in uniq loop
+      tmp := idx;
+      for d in n:-1:1 loop
+        p := mod(tmp, sizes[d]);
+        tmp := intDiv(tmp, sizes[d]);
+        lo[d] := intMin(lo[d], p);
+        hi[d] := intMax(hi[d], p);
+      end for;
+      if tmp <> 0 then
+        return;
+      end if;
+    end for;
+    for d in 1:n loop
+      count := count * (hi[d] - lo[d] + 1);
+    end for;
+    if count <> listLength(uniq) then
+      return;
+    end if;
+    for d in 1:n loop
+      range := restrictedRange(listGet(ranges, d), lo[d], hi[d], sizes[d]);
+      if isNone(range) then
+        return;
+      end if;
+      new_ranges := Util.getOption(range) :: new_ranges;
+    end for;
+    res := SOME(Iterator.fromFrames(List.zip3(names, listReverse(new_ranges), maps)));
+  end restrictIterator;
+
+  function sliceAttribute
+    "the attribute of the box elements, e.g. the start values of x[2:N] for $RZ"
+    input output Expression exp;
+    input list<Subscript> subs;
+  protected
+    Integer n = Type.dimensionCount(Expression.typeOf(exp));
+    Call call;
+    list<tuple<InstNode, Expression>> iters = {};
+    list<Subscript> rest;
+    Expression range;
+    Boolean ok = true;
+  algorithm
+    if n == 0 then return; end if;
+    // an attribute with fewer dimensions applies to the trailing ones
+    rest := List.lastN(subs, n);
+    exp := match exp
+      // {e for i in 1:n}[s:t] -> {e for i in s:t}, the last iterator belongs to the first dimension
+      case Expression.CALL(call = call as Call.TYPED_ARRAY_CONSTRUCTOR()) guard(listLength(call.iters) == n) algorithm
+        for tpl in listReverse(call.iters) loop
+          range := match (Util.tuple22(tpl), listHead(rest))
+            local
+              Expression slice;
+            case (_, Subscript.WHOLE()) then Util.tuple22(tpl);
+            case (Expression.RANGE(start = Expression.INTEGER(1), step = NONE()), Subscript.SLICE(slice = slice as Expression.RANGE())) then slice;
+            else algorithm ok := false; then Util.tuple22(tpl);
+          end match;
+          iters := (Util.tuple21(tpl), range) :: iters;
+          rest := listRest(rest);
+        end for;
+        call.iters := iters;
+        call.ty := Type.ARRAY(Type.arrayElementType(call.ty), list(Type.nthDimension(Expression.typeOf(Util.tuple22(t)), 1) for t in listReverse(iters)));
+      then if ok then Expression.CALL(call) else Expression.applySubscripts(List.lastN(subs, n), exp);
+      else Expression.applySubscripts(rest, exp);
+    end match;
+  end sliceAttribute;
+
+  function boxes
+    "splits flat indices (zero based, last dimension fastest) of an array with
+     the given sizes into boxes, ordered by their first index"
+    input list<Integer> indices;
+    input list<Integer> sizes;
+    output list<list<Integer>> parts = {};
+  protected
+    list<list<Integer>> locs;
+  algorithm
+    locs := list(indexLocation(i, sizes) for i in List.sort(UnorderedSet.toList(UnorderedSet.fromList(indices, Util.id, intEq)), intGt));
+    for spec in boxSpecs(locs) loop
+      parts := boxIndices(spec, sizes) :: parts;
+    end for;
+    parts := List.sort(parts, function boxGreater());
+  end boxes;
+
+  function boxGreater
+    input list<Integer> a;
+    input list<Integer> b;
+    output Boolean res = listHead(a) > listHead(b);
+  end boxGreater;
+
+  function indexLocation
+    "zero based location of a flat index, last dimension fastest"
+    input Integer index;
+    input list<Integer> sizes;
+    output list<Integer> loc = {};
+  protected
+    Integer tmp = index;
+  algorithm
+    for s in listReverse(sizes) loop
+      loc := mod(tmp, s) :: loc;
+      tmp := intDiv(tmp, s);
+    end for;
+  end indexLocation;
+
+  function boxSpecs
+    "the locations as boxes of (first, last) per dimension: groups of the first
+     coordinate with equal boxes of the others are merged"
+    input list<list<Integer>> locs;
+    output list<list<tuple<Integer, Integer>>> specs = {};
+  protected
+    type Locations = list<list<Integer>>;
+    UnorderedMap<Integer, Locations> groups = UnorderedMap.new<Locations>(Util.id, intEq);
+    list<Integer> values;
+    list<list<tuple<Integer, Integer>>> sub, prev_sub = {};
+    Integer lo = -1, hi = -1;
+    String key, prev_key = "#none";
+  algorithm
+    if listEmpty(locs) then
+      return;
+    elseif listEmpty(listHead(locs)) then
+      specs := {{}};
+      return;
+    end if;
+    for loc in locs loop
+      UnorderedMap.add(listHead(loc), listRest(loc) :: UnorderedMap.getOrDefault(listHead(loc), groups, {}), groups);
+    end for;
+    values := List.sort(UnorderedMap.keyList(groups), intGt);
+    for v in values loop
+      sub := boxSpecs(listReverse(UnorderedMap.getOrFail(v, groups)));
+      key := specString(sub);
+      if v == hi + 1 and key == prev_key then
+        hi := v;
+      else
+        specs := addSpecs(lo, hi, prev_sub, specs);
+        (lo, hi, prev_sub, prev_key) := (v, v, sub, key);
+      end if;
+    end for;
+    specs := listReverse(addSpecs(lo, hi, prev_sub, specs));
+  end boxSpecs;
+
+  function addSpecs
+    input Integer lo;
+    input Integer hi;
+    input list<list<tuple<Integer, Integer>>> sub;
+    input output list<list<tuple<Integer, Integer>>> specs;
+  algorithm
+    if lo >= 0 then
+      for s in sub loop
+        specs := ((lo, hi) :: s) :: specs;
+      end for;
+    end if;
+  end addSpecs;
+
+  function specString
+    input list<list<tuple<Integer, Integer>>> specs;
+    output String str = stringDelimitList(list(stringDelimitList(list(intString(Util.tuple21(t)) + ":" + intString(Util.tuple22(t)) for t in s), ",") for s in specs), ";");
+  end specString;
+
+  function boxIndices
+    "the flat indices of a box"
+    input list<tuple<Integer, Integer>> spec;
+    input list<Integer> sizes;
+    output list<Integer> indices = {0};
+  protected
+    Integer lo, hi;
+  algorithm
+    for tpl in List.zip(spec, sizes) loop
+      ((lo, hi), _) := tpl;
+      indices := List.flatten(list(list(i * Util.tuple22(tpl) + p for p in lo:hi) for i in indices));
+    end for;
+  end boxIndices;
+
+  function restrictedRange
+    "the positions lo..hi (zero based) of a range with n elements at the analysis sizes"
+    input Expression range;
+    input Integer lo;
+    input Integer hi;
+    input Integer n;
+    output Option<Expression> res = NONE();
+  protected
+    Option<Expression> start, stop;
+    Expression size_exp;
+    Dimension dim;
+  algorithm
+    () := match range
+      case Expression.RANGE() guard isNone(range.step) or Expression.isOne(Util.getOption(range.step)) algorithm
+        if lo == 0 and hi == n - 1 then
+          res := SOME(range);
+          return;
+        end if;
+        start := rangeBound(lo, n, range.start, range.stop);
+        stop := rangeBound(hi, n, range.start, range.stop);
+        if isNone(start) or isNone(stop) then
+          return;
+        end if;
+        size_exp := SimplifyExp.simplify(Expression.MULTARY({Util.getOption(stop), Expression.INTEGER(1)}, {Util.getOption(start)}, Operator.makeAdd(Type.INTEGER())));
+        dim := match Type.nthDimension(range.ty, 1)
+          // the bounds keep their distance to the end they are counted from
+          case dim as Dimension.RESIZABLE()
+          then Dimension.RESIZABLE(originalPosition(hi, n, dim.size) - originalPosition(lo, n, dim.size) + 1, SOME(hi - lo + 1), size_exp, dim.var);
+          else Dimension.fromInteger(hi - lo + 1);
+        end match;
+        res := SOME(Expression.RANGE(Type.ARRAY(Type.INTEGER(), {dim}), Util.getOption(start), NONE(), Util.getOption(stop)));
+      then ();
+      else ();
+    end match;
+  end restrictedRange;
+
+  function originalPosition
+    "position p (zero based) of a range with n elements at the analysis sizes for
+     the original size n_orig, counted from the same end as in rangeBound"
+    input Integer p;
+    input Integer n;
+    input Integer n_orig;
+    output Integer p_orig = if p < n - 1 - p then p else n_orig - n + p;
+  end originalPosition;
+
+  function rangeBound
+    "position p (zero based) of a range with n elements, counted from the nearer end"
+    input Integer p;
+    input Integer n;
+    input Expression start;
+    input Expression stop;
+    output Option<Expression> bound;
+  algorithm
+    if Expression.isInteger(start) and Expression.isInteger(stop) then
+      bound := SOME(Expression.INTEGER(Expression.integerValue(start) + p));
+    elseif p < n - 1 - p then
+      bound := SOME(SimplifyExp.simplify(Expression.MULTARY({start, Expression.INTEGER(p)}, {}, Operator.makeAdd(Type.INTEGER()))));
+    elseif p > n - 1 - p then
+      bound := SOME(SimplifyExp.simplify(Expression.MULTARY({stop}, {Expression.INTEGER(n - 1 - p)}, Operator.makeAdd(Type.INTEGER()))));
+    else
+      bound := NONE();
+    end if;
+  end rangeBound;
+
+protected
+
+  function iteratorIsResizable
+    input Expression range;
+    output Boolean b = Expression.fold(range, expContainsResizable, false);
+  end iteratorIsResizable;
+
+  function expContainsResizable
+    "needs to be mapped with Expression.fold()"
+    input Expression exp;
+    input output Boolean b;
+  algorithm
+    if not b then
+      b := match exp
+        case Expression.CREF() then BVariable.checkCref(exp.cref, BVariable.isResizableParameter, sourceInfo());
+        else false;
+      end match;
+    end if;
+  end expContainsResizable;
+
+  function collectResizables
+    "needs to be mapped with Expression.map()"
+    input output Expression exp;
+    input UnorderedSet<ComponentRef> collector;
+  algorithm
+    () := match exp
+      case Expression.CREF() guard(BVariable.checkCref(exp.cref, BVariable.isResizableParameter, sourceInfo())) algorithm
+        UnorderedSet.add(exp.cref, collector);
+      then ();
+      else ();
+    end match;
+  end collectResizables;
+
+  function collectOccurences
+    input output Expression exp;
+    input UnorderedMap<ComponentRef, Occurences> occs;
+  algorithm
+    () := match exp
+      case Expression.CREF() algorithm
+        ComponentRef.mapSubscripts(exp.cref, function collectOccurencesSubscript(occs = occs));
+      then ();
+      else ();
+    end match;
+  end collectOccurences;
+
+  function collectOccurencesSubscript
+    input output Subscript sub;
+    input UnorderedMap<ComponentRef, Occurences> occs;
+  protected
+    UnorderedSet<ComponentRef> acc = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    Expression subExp;
+  algorithm
+    Subscript.mapExp(sub, function collectOccurencesSubscriptExp(occs = occs, acc = acc));
+    if not UnorderedSet.isEmpty(acc) then
+      subExp := Subscript.toExp(sub);
+      acc := UnorderedSet.selfMap(acc, function addOccurence(subExp = subExp, occs = occs));
+    end if;
+  end collectOccurencesSubscript;
+
+  function collectOccurencesSubscriptExp
+    input output Expression exp;
+    input UnorderedMap<ComponentRef, Occurences> occs;
+    input UnorderedSet<ComponentRef> acc;
+  algorithm
+    () := match exp
+      case Expression.CREF() guard(UnorderedMap.contains(exp.cref, occs)) algorithm
+        UnorderedSet.add(exp.cref, acc);
+      then ();
+      else ();
+    end match;
+  end collectOccurencesSubscriptExp;
+
+  function addOccurence
+    input output ComponentRef iter;
+    input Expression subExp;
+    input UnorderedMap<ComponentRef, Occurences> occs;
+  protected
+    UnorderedSet<Expression> local_occ = UnorderedMap.getSafe(iter, occs, sourceInfo());
+  algorithm
+    UnorderedSet.add(subExp, local_occ);
+  end addOccurence;
+
+  function collectVars
+    input output Expression exp;
+    input BVariable.checkVar func;
+    input UnorderedSet<ComponentRef> collector;
+  algorithm
+    () := match exp
+      case Expression.CREF() guard(func(BVariable.getVarPointer(exp.cref, sourceInfo()))) algorithm
+        UnorderedSet.add(exp.cref, collector);
+      then ();
+      else();
+    end match;
+  end collectVars;
+
+  function collectUnguardedVars
+    "collectVars without the branches of if-expressions"
+    input output Expression exp;
+    input BVariable.checkVar func;
+    input UnorderedSet<ComponentRef> collector;
+  algorithm
+    () := match exp
+      case Expression.IF() algorithm
+        collectUnguardedVars(exp.condition, func, collector);
+      then ();
+      case Expression.CREF() algorithm
+        collectVars(exp, func, collector);
+      then ();
+      else algorithm
+        Expression.mapShallow(exp, function collectUnguardedVars(func = func, collector = collector));
+      then ();
+    end match;
+  end collectUnguardedVars;
+
+  function findOptimalValue
+    input Equation eqn;
+    input UnorderedMap<ComponentRef, Occurences> occs;
+    input UnorderedMap<ComponentRef, Expression> resizables;
+    input UnorderedSet<ComponentRef> parameters;
+    input UnorderedSet<ComponentRef> min_parameters;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    input UnorderedMap<Expression, ParameterList> c2pi;
+  protected
+    Expression range, target;
+    UnorderedSet<ComponentRef> local_parameters;
+    DifferentiationArguments args;
+  algorithm
+    for cref in UnorderedMap.keyList(occs) loop
+      range := UnorderedMap.getSafe(cref, resizables, sourceInfo());
+      Expression.map(range, function collectResizables(collector = parameters));
+      () := match range
+        case Expression.RANGE() algorithm
+          // optimization target function (minimum)
+          // min! f(x) = stop - start
+          target := Expression.MULTARY({range.stop}, {range.start}, Operator.makeAdd(Type.INTEGER()));
+          target := SimplifyExp.simplify(target);
+
+          // collect local parameters and merge with global parameters
+          local_parameters := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+          Expression.map(range, function collectResizables(collector = local_parameters));
+          UnorderedSet.merge(parameters, local_parameters);
+
+          // differentiate the target by all contained parameters to determine initial values
+          args := DifferentiationArguments.simpleCref(cref);
+          local_parameters := UnorderedSet.selfMap(local_parameters, function getInitialValues(target = target, args = args, min_parameters = min_parameters, optimal_values = optimal_values));
+
+          getRangeConstraint(range.start, range.step, range.stop, local_parameters, c2pi, "equation");
+        then ();
+        else ();
+      end match;
+    end for;
+  end findOptimalValue;
+
+  function getRangeConstraint
+    input Expression start;
+    input Option<Expression> step_opt;
+    input Expression stop;
+    input UnorderedSet<ComponentRef> parameters;
+    input UnorderedMap<Expression, ParameterList> c2pi;
+    input String const_kind;
+  protected
+    Expression step, target, distance_const;
+  algorithm
+    step := Util.getOptionOrDefault(step_opt, Expression.INTEGER(1));
+    target := Expression.MULTARY({stop}, {start}, Operator.makeAdd(Type.INTEGER()));
+
+    // the optimal distance constraint
+    // 2 - (stop - start)/start <= 0
+    // ToDo: reduce the constant to 1. current structures do not support size 1 for loops well
+    distance_const := Expression.MULTARY({Expression.INTEGER(2)}, {Expression.MULTARY({target}, {step}, Operator.makeMul(Type.INTEGER()))}, Operator.makeAdd(Type.INTEGER()));
+    distance_const := SimplifyExp.simplify(distance_const);
+    distance_const := SimplifyExp.combineBinaries(distance_const);
+    distance_const := SimplifyExp.simplify(distance_const);
+    UnorderedMap.add(distance_const, UnorderedSet.toList(parameters), c2pi);
+    if debug then
+      print("[debug] adding " + const_kind + " constraint: 0 >= " + Expression.toString(distance_const) + "\n");
+    end if;
+  end getRangeConstraint;
+
+  function getFactor
+    input Expression exp;
+    input DifferentiationArguments args;
+    input Option<Integer> opt_factor;
+    output Integer factor;
+  protected
+    Expression diff;
+  algorithm
+    diff := Differentiate.differentiateExpression(exp, args);
+    diff := SimplifyExp.simplify(diff);
+    factor := Expression.integerValueOrDefault(diff, 0);
+
+    if isSome(opt_factor) and factor <> Util.getOption(opt_factor) then
+      factor := 0;
+    end if;
+  end getFactor;
+
+  function getShift
+    input Expression exp;
+    input ComponentRef cref;
+    output Expression shift;
+  algorithm
+    shift := Replacements.single(exp, Expression.CREF(Type.INTEGER(), cref), Expression.INTEGER(0));
+    shift := SimplifyExp.simplify(shift);
+  end getShift;
+
+  function getDistance
+    input ComponentRef cref;
+    input Expression exp;
+    input DifferentiationArguments args;
+    input output Option<Integer> opt_factor;
+    input output Integer min_distance;
+    input output Integer max_distance;
+  protected
+    Expression shift;
+    Integer factor, distance;
+  algorithm
+    if isNone(opt_factor) or Util.getOption(opt_factor) <> 0 then
+      factor := getFactor(exp, args, opt_factor);
+
+      if factor <> 0 then
+        // if the factor checks out, get shift and update min and max
+        shift := getShift(exp, cref);
+        try
+          // the shift has to be a single integer value
+          Expression.INTEGER(distance) := shift;
+          if isNone(opt_factor) then
+            min_distance := distance;
+            max_distance := distance;
+            opt_factor := SOME(factor);
+          else
+            min_distance := intMin(distance, min_distance);
+            max_distance := intMax(distance, max_distance);
+          end if;
+        else
+          // failed
+          min_distance := 0;
+          max_distance := 0;
+          opt_factor := SOME(0);
+        end try;
+      else
+        // failed
+        min_distance := 0;
+        max_distance := 0;
+        opt_factor := SOME(0);
+      end if;
+    end if;
+  end getDistance;
+
+  function addVariableConstraint
+    input ComponentRef cref;
+    input Equation eqn "for debugging only";
+    input Option<UnorderedMap<ComponentRef, Expression>> replacements;
+    input output UnorderedMap<Expression, ParameterList> c2pi;
+  protected
+    Variable var = Pointer.access(BVariable.getVarPointer(cref, sourceInfo()));
+    list<Dimension> dims = Type.arrayDims(var.ty);
+    list<Subscript> subs = ComponentRef.subscriptsAllWithWholeFlat(cref); // needs list reverse?
+    Dimension dim;
+    Subscript sub;
+    Expression sub_exp, const;
+    Operator op = Operator.makeAdd(Type.INTEGER());
+  algorithm
+    for tpl in List.zip(dims, subs) loop
+      (dim, sub) := tpl;
+      // a whole dimension (x[:]) is within the dimension by definition
+      if not Subscript.isWhole(sub) then
+        sub_exp := Subscript.toExp(sub);
+        const   := Expression.MULTARY({sub_exp}, {Dimension.sizeExp(dim)}, op);
+        try
+          addConstraint(const, replacements, c2pi, Expression.isNonPositive, ComponentRef.toString(cref) + " (variable)", ">=");
+        else
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed.\nViolation of implicit constraint `" + Dimension.toString(dim) + " >= " + Subscript.toString(sub)
+            + "` for component reference `" + ComponentRef.toString(cref) + "` of variable `" + Variable.toString(Pointer.access(BVariable.getVarPointer(cref, sourceInfo()))) + "`\nin equation:\n" + Equation.toString(eqn)});
+          fail();
+        end try;
+      end if;
+      const   := Expression.MULTARY({Expression.INTEGER(1)}, {Dimension.sizeExp(dim)}, op);
+      try
+        addConstraint(const, replacements, c2pi, Expression.isNonPositive, ComponentRef.toString(cref) + " (variable)", ">=");
+      else
+        Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed.\nViolation of implicit constraint `" + Dimension.toString(dim) + " >= 1"
+          + "` for component reference `" + ComponentRef.toString(cref) + "` of variable `" + Variable.toString(Pointer.access(BVariable.getVarPointer(cref, sourceInfo()))) + "`\nin equation:\n" + Equation.toString(eqn)});
+        fail();
+      end try;
+    end for;
+  end addVariableConstraint;
+
+  function addConstraint
+    input Expression old_const;
+    input Option<UnorderedMap<ComponentRef, Expression>> replacements;
+    input UnorderedMap<Expression, ParameterList> c2p;
+    input checkFunc func "checks validity of redundant constraints";
+    input String const_kind "only for debugging: words to describe the kind of constraint";
+    input String eq_kind "only for debugging: in/equality symbols (=, >=, <=, >, <)";
+    partial function checkFunc
+      input Expression exp;
+      output Boolean b;
+    end checkFunc;
+  protected
+    Expression const, diff;
+    UnorderedSet<ComponentRef> parameters;
+    list<ComponentRef> params;
+    Boolean redundant;
+    DifferentiationArguments args;
+    UnorderedMap<ComponentRef, Expression> zero_replacements;
+  algorithm
+    if isSome(replacements) then
+      const := Expression.map(old_const, function Replacements.applySimpleExp(replacements = Util.getOption(replacements)));
+    else
+      const := old_const;
+    end if;
+
+    const := Expression.map(const, function addRangeConstraints(replacements = replacements, c2p = c2p, func = func, const_kind = const_kind, eq_kind = eq_kind));
+
+    parameters := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    Expression.map(const, function collectResizables(collector = parameters));
+    params := UnorderedSet.toList(parameters);
+
+    redundant := true;
+    for p in params loop
+      args := DifferentiationArguments.simpleCref(p);
+      diff := Differentiate.differentiateExpression(const, args);
+      diff := SimplifyExp.simplify(diff);
+      if not Expression.isZero(diff) then
+        redundant := false; break;
+      end if;
+    end for;
+
+    if not redundant then
+      UnorderedMap.add(const, params, c2p);
+    else
+      zero_replacements := UnorderedMap.new<Expression>(ComponentRef.hash, ComponentRef.isEqual);
+      for p in params loop
+        UnorderedMap.add(p, Expression.INTEGER(0), zero_replacements);
+      end for;
+      const := Expression.map(const, function Replacements.applySimpleExp(replacements = zero_replacements));
+      const := SimplifyExp.simplify(const);
+      // Only fail for literals: symbolic CREFs remaining after replacement are inner iterators
+      // (e.g. sum/product) whose bounds are guaranteed by their own range expression.
+      if not func(const) and Expression.isLiteral(const) then fail(); end if;
+    end if;
+
+    if debug then
+      if redundant then
+        print("[debug] not adding redundant " + const_kind + " constraint: 0 " + eq_kind + " " + Expression.toString(old_const) + " simplified to: 0 " + eq_kind + " " + Expression.toString(const) + "\n");
+      else
+        print("[debug] adding " + const_kind + " constraint: 0 " + eq_kind + " " + Expression.toString(old_const) + " simplified to: 0 " + eq_kind + " " + Expression.toString(const) + "\n");
+      end if;
+    end if;
+  end addConstraint;
+
+  function addRangeConstraints
+    input output Expression exp;
+    input Option<UnorderedMap<ComponentRef, Expression>> replacements;
+    input UnorderedMap<Expression, ParameterList> c2p;
+    input checkFunc func "checks validity of redundant constraints";
+    input String const_kind "only for debugging: words to describe the kind of constraint";
+    input String eq_kind "only for debugging: in/equality symbols (=, >=, <=, >, <)";
+    partial function checkFunc
+      input Expression exp;
+      output Boolean b;
+    end checkFunc;
+  protected
+    UnorderedSet<ComponentRef> parameters;
+  algorithm
+    exp := match exp
+      case Expression.RANGE() algorithm
+        // collect local parameters
+        parameters := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+        Expression.map(exp, function collectResizables(collector = parameters));
+        getRangeConstraint(exp.start, exp.step, exp.stop, parameters, c2p, "variable");
+      then Expression.rangeSizeExp(exp);
+      else exp;
+    end match;
+  end addRangeConstraints;
+
+  function getInitialValues
+    input output ComponentRef cref;
+    input Expression target;
+    input DifferentiationArguments args;
+    input UnorderedSet<ComponentRef> min_parameters;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+  protected
+    Expression diff, binding;
+    Variable var;
+  algorithm
+    args.diffCref := cref;
+    diff := Differentiate.differentiateExpression(target, args);
+    diff := SimplifyExp.simplify(diff);
+
+    if Expression.isPositive(diff) then
+      // use min value as initial guess
+      UnorderedSet.add(cref, min_parameters);
+    elseif Expression.isNegative(diff) then
+      // use max value as initial guess
+    else
+      // cannot be determined -> use actual binding value
+      var := Pointer.access(BVariable.getVarPointer(cref, sourceInfo()));
+      binding := Binding.getExp(var.binding);
+      UnorderedMap.add(cref, binding, optimal_values);
+    end if;
+  end getInitialValues;
+
+  function setInitialValues
+    input output ComponentRef cref;
+    input UnorderedSet<ComponentRef> min_parameters;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+  protected
+    Variable var;
+    VariableAttributes attributes;
+    Expression value;
+  algorithm
+    if not UnorderedMap.contains(cref, optimal_values) then
+      var := Pointer.access(BVariable.getVarPointer(cref, sourceInfo()));
+      value := match var
+        case Variable.VARIABLE(backendinfo = BackendInfo.BACKEND_INFO(attributes = attributes as VariableAttributes.VAR_ATTR_INT())) algorithm
+          if UnorderedSet.contains(cref, min_parameters) then
+            if isSome(attributes.min) then
+              value := Binding.getTypedExp(Util.getOption(attributes.min));
+            else
+              value := Expression.INTEGER(0);
+            end if;
+          elseif isSome(attributes.max) then
+            value := Binding.getTypedExp(Util.getOption(attributes.max));
+          else
+            value := Expression.INTEGER(0);
+          end if;
+        then value;
+        else Expression.INTEGER(0);
+      end match;
+      UnorderedMap.add(cref, value, optimal_values);
+    end if;
+  end setInitialValues;
+
+  function invertConstraintParameterMap
+    input UnorderedMap<Expression, ParameterList> c2p;
+    input UnorderedSet<ComponentRef> parameters;
+    output UnorderedMap<ComponentRef, ConstraintList> p2c = UnorderedMap.new<ConstraintList>(ComponentRef.hash, ComponentRef.isEqual);
+  protected
+    Expression const;
+    list<ComponentRef> params;
+  algorithm
+    // initializing map
+    for param in UnorderedSet.toList(parameters) loop
+      UnorderedMap.add(param, {}, p2c);
+    end for;
+
+    // inverting map
+    for tpl in UnorderedMap.toList(c2p) loop
+      (const, params) := tpl;
+      for param in params loop
+        // constraints of single elements (e.g. from expanded connections) may contain parameters that were not collected
+        UnorderedMap.add(param, const :: UnorderedMap.getOrDefault(param, p2c, {}), p2c);
+      end for;
+    end for;
+  end invertConstraintParameterMap;
+
+  function computeOptimalValues
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    input UnorderedMap<Expression, ParameterList> c2pi;
+    input UnorderedMap<ComponentRef, ConstraintList> p2ci;
+    input UnorderedMap<Expression, ParameterList> c2pe;
+    input UnorderedMap<ComponentRef, ConstraintList> p2ce;
+  protected
+    UnorderedSet<ComponentRef> failed_parameters = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+  algorithm
+    if debug then
+      print("FIXING CONSTRAINTS\n\n");
+    end if;
+    fixConstraints(optimal_values, c2pi, p2ci, failed_parameters, function intLe(i2 = 0));
+    fixConstraints(optimal_values, c2pe, p2ce, failed_parameters, function intEq(i2 = 0));
+
+    if debug then
+      print("\n");
+    end if;
+  end computeOptimalValues;
+
+  function fixConstraints
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    input UnorderedMap<Expression, ParameterList> c2p;
+    input UnorderedMap<ComponentRef, ConstraintList> p2c;
+    input UnorderedSet<ComponentRef> failed_parameters;
+    input checkVal func "function to check if constraint is complied with";
+    partial function checkVal
+      input Integer i;
+      output Boolean b;
+    end checkVal;
+  protected
+    UnorderedSet<Expression> parsed_constraints = UnorderedSet.new(Expression.hash, Expression.isEqual);
+    Expression constraint, old_optimal_value;
+    list<ComponentRef> crefs;
+    Equation eqn, solved_eqn;
+    Solve.Status status;
+    Integer value;
+    Boolean failed;
+  algorithm
+    // traversing constraints
+    for tpl in UnorderedMap.toList(c2p) loop
+      (constraint, crefs) := tpl;
+      failed := false;
+      () := match checkConstraint(constraint, optimal_values)
+        // this constraint is not violated
+        case SOME(value) guard(func(value)) algorithm
+          if debug then
+            print(Expression.toString(constraint) + " || is not violated " + intString(value) + "\n");
+          end if;
+        then ();
+
+        // this constraint is violated
+        case SOME(value) algorithm
+          if debug then
+            print(Expression.toString(constraint) + " || is violated by " + intString(value) + "\n");
+          end if;
+          // create artificial equation
+          eqn := Equation.makeAssignmentEqn(constraint, Expression.INTEGER(0), Iterator.EMPTY(), EquationAttributes.default(EquationKind.DISCRETE, false));
+          for cref in crefs loop
+            failed := false;
+            // solve the artificial equation for cref
+            (solved_eqn, status, _) := Solve.solveBody(eqn, cref);
+            if status == NBSolve.Status.EXPLICIT then
+              // try to used solved value as new parameter value to fulfill constraint
+              () := match checkConstraint(Util.getOption(Equation.getRHS(solved_eqn)), optimal_values)
+                case SOME(value) algorithm
+                  // saving previous optimal value and checking new one
+                  old_optimal_value := UnorderedMap.getSafe(cref, optimal_values, sourceInfo());
+                  UnorderedMap.add(cref, Expression.INTEGER(value), optimal_values);
+
+                  // check all constraints of this parameter
+                  for cons in UnorderedMap.getSafe(cref, p2c, sourceInfo()) loop
+                    if UnorderedSet.contains(constraint, parsed_constraints) and not func(Util.getOptionOrDefault(checkConstraint(cons, optimal_values), 1)) then
+                      failed := true;
+                      break;
+                    end if;
+                  end for;
+
+                  // if this parameter would violate any old constraint, use old value and check next parameter
+                  if failed then
+                    UnorderedMap.add(cref, old_optimal_value, optimal_values);
+                  end if;
+                then ();
+                else ();
+              end match;
+            else
+              // if the equation could not be solved, fail
+              failed := true;
+            end if;
+
+            // this constraint has been resolved if one parameter could be adjusted to fulfill it
+            // without breaking other constraints
+            if not failed then
+              UnorderedSet.add(constraint, parsed_constraints); break;
+            end if;
+          end for;
+        then ();
+
+        // this constraint cannot be determined
+        else algorithm
+          for cref in crefs loop
+            UnorderedSet.add(cref, failed_parameters);
+          end for;
+        then ();
+      end match;
+
+      // this constraint cannot be fixed
+      if failed then
+        for cref in crefs loop
+          UnorderedSet.add(cref, failed_parameters);
+        end for;
+      end if;
+    end for;
+  end fixConstraints;
+
+  function checkConstraint
+    input Expression constraint;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    output Option<Integer> value;
+  protected
+    Expression replaced;
+  algorithm
+    replaced := Expression.map(constraint, function Replacements.applySimpleExp(replacements = optimal_values));
+    replaced := SimplifyExp.simplify(replaced);
+    value := match replaced
+      case Expression.INTEGER() then SOME(replaced.value);
+      else NONE();
+    end match;
+  end checkConstraint;
+
+  function updateDimension
+    input output Dimension dim;
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+  algorithm
+    dim := match dim
+      case Dimension.RESIZABLE() algorithm
+        dim.opt_size := checkConstraint(dim.exp, optimal_values);
+      then dim;
+
+      else dim;
+    end match;
+  end updateDimension;
+
+// *****************************
+// DEBUGGING TOSTRING FUNCTIONS
+// *****************************
+
+  function optimalValuesToString
+    "called using -d=dumpResizable"
+    input UnorderedMap<ComponentRef, Expression> optimal_values;
+    input output String str = StringUtil.headline_2("[dumpResizable] Evaluated Optimal Resizable Parameter Values:") + "\n";
+  protected
+    ComponentRef param;
+    Expression value;
+    Variable var;
+    list<String> names = {}, old_vals = {}, new_vals = {};
+    String name, old, new;
+    Integer names_len;
+  algorithm
+    for tpl in UnorderedMap.toList(optimal_values) loop
+      (param, value)  := tpl;
+      var             := Pointer.access(BVariable.getVarPointer(param, sourceInfo()));
+      names           := ComponentRef.toString(param) :: names;
+      new_vals        := Expression.toString(value) :: new_vals;
+      old_vals        := Binding.toString(var.binding) :: old_vals;
+    end for;
+
+    names_len := max(stringLength(n) for n in names);
+
+    while not listEmpty(names) loop
+      name  :: names := names;
+      new   :: new_vals := new_vals;
+      old   :: old_vals := old_vals;
+      str := str + "  " + name + " " + StringUtil.repeat(".", names_len + 5 - stringLength(name)) + " OPTIMAL: " + new + " (ORIGINAL: " + old + ")\n";
+    end while;
+    str := str + "\n";
+  end optimalValuesToString;
+
+  function occurencesToString
+    "helper function for debugging"
+    input UnorderedMap<ComponentRef, Occurences> occs;
+    output String str = "";
+  algorithm
+    for tpl in UnorderedMap.toList(occs) loop
+      str := ComponentRef.toString(Util.tuple21(tpl)) + ": {" + UnorderedSet.toString(Util.tuple22(tpl), Expression.toString, ", ") + "}\n";
+    end for;
+  end occurencesToString;
+
+  function distancesToString
+    "helper function for debugging"
+    input tuple<ComponentRef, Integer> tpl;
+    output String str = ComponentRef.toString(Util.tuple21(tpl)) + ":" + intString(Util.tuple22(tpl));
+  end distancesToString;
+
+  function parametersToString
+    "helper function for debugging"
+    input list<ComponentRef> parameters;
+    output String str = List.toString(parameters, ComponentRef.toString);
+  end parametersToString;
+
+  function constraintsToString
+    "helper function for debugging"
+    input list<Expression> constraints;
+    output String str = List.toString(constraints, Expression.toString);
+  end constraintsToString;
+
+  annotation(__OpenModelica_Interface="nbackend");
+end NBResizable;

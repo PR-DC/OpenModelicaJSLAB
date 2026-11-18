@@ -1,0 +1,259 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+#include <stdexcept>
+#include <ostream>
+
+#include "Util.h"
+#include "Element.h"
+#include "Modifier.h"
+
+using namespace OpenModelica;
+using namespace OpenModelica::Absyn;
+
+constexpr int MOD = 0;
+constexpr int REDECL = 1;
+constexpr int NOMOD = 2;
+
+extern "C" record_description SCode_Mod_MOD__desc;
+extern "C" record_description SCode_Mod_REDECL__desc;
+extern "C" record_description SCode_Mod_NOMOD__desc;
+
+extern "C" record_description SCode_SubMod_NAMEMOD__desc;
+
+std::unique_ptr<Modifier::Base> fromMM(OpenModelica::MetaModelica::Record value)
+{
+  switch (value.index()) {
+    case MOD: return std::make_unique<BindingModifier>(value);
+    case REDECL: return std::make_unique<RedeclareModifier>(value);
+  }
+
+  return nullptr;
+}
+
+Modifier::Modifier(MetaModelica::Record value)
+  : _value{fromMM(value)}
+{
+
+}
+
+Modifier::Modifier(Final finalPrefix, Each eachPrefix, std::vector<SubMod> subMods,
+  std::optional<Expression> binding, const SourceInfo &info) noexcept
+  : _value(std::make_unique<BindingModifier>(finalPrefix, eachPrefix, std::move(subMods), std::move(binding), info))
+{
+
+}
+
+Modifier::Modifier(Final finalPrefix, Each eachPrefix, std::unique_ptr<Element> element) noexcept
+  : _value(std::make_unique<RedeclareModifier>(finalPrefix, eachPrefix, std::move(element)))
+{
+
+}
+
+Modifier::Modifier(const Modifier &other) noexcept
+  : _value{other._value ? other._value->clone() : nullptr}
+{
+
+}
+
+Modifier& Modifier::operator= (const Modifier &other) noexcept
+{
+  _value = other._value ? other._value->clone() : nullptr;
+  return *this;
+}
+
+MetaModelica::Value Modifier::toSCode() const noexcept
+{
+  if (_value) return _value->toSCode();
+  return MetaModelica::Record{NOMOD, SCode_Mod_NOMOD__desc};
+}
+
+bool Modifier::isEmpty() const noexcept
+{
+  return _value == nullptr;
+}
+
+bool Modifier::isFinal() const noexcept
+{
+  return _value ? _value->isFinal() : false;
+}
+
+bool Modifier::isEach() const noexcept
+{
+  return _value ? _value->isEach() : false;
+}
+
+const Expression* Modifier::binding() const noexcept
+{
+  return _value ? _value->binding() : nullptr;
+}
+
+//bool Modifier::hasBooleanNamed(std::string_view name) const
+//{
+//  if (!_value) return false;
+//
+//  auto m = _value->lookupSubMod(name);
+//  auto binding = m ? m->second.binding() : nullptr;
+//
+//  return binding && binding->isTrue();
+//}
+
+void Modifier::print(std::ostream &os, std::string_view name) const noexcept
+{
+  if (_value) {
+    _value->print(os, name);
+  }
+}
+
+BindingModifier::BindingModifier(MetaModelica::Record value)
+  : _final{value[0]},
+    _each{value[1]},
+    _subMods{value[2].mapVector([](MetaModelica::Record v) {
+      return Modifier::SubMod{v[0].toString(), v[1]};
+    })},
+    _binding{value[3].mapOptional<Expression>()},
+    _comment{value[4].toOptional<std::string>()},
+    _info{value[5]}
+{
+
+}
+
+BindingModifier::BindingModifier(Final finalPrefix, Each eachPrefix, std::vector<Modifier::SubMod> subMods,
+  std::optional<Expression> binding, const SourceInfo &info) noexcept
+  : _final(finalPrefix), _each(eachPrefix), _subMods(std::move(subMods)),
+    _binding(std::move(binding)), _info(info)
+{
+}
+
+MetaModelica::Value BindingModifier::toSCode() const noexcept
+{
+  return MetaModelica::Record{MOD, SCode_Mod_MOD__desc, {
+    _final.toSCode(),
+    _each.toSCode(),
+    MetaModelica::List{_subMods, [](const auto &m) {
+      return MetaModelica::Record{0, SCode_SubMod_NAMEMOD__desc, {
+        MetaModelica::Value{m.first},
+        m.second.toSCode()
+      }};
+    }},
+    MetaModelica::Option{_binding, [](const auto &b) { return b.toAbsyn(); }},
+    MetaModelica::Option{_comment},
+    _info
+  }};
+}
+
+const Modifier::SubMod* BindingModifier::lookupSubMod(std::string_view name) const noexcept
+{
+  for (auto &m: _subMods) {
+    if (m.first == name) {
+      return &m;
+    }
+  }
+
+  return nullptr;
+}
+
+std::unique_ptr<Modifier::Base> BindingModifier::clone() const noexcept
+{
+  return std::make_unique<BindingModifier>(*this);
+}
+
+namespace OpenModelica::Absyn
+{
+  std::ostream& operator<< (std::ostream &os, const Modifier::SubMod &submod)
+  {
+    submod.second.print(os, submod.first);
+    return os;
+  }
+}
+
+void BindingModifier::print(std::ostream &os, std::string_view name) const noexcept
+{
+  os << _final.unparse() << _each.unparse() << name;
+
+  if (!_subMods.empty()) {
+    os << '(' << Util::printList(_subMods) << ')';
+  }
+
+  if (_binding) {
+    os << " = ";
+    os << *_binding;
+  }
+}
+
+RedeclareModifier::RedeclareModifier(MetaModelica::Record value)
+  : _final{value[0]},
+    _each{value[1]},
+    _element{Element::fromSCode(value[2])}
+{
+
+}
+
+RedeclareModifier::RedeclareModifier(Final isFinal, Each isEach, std::unique_ptr<Element> element) noexcept
+  : _final(isFinal), _each(isEach), _element(std::move(element))
+{
+
+}
+
+RedeclareModifier::RedeclareModifier(const RedeclareModifier &other) noexcept
+  : _final{other._final}, _each{other._each}, _element{other._element->clone()}
+{
+
+}
+
+MetaModelica::Value RedeclareModifier::toSCode() const noexcept
+{
+  return MetaModelica::Record{REDECL, SCode_Mod_REDECL__desc, {
+    _final.toSCode(),
+    _each.toSCode(),
+    _element->toSCode()
+  }};
+}
+
+std::unique_ptr<Modifier::Base> RedeclareModifier::clone() const noexcept
+{
+  return std::make_unique<RedeclareModifier>(*this);
+}
+
+void RedeclareModifier::print(std::ostream &os, std::string_view) const noexcept
+{
+  _element->print(os, _each);
+}
+
+std::ostream& OpenModelica::Absyn::operator<< (std::ostream &os, const Modifier &modifier) noexcept
+{
+  modifier.print(os);
+  return os;
+}

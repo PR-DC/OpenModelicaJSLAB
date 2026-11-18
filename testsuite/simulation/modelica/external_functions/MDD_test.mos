@@ -1,0 +1,36 @@
+// name:     MDD_test
+// keywords: MDD_test
+// status:   correct
+// teardown_command: rm -rf MDD_test_*
+//
+//  Checks that external object aliases are recognized properly. Otherwise the system has too many equations.
+//
+
+loadModel(Modelica, {"4.1.0"});getErrorString();
+loadModel(Modelica_DeviceDrivers); getErrorString();
+loadFile("MDD_test.mo"); getErrorString();
+buildModel(MDD_test); getErrorString();
+// Result:
+// true
+// ""
+// true
+// "[Modelica_DeviceDrivers 2.2.0/EmbeddedTargets/STM32F4/Functions/HAL.mo:5:3-11:14:writable] Warning: External function annotation should occur on the external-clause, not on the function.
+// [Modelica_DeviceDrivers 2.2.0/Incubate/OperatingSystem/DynamicArray.mo:6:3-94:18:writable] Warning: External function annotation should occur on the external-clause, not on the function.
+// [Modelica_DeviceDrivers 2.2.0/Incubate/Utilities/Functions.mo:1041:3-1062:27:writable] Warning: External function annotation should occur on the external-clause, not on the function.
+// [Modelica_DeviceDrivers 2.2.0/Incubate/Utilities/Functions.mo:1064:3-1092:25:writable] Warning: External function annotation should occur on the external-clause, not on the function.
+// "
+// true
+// ""
+// {"MDD_test", "MDD_test_init.xml"}
+// "[Modelica_DeviceDrivers 2.2.0/Blocks/Packaging/SerialPackager.mo:98:7-105:23:writable] Warning: Pure function 'Modelica_DeviceDrivers.Blocks.Packaging.SerialPackager.Internal.DummyFunctions.resetPointer' contains a call to impure function 'Modelica_DeviceDrivers.Packaging.SerialPackager_.resetPointer'.
+// [Modelica_DeviceDrivers 2.2.0/Blocks/Packaging/SerialPackager.mo:139:5-153:23:writable] Warning: Pure function 'Modelica_DeviceDrivers.Blocks.Packaging.SerialPackager.Internal.DummyFunctions.integerBitPack' contains a call to impure function 'Modelica_DeviceDrivers.Packaging.SerialPackager_.integerBitPack'.
+// [Modelica_DeviceDrivers 2.2.0/Blocks/Packaging/SerialPackager.mo:130:7-137:16:writable] Warning: Pure function 'Modelica_DeviceDrivers.Blocks.Packaging.SerialPackager.Internal.DummyFunctions.clear' contains a call to impure function 'Modelica_DeviceDrivers.Packaging.SerialPackager_.clear'.
+// [Modelica_DeviceDrivers 2.2.0/Blocks/Packaging/SerialPackager.mo:107:7-117:21:writable] Warning: Pure function 'Modelica_DeviceDrivers.Blocks.Packaging.SerialPackager.Internal.DummyFunctions.getInteger' contains a call to impure function 'Modelica_DeviceDrivers.Packaging.SerialPackager_.getInteger'.
+// Warning: Alias equations of external objects are not Modelica compliant as in:
+//     packInt.pkgOut[1].pkg = packInt.pkgIn.pkg
+//     resetPointer.pkgOut[1].pkg = resetPointer.pkgIn.pkg
+//     resetPointer.pkgOut[1].pkg = getInteger.pkgIn.pkg
+//     packInt.pkgOut[1].pkg = resetPointer.pkgIn.pkg
+//     packager.pkgOut.pkg = packInt.pkgIn.pkg
+// "
+// endResult

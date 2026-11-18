@@ -1,0 +1,1628 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NBPartitioning
+"file:        NBPartitioning.mo
+ package:     NBPartitioning
+ description: This file contains the functions for the partitioning module.
+"
+
+public
+  import Module = NBModule;
+
+protected
+  // NF
+  import NFBackendExtension.{BackendInfo, VariableKind};
+  import Call = NFCall;
+  import ClockKind = NFClockKind;
+  import ComponentRef = NFComponentRef;
+  import Expression = NFExpression;
+  import NFFunction.Function;
+  import Subscript = NFSubscript;
+  import Type = NFType;
+  import Variable = NFVariable;
+
+  // Backend
+  import Adjacency = NBAdjacency;
+  import BackendDAE = NBackendDAE;
+  import Causalize = NBCausalize;
+  import BEquation = NBEquation;
+  import Events = NBEvents;
+  import NBEquation.{Equation, EquationPointer, EquationPointers, EqData, EquationKind, WhenEquationBody, WhenStatement};
+  import Matching = NBMatching;
+  import Slice = NBSlice;
+  import Sorting = NBSorting;
+  import StrongComponent = NBStrongComponent;
+  import Partition = NBPartition;
+  import BVariable = NBVariable;
+  import NBVariable.{VariablePointer, VariablePointers, VarData};
+
+  // Util
+  import MetaModelica.Dangerous;
+  import Array;
+  import DoubleEnded;
+  import Graph;
+  import List;
+  import Rational;
+  import NBBackendUtil;
+  import PointerWeak;
+  import UnorderedMap;
+  import UnorderedSet;
+  import Util;
+
+  // Old imports
+  import OldDAE = DAE;
+  import OldBackendDAE = BackendDAE;
+
+public
+  uniontype BClock
+    record BASE_CLOCK
+      ClockKind clock;
+    end BASE_CLOCK;
+
+    record SUB_CLOCK
+      Rational factor;
+      Rational shift;
+      Option<String> solver;
+    end SUB_CLOCK;
+
+    record INFERRED_CLOCK
+      ComponentRef base_ref;
+    end INFERRED_CLOCK;
+
+    function toString
+      input BClock clock;
+      output String str;
+    algorithm
+    str := match clock
+      case BASE_CLOCK()     then ClockKind.toDebugString(clock.clock);
+      case SUB_CLOCK()      then "SUB_CLOCK(" + Rational.toString(clock.factor) + ", " + Rational.toString(clock.shift) + ")";
+      case INFERRED_CLOCK() then "INFERRED_CLOCK(" + ComponentRef.toString(clock.base_ref) + ")";
+                            else "UNKNOWN_CLOCK()";
+      end match;
+    end toString;
+
+    function hash
+      input BClock clock;
+      output Integer i = stringHashDjb2(toString(clock));
+    end hash;
+
+    function isEqual
+      input BClock clock1;
+      input BClock clock2;
+      output Boolean b;
+    algorithm
+      b := match (clock1, clock2)
+        case (BASE_CLOCK(), BASE_CLOCK())         then ClockKind.compare(clock1.clock, clock2.clock) == 0;
+        case (SUB_CLOCK(), SUB_CLOCK())           then Rational.isEqual(clock1.factor, clock2.factor) and Rational.isEqual(clock1.shift, clock2.shift) and Util.optionEqual(clock1.solver, clock2.solver, stringEq);
+        case (INFERRED_CLOCK(), INFERRED_CLOCK()) then ComponentRef.isEqual(clock1.base_ref, clock2.base_ref);
+        else false;
+      end match;
+    end isEqual;
+
+    function add
+      input Equation eqn;
+      input ClockedInfo info;
+    algorithm
+      () := match (Equation.getLHS(eqn), Equation.getRHS(eqn))
+        local
+          ComponentRef clock_name;
+          Expression exp;
+
+        case (SOME(Expression.CREF(cref = clock_name)), SOME(exp))
+        guard(Expression.isClockOrSampleFunction(exp)) algorithm
+          create(clock_name, exp, info);
+        then ();
+
+        case (SOME(exp), SOME(Expression.CREF(cref = clock_name)))
+        guard(Expression.isClockOrSampleFunction(exp)) algorithm
+          create(clock_name, exp, info);
+        then ();
+
+        else ();
+      end match;
+    end add;
+
+    function isBaseClock
+      input BClock clock;
+      output Boolean b;
+    algorithm
+      b := match clock case BASE_CLOCK() then true; else false; end match;
+    end isBaseClock;
+
+    function isInferredClock
+      input BClock clock;
+      output Boolean b;
+    algorithm
+      b := match clock
+        case BASE_CLOCK(clock = ClockKind.INFERRED_CLOCK()) then true;
+        case INFERRED_CLOCK() then true;
+        else false;
+      end match;
+    end isInferredClock;
+
+    function isEventClock
+      input BClock clock;
+      output Boolean b;
+    algorithm
+      b := match clock case BASE_CLOCK(clock = ClockKind.EVENT_CLOCK()) then true; else false; end match;
+    end isEventClock;
+
+    function baseClockInferrence
+      input output BClock clock;
+      input UnorderedMap<ComponentRef, BClock> base_clock_inferrence;
+    algorithm
+      clock := match clock
+        local
+          BClock base_clock;
+        case INFERRED_CLOCK() algorithm
+          base_clock := UnorderedMap.getSafe(clock.base_ref, base_clock_inferrence, sourceInfo());
+        then baseClockInferrence(base_clock, base_clock_inferrence);
+        case BClock.BASE_CLOCK(clock = ClockKind.INFERRED_CLOCK()) then DEFAULT_BASE_CLOCK;
+        else clock;
+      end match;
+    end baseClockInferrence;
+
+    function convertBase
+      input BClock clock;
+      output OldDAE.ClockKind oldClock;
+    algorithm
+      oldClock := match clock
+        case BASE_CLOCK() then ClockKind.toDAE(clock.clock);
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for non-base clock: " + toString(clock)});
+        then fail();
+      end match;
+    end convertBase;
+
+    function convertSub
+      input BClock clock;
+      output OldBackendDAE.SubClock oldClock;
+    algorithm
+      oldClock := match clock
+        case SUB_CLOCK() then OldBackendDAE.SUBCLOCK(
+          factor  = NBBackendUtil.convertRational(clock.factor),
+          shift   = NBBackendUtil.convertRational(clock.shift),
+          solver  = clock.solver);
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for non-sub clock: " + toString(clock)});
+        then fail();
+      end match;
+    end convertSub;
+
+    function toExp
+      input BClock clock;
+      output Expression exp;
+    algorithm
+      exp := match clock
+        case BASE_CLOCK() then Expression.CLKCONST(clock.clock);
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for non-base clock: " + toString(clock)});
+        then fail();
+      end match;
+    end toExp;
+
+  protected
+    function create
+      input ComponentRef clock_name;
+      input Expression exp;
+      input ClockedInfo info;
+    protected
+      BClock clock;
+      Option<ComponentRef> baseClock;
+      Pointer<Variable> clock_var;
+    algorithm
+      try
+        // parse the clock and see if it depends on another clock
+        (clock, baseClock) := fromExp(exp);
+        if isSome(baseClock) then
+          // sub clock
+          UnorderedMap.add(clock_name, clock, info.subClocks);
+          UnorderedMap.add(clock_name, Util.getOption(baseClock), info.subToBase);
+        else
+          // base clock
+          UnorderedMap.add(clock_name, clock, info.baseClocks);
+        end if;
+
+        // if this is from the equation block and not from variable binding, the variable needs to updated
+        // such that the clock can be found for the partitioning clocked association
+        clock_var := BVariable.getVarPointer(clock_name, sourceInfo());
+        if not BVariable.isClockOrClocked(clock_var) then
+          BVariable.setVarKind(clock_var, VariableKind.CLOCKED());
+        end if;
+      else
+        Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for " + ComponentRef.toString(clock_name) + "."});
+        fail();
+      end try;
+    end create;
+
+    function fromExp
+      input Expression exp;
+      output BClock subClock;
+      output Option<ComponentRef> baseClock;
+    algorithm
+      (subClock, baseClock) := match exp
+        local
+          Call call;
+
+        case Expression.CLKCONST() algorithm
+        then (BASE_CLOCK(exp.clk), NONE());
+
+        case Expression.CREF() algorithm
+        then (DEFAULT_SUB_CLOCK, SOME(exp.cref));
+
+        case Expression.CALL(call = call as Call.TYPED_CALL()) algorithm
+          (baseClock, subClock) := match (AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)), Call.arguments(call))
+            local
+              Expression e;
+              Integer i1, i2;
+
+            // sample: default subclock sampling
+            case ("sample", {_, e}) algorithm
+              (subClock, baseClock) := fromExp(e);
+            then (baseClock, subClock);
+
+            // subclock: subset sampling
+            case ("subSample", {e, Expression.INTEGER(i1)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.RATIONAL(i1, 1), Rational.ZERO, NONE()));
+            then (baseClock, subClock);
+
+            // subclock: super sampling
+            case ("superSample", {e, Expression.INTEGER(i1)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.RATIONAL(1, i1), Rational.ZERO, NONE()));
+            then (baseClock, subClock);
+
+            // subclock: shift sampling (default 3rd argument = 1)
+            case ("shiftSample", {e, Expression.INTEGER(i1)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.ONE, Rational.RATIONAL(i1, 1), NONE()));
+            then (baseClock, subClock);
+
+            // subclock: shift sampling
+            case ("shiftSample", {e, Expression.INTEGER(i1), Expression.INTEGER(i2)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.ONE, Rational.RATIONAL(i1, i2), NONE()));
+            then (baseClock, subClock);
+
+            // subclock: back sampling (default 3rd argument = 1)
+            case ("backSample", {e, Expression.INTEGER(i1)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.ONE, Rational.RATIONAL(-i1, 1), NONE()));
+            then (baseClock, subClock);
+
+            // subclock: back sampling
+            case ("backSample", {e, Expression.INTEGER(i1), Expression.INTEGER(i2)}) algorithm
+              (subClock, baseClock) := fromExp(e);
+              subClock := updateSubClock(subClock, SUB_CLOCK(Rational.ONE, Rational.RATIONAL(-i1, i2), NONE()));
+            then (baseClock, subClock);
+
+            else algorithm
+              Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for exp with unhandled call: " + Expression.toString(exp) + "."});
+            then fail();
+          end match;
+        then (subClock, baseClock);
+
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for exp with unhandled expression kind: " + Expression.toString(exp) + "."});
+        then fail();
+      end match;
+    end fromExp;
+
+  public
+    function updateSubClock
+      "adding the sub clock src to the sub clock dest. not symmetrical/commutative"
+      input output BClock dest;
+      input BClock src;
+    algorithm
+      dest := match (dest, src)
+        case (SUB_CLOCK(), SUB_CLOCK()) algorithm
+          dest.shift  := Rational.add(dest.shift, Rational.mul(src.shift, dest.factor));
+          dest.factor := Rational.mul(dest.factor, src.factor);
+        then dest;
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for " + toString(dest) + " and " + toString(src) + " because of incorrect clock types."});
+        then fail();
+      end match;
+    end updateSubClock;
+  end BClock;
+
+  constant BClock DEFAULT_BASE_CLOCK = BASE_CLOCK(ClockKind.REAL_CLOCK(Expression.REAL(1.0)));
+  constant BClock DEFAULT_SUB_CLOCK = SUB_CLOCK(Rational.ONE, Rational.ZERO, NONE());
+  type CrefLst = list<ComponentRef>;
+
+  uniontype ClockedInfo
+    record CLOCKED_INFO
+      UnorderedMap<ComponentRef, BClock> baseClocks;
+      UnorderedMap<ComponentRef, BClock> subClocks;
+      UnorderedMap<ComponentRef, ComponentRef> subToBase;
+      UnorderedMap<ComponentRef, CrefLst> baseToSub;
+    end CLOCKED_INFO;
+
+    function new
+      output ClockedInfo info = CLOCKED_INFO(
+        baseClocks  = UnorderedMap.new<BClock>(ComponentRef.hash, ComponentRef.isEqual),
+        subClocks   = UnorderedMap.new<BClock>(ComponentRef.hash, ComponentRef.isEqual),
+        subToBase   = UnorderedMap.new<ComponentRef>(ComponentRef.hash, ComponentRef.isEqual),
+        baseToSub   = UnorderedMap.new<CrefLst>(ComponentRef.hash, ComponentRef.isEqual));
+    end new;
+
+    function toString
+      input ClockedInfo info;
+      output String str = "";
+    algorithm
+      if not isEmpty(info) then
+        str := StringUtil.headline_2("Clocked Info") + "\n";
+        str := str + StringUtil.headline_3("Base Clocks") + UnorderedMap.toString(info.baseClocks, ComponentRef.toString, BClock.toString) + "\n\n";
+        str := str + StringUtil.headline_3("Sub Clocks") + UnorderedMap.toString(info.subClocks, ComponentRef.toString, BClock.toString) + "\n\n";
+        str := str + StringUtil.headline_3("Sub to Base Clocks") + UnorderedMap.toString(info.subToBase, ComponentRef.toString, ComponentRef.toString) + "\n\n";
+        str := str + StringUtil.headline_3("Base to Sub Clocks") + UnorderedMap.toString(info.baseToSub, ComponentRef.toString, ComponentRef.listToString) + "\n";
+      end if;
+    end toString;
+
+    function isEmpty
+      input ClockedInfo info;
+      output Boolean b = UnorderedMap.isEmpty(info.baseClocks);
+    end isEmpty;
+
+    function resolveSubClocks
+      input ClockedInfo info;
+      input UnorderedMap<ComponentRef, ComponentRef> clock_map;
+    algorithm
+      // resolve the implicit clock map
+      for cref in UnorderedMap.keyList(clock_map) loop
+        resolveImplicitSubClock(cref, info, clock_map);
+      end for;
+
+      // update sub to base clock
+      for sub_clock in UnorderedMap.keyList(info.subClocks) loop
+        resolveSubClock(sub_clock, info, clock_map);
+      end for;
+
+      // update base to sub clocks
+      for sub_clock in UnorderedMap.keyList(info.subClocks) loop
+        addSubClock(sub_clock, info);
+      end for;
+    end resolveSubClocks;
+
+    function baseClockCount
+      input ClockedInfo info;
+      input Boolean countInferred = false;
+      output Integer count = UnorderedMap.size(info.baseClocks);
+    algorithm
+      if not countInferred then
+        count := count - List.count(UnorderedMap.valueList(info.baseClocks), BClock.isInferredClock);
+      end if;
+    end baseClockCount;
+
+    function subClockCount
+      input ClockedInfo info;
+      output Integer count = UnorderedMap.size(info.subClocks);
+    end subClockCount;
+
+  protected
+    function resolveImplicitSubClock
+      "implicite sub clocks are signals that are clocked but not defined by a sampling function themselves.
+      they infer their clock by the partition they are in. this function resolves each implicit clock to it's
+      root clock that has a sample function definition"
+      input ComponentRef key;
+      input ClockedInfo info;
+      input UnorderedMap<ComponentRef, ComponentRef> clock_map;
+      output ComponentRef clock = key;
+    algorithm
+      if UnorderedMap.contains(key, clock_map) then
+        clock := UnorderedMap.getSafe(key, clock_map, sourceInfo());
+        if not (UnorderedMap.contains(clock, info.subClocks) or UnorderedMap.contains(clock, info.baseClocks)) then
+          clock := resolveImplicitSubClock(clock, info, clock_map);
+          UnorderedMap.add(key, clock, clock_map);
+        end if;
+      end if;
+    end resolveImplicitSubClock;
+
+    function resolveSubClock
+      input ComponentRef clock_name;
+      input ClockedInfo info;
+      input UnorderedMap<ComponentRef, ComponentRef> clock_map;
+      output ComponentRef base_clock;
+    protected
+      ComponentRef implicit_clock, parent_clock = UnorderedMap.getSafe(clock_name, info.subToBase, sourceInfo());
+      Option<ComponentRef> implicit_clock_opt = NONE();
+      BClock dest, src;
+    algorithm
+      if UnorderedMap.contains(parent_clock, info.baseClocks) then
+        // just a base clock
+        base_clock := parent_clock;
+      else
+        // not a base, update necessary
+        if not UnorderedMap.contains(parent_clock, info.subClocks) then
+          // neither base nor sub clock --> implicit clock. map it
+          implicit_clock_opt := SOME(parent_clock);
+          parent_clock := UnorderedMap.getSafe(parent_clock, clock_map, sourceInfo());
+        end if;
+        base_clock := resolveSubClock(parent_clock, info, clock_map);
+
+        // update the sub clock and add the new base clock
+        dest  := UnorderedMap.getSafe(parent_clock, info.subClocks, sourceInfo());
+        src   := UnorderedMap.getSafe(clock_name, info.subClocks, sourceInfo());
+        UnorderedMap.add(clock_name, BClock.updateSubClock(dest, src), info.subClocks);
+        UnorderedMap.add(clock_name, base_clock, info.subToBase);
+
+        // also update and add the implicit clock
+        if isSome(implicit_clock_opt) then
+          SOME(implicit_clock) := implicit_clock_opt;
+          // add the implicit clock as a sub clock
+          UnorderedMap.add(implicit_clock, dest, info.subClocks);
+          UnorderedMap.add(implicit_clock, base_clock, info.subToBase);
+        end if;
+      end if;
+    end resolveSubClock;
+
+    function addSubClock
+      input ComponentRef clock_name;
+      input ClockedInfo info;
+    protected
+      ComponentRef base_clock = UnorderedMap.getSafe(clock_name, info.subToBase, sourceInfo());
+      List<ComponentRef> current_clocks;
+    algorithm
+      current_clocks := UnorderedMap.getOrDefault(base_clock, info.baseToSub, {});
+      UnorderedMap.add(base_clock, clock_name :: current_clocks, info.baseToSub);
+    end addSubClock;
+  end ClockedInfo;
+
+// =========================================================================
+//                      MAIN ROUTINE, PLEASE DO NOT CHANGE
+// =========================================================================
+  function main
+    "Wrapper function for any partitioning function. This will be
+     called during simulation and gets the corresponding subfunction from
+     Config."
+    extends Module.wrapper;
+    input Partition.Kind kind;
+  protected
+    Module.partitioningInterface func;
+  algorithm
+    func := getModule();
+
+    bdae := match (kind, bdae)
+      local
+        VariablePointers variables, clocks;
+        EquationPointers equations, clocked;
+
+      case (NBPartition.Kind.ODE, BackendDAE.MAIN(
+        varData = BVariable.VAR_DATA_SIM(unknowns = variables, clocks = clocks),
+        eqData = BEquation.EQ_DATA_SIM(simulation = equations, clocked = clocked)))
+      algorithm
+        bdae.ode := func(kind, variables, equations, clocks, clocked, bdae.clockedInfo);
+        bdae.ode := list(sys for sys guard(not Partition.Partition.isEmpty(sys)) in bdae.ode);
+        // remove all inferred clocks from discrete vars and equations after partitioning
+        bdae.varData  := VarData.removeTypedCheck(bdae.varData, BVariable.isClock, VarData.VarType.DISCRETE);
+        bdae.eqData   := EqData.removeTypedCheck(bdae.eqData, Equation.isTypeClock, EqData.EqType.DISCRETE);
+      then bdae;
+
+      case (_, BackendDAE.MAIN(
+        varData = BVariable.VAR_DATA_SIM(initials = variables, clocks = clocks),
+        eqData = BEquation.EQ_DATA_SIM(initials = equations, clocked = clocked)))
+        guard(Partition.kindIsInitial(kind))
+      algorithm
+        bdae.init := partitioningNone(kind, variables, equations, clocks, clocked, bdae.clockedInfo);
+        bdae.init := list(sys for sys guard(not Partition.Partition.isEmpty(sys)) in bdae.init);
+      then bdae;
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+      then fail();
+    end match;
+  end main;
+
+  function getModule
+    "Returns the module function that was chosen by the user."
+    output Module.partitioningInterface func;
+  protected
+    String flag = "clocked"; //Flags.getConfigString(Flags.PARTITIONING)
+  algorithm
+    func := match flag
+      case "default"  then (partitioningClocked);
+      case "clocked"  then (partitioningClocked);
+      case "none"     then (partitioningNone);
+      /* ... New detect states modules have to be added here */
+      else fail();
+    end match;
+  end getModule;
+
+  function categorize
+    "creates ODE, ALG, ODE_EVT, ALG_EVT partitions from ODE by checking
+    if it contains discrete equations or state equations.
+    Should be evoked just before jacobian at the very end."
+    extends Module.wrapper;
+  algorithm
+    bdae := match bdae
+      local
+        DoubleEnded.MutableList<Partition.Partition> ode = DoubleEnded.MutableList.fromList({});
+        DoubleEnded.MutableList<Partition.Partition> alg = DoubleEnded.MutableList.fromList({});
+        DoubleEnded.MutableList<Partition.Partition> ode_evt = DoubleEnded.MutableList.fromList({});
+        DoubleEnded.MutableList<Partition.Partition> alg_evt = DoubleEnded.MutableList.fromList({});
+        DoubleEnded.MutableList<Partition.Partition> clocked = DoubleEnded.MutableList.fromList({});
+        UnorderedSet<ComponentRef> event_crefs;
+
+      case BackendDAE.MAIN() algorithm
+        event_crefs := eventCrefs(bdae.eventInfo);
+        for part in bdae.ode loop
+          EquationPointers.mapExp(part.equations, function collectDelayCrefs(crefs = event_crefs));
+        end for;
+        for syst in List.flatten(list(splitAlgebraic(p, event_crefs) for p in bdae.ode)) loop
+          Partition.Partition.categorize(syst, ode, alg, ode_evt, alg_evt, clocked);
+        end for;
+        bdae.ode := DoubleEnded.MutableList.toListAndClear(ode);
+        bdae.algebraic := DoubleEnded.MutableList.toListAndClear(alg);
+        bdae.ode_event := DoubleEnded.MutableList.toListAndClear(ode_evt);
+        bdae.alg_event := DoubleEnded.MutableList.toListAndClear(alg_evt);
+        bdae.clocked := DoubleEnded.MutableList.toListAndClear(clocked);
+      then bdae;
+
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed."});
+      then fail();
+    end match;
+  end categorize;
+
+  function splitAlgebraic
+    "splits the strong components of a continuous partition that no state derivative,
+    discrete variable or event depends on into an algebraic partition. they are only
+    needed for the output and not evaluated with the ode."
+    input Partition.Partition part;
+    input UnorderedSet<ComponentRef> event_crefs;
+    output list<Partition.Partition> parts = {part};
+  protected
+    array<StrongComponent> comps;
+    Integer n;
+    UnorderedMap<ComponentRef, Slice.IntLst> solved = UnorderedMap.new<Slice.IntLst>(ComponentRef.hash, ComponentRef.isEqual);
+    UnorderedMap<ComponentRef, Slice.IntLst> solved_elements = UnorderedMap.new<Slice.IntLst>(ComponentRef.hash, ComponentRef.isEqual);
+    UnorderedSet<ComponentRef> deps, alg_vars, alg_eqns;
+    array<tuple<Integer, list<Integer>>> graph;
+    list<Integer> seeds = {}, solving;
+    array<Boolean> needed;
+    ComponentRef name;
+    Boolean has_der = false;
+    Partition.Partition ode_part, alg_part;
+  algorithm
+    if Partition.Partition.isClocked(part) or isSome(part.daeUnknowns) or isNone(part.strongComponents) then
+      return;
+    end if;
+    SOME(comps) := part.strongComponents;
+    n := arrayLength(comps);
+
+    // the components that solve a variable, seeded by state derivatives, discrete and event variables
+    for i in 1:n loop
+      for cref in StrongComponent.getVariableCrefs(comps[i]) loop
+        if hasLiteralSubscripts(cref) then
+          UnorderedMap.add(cref, i :: UnorderedMap.getOrDefault(cref, solved_elements, {}), solved_elements);
+        end if;
+      end for;
+      for var in StrongComponent.getVariables(comps[i]) loop
+        name := ComponentRef.stripSubscriptsAll(BVariable.getVarName(var));
+        UnorderedMap.add(name, i :: UnorderedMap.getOrDefault(name, solved, {}), solved);
+        has_der := has_der or BVariable.isStateDerivative(var);
+        if BVariable.isStateDerivative(var) or BVariable.isDiscrete(var) or UnorderedSet.contains(name, event_crefs) then
+          seeds := i :: seeds;
+        end if;
+      end for;
+    end for;
+
+    // edges to the components a component depends on
+    graph := arrayCreate(n, (0, {}));
+    for i in 1:n loop
+      deps := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+      for eqn in componentEquations(comps[i]) loop
+        Equation.map(Pointer.access(eqn), function collectPartitioningCrefs(var_crefs = deps, strip = false), NONE(), Expression.fakeMap);
+      end for;
+      graph[i] := (i, List.flatten(list(solvingComponents(d, solved_elements, solved) for d in UnorderedSet.toList(deps))));
+    end for;
+
+    // the partitions get whole variables, all components solving elements of a needed variable are needed
+    needed := arrayCreate(n, false);
+    while not listEmpty(seeds) loop
+      for i in Graph.allReachableNodesInt((seeds, {}), graph, n + 1, n) loop
+        needed[i] := true;
+      end for;
+      seeds := {};
+      for i in 1:n loop
+        if needed[i] then
+          for var in StrongComponent.getVariables(comps[i]) loop
+            solving := UnorderedMap.getOrDefault(ComponentRef.stripSubscriptsAll(BVariable.getVarName(var)), solved, {});
+            for j in solving loop
+              if not needed[j] then
+                seeds := j :: seeds;
+              end if;
+            end for;
+          end for;
+        end if;
+      end for;
+    end while;
+    if not has_der or Array.all(needed, Util.id) then
+      return;
+    end if;
+
+    alg_vars := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    alg_eqns := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    for i in 1:n loop
+      if not needed[i] then
+        for var in StrongComponent.getVariables(comps[i]) loop
+          UnorderedSet.add(BVariable.getVarName(var), alg_vars);
+        end for;
+        for eqn in componentEquations(comps[i]) loop
+          UnorderedSet.add(Equation.getEqnName(eqn), alg_eqns);
+        end for;
+      end if;
+    end for;
+
+    ode_part := part;
+    ode_part.strongComponents := SOME(listArray(list(comps[i] for i guard(needed[i]) in 1:n)));
+    ode_part.unknowns := VariablePointers.fromList(list(v for v guard(not UnorderedSet.contains(BVariable.getVarName(v), alg_vars)) in VariablePointers.toList(part.unknowns)), part.unknowns.scalarized);
+    ode_part.equations := EquationPointers.fromList(list(e for e guard(not UnorderedSet.contains(Equation.getEqnName(e), alg_eqns)) in EquationPointers.toList(part.equations)));
+    alg_part := part;
+    alg_part.strongComponents := SOME(listArray(list(comps[i] for i guard(not needed[i]) in 1:n)));
+    alg_part.unknowns := VariablePointers.fromList(list(v for v guard(UnorderedSet.contains(BVariable.getVarName(v), alg_vars)) in VariablePointers.toList(part.unknowns)), part.unknowns.scalarized);
+    alg_part.equations := EquationPointers.fromList(list(e for e guard(UnorderedSet.contains(Equation.getEqnName(e), alg_eqns)) in EquationPointers.toList(part.equations)));
+    parts := {ode_part, alg_part};
+  end splitAlgebraic;
+
+  function componentEquations
+    "all equations of a strong component, also the inner equations of algebraic loops"
+    input StrongComponent comp;
+    output list<Pointer<Equation>> eqns;
+  algorithm
+    eqns := match comp
+      case StrongComponent.ALGEBRAIC_LOOP() then listAppend(StrongComponent.getEquations(comp),
+        List.flatten(list(componentEquations(c) for c in comp.strict.innerEquations)));
+      else StrongComponent.getEquations(comp);
+    end match;
+  end componentEquations;
+
+  function eventCrefs
+    "the variables zero crossings and event conditions depend on"
+    input Events.EventInfo eventInfo;
+    output UnorderedSet<ComponentRef> crefs = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+  algorithm
+    () := match eventInfo
+      case Events.EventInfo.EVENT_INFO() algorithm
+        for cond in listAppend(UnorderedMap.keyList(eventInfo.time_map), UnorderedMap.keyList(eventInfo.state_map)) loop
+          collectPartitioningCrefs(cond.exp, crefs);
+        end for;
+        for sev in UnorderedMap.valueList(eventInfo.state_map) loop
+          UnorderedSet.add(BVariable.getVarName(sev.auxiliary), crefs);
+        end for;
+        for mev in eventInfo.math_lst loop
+          collectPartitioningCrefs(mev.exp, crefs);
+        end for;
+        for sd in eventInfo.spatial_lst loop
+          for exp in {sd.in0, sd.in1, sd.pos, sd.dir} loop
+            collectPartitioningCrefs(exp, crefs);
+          end for;
+        end for;
+      then ();
+      else ();
+    end match;
+  end eventCrefs;
+
+  function collectDelayCrefs
+    "the variables of delay() calls, their buffers are filled after every step"
+    input output Expression exp;
+    input UnorderedSet<ComponentRef> crefs;
+  algorithm
+    () := match exp
+      local
+        Call call;
+      case Expression.CALL(call = call as Call.TYPED_CALL())
+        guard(AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn)) == "delay") algorithm
+        collectPartitioningCrefs(exp, crefs);
+      then ();
+      else ();
+    end match;
+  end collectDelayCrefs;
+
+  function extractClocksEqn
+    input output Equation eqn;
+    input UnorderedMap<BClock, ComponentRef> clck_coll;
+    input UnorderedMap<BClock, ComponentRef> infr_coll;
+    input Pointer<list<Pointer<Variable>>> new_clocks;
+    input Pointer<list<Pointer<Variable>>> new_infers;
+    input Pointer<Integer> idx;
+  algorithm
+    eqn := match eqn
+      case Equation.WHEN_EQUATION() algorithm
+        eqn.body := Util.getOption(extractClocksWhenCond(SOME(eqn.body), clck_coll, infr_coll, new_clocks, new_infers, idx));
+      then eqn;
+      else eqn;
+    end match;
+    eqn := Equation.map(eqn, function extractClocks(clck_coll = clck_coll, infr_coll = infr_coll, new_clocks = new_clocks, new_infers = new_infers, idx = idx, when_cond = false));
+  end extractClocksEqn;
+
+  function extractClocksWhenCond
+    input output Option<WhenEquationBody> body_opt;
+    input UnorderedMap<BClock, ComponentRef> clck_coll;
+    input UnorderedMap<BClock, ComponentRef> infr_coll;
+    input Pointer<list<Pointer<Variable>>> new_clocks;
+    input Pointer<list<Pointer<Variable>>> new_infers;
+    input Pointer<Integer> idx;
+  algorithm
+    body_opt := match body_opt
+      local
+        WhenEquationBody body;
+      case SOME(body) algorithm
+        body.condition := Expression.map(body.condition, function extractClocks(clck_coll = clck_coll, infr_coll = infr_coll, new_clocks = new_clocks, new_infers = new_infers, idx = idx, when_cond = true));
+        body.else_when := extractClocksWhenCond(body.else_when, clck_coll, infr_coll, new_clocks, new_infers, idx);
+      then SOME(body);
+      else body_opt;
+    end match;
+  end extractClocksWhenCond;
+
+  function extractClocks
+    "replace clock constructors in expressions with variables"
+    input output Expression exp;
+    input UnorderedMap<BClock, ComponentRef> clck_coll;
+    input UnorderedMap<BClock, ComponentRef> infr_coll;
+    input Pointer<list<Pointer<Variable>>> new_clocks;
+    input Pointer<list<Pointer<Variable>>> new_infers;
+    input Pointer<Integer> idx;
+    input Boolean when_cond;
+  algorithm
+    exp := match exp
+      local
+        BClock clock;
+        Pointer<Variable> clock_var;
+        ComponentRef clock_name;
+
+      case Expression.CLKCONST() guard(when_cond or not ClockKind.isInferred(exp.clk)) algorithm
+        clock := BClock.BASE_CLOCK(exp.clk);
+        if UnorderedMap.contains(clock, clck_coll) then
+          // clock already exists
+          clock_name := UnorderedMap.getSafe(clock, clck_coll, sourceInfo());
+        elseif UnorderedMap.contains(clock, infr_coll) then
+          clock_name := UnorderedMap.getSafe(clock, infr_coll, sourceInfo());
+        else
+          // new clock
+          (clock_var, clock_name) := BVariable.makeClockVar(Pointer.access(idx), Expression.typeOf(exp));
+          if BClock.isInferredClock(clock) then
+            UnorderedMap.add(clock, clock_name, infr_coll);
+            Pointer.update(new_infers, clock_var :: Pointer.access(new_infers));
+          else
+            UnorderedMap.add(clock, clock_name, clck_coll);
+            Pointer.update(new_clocks, clock_var :: Pointer.access(new_clocks));
+          end if;
+          Pointer.update(idx, Pointer.access(idx) + 1);
+        end if;
+      then Expression.fromCref(clock_name);
+
+      else exp;
+    end match;
+  end extractClocks;
+
+protected
+  type ClusterElementType = enumeration(EQUATION, VARIABLE);
+
+  uniontype Cluster
+    record CLUSTER
+      UnorderedSet<ComponentRef> variables  "set of all variables in this cluster";
+      UnorderedSet<ComponentRef> eqn_idnts  "set of all equations in this cluster";
+    end CLUSTER;
+
+    function toString
+      input Cluster cluster;
+      output String str;
+    algorithm
+      str := "### Cluster Variables:\n" + UnorderedSet.toString(cluster.variables, ComponentRef.toString)
+        + "\n### Cluster Equation Identifiers:\n" + UnorderedSet.toString(cluster.eqn_idnts, ComponentRef.toString);
+    end toString;
+
+    function addElement
+      input Option<Cluster> cluster_opt;
+      input ComponentRef cref;
+      input ClusterElementType ty;
+      output Cluster cluster;
+    algorithm
+      cluster := match cluster_opt
+        case SOME(cluster) then cluster;
+        else CLUSTER(
+          variables = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual),
+          eqn_idnts = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual));
+      end match;
+
+      cluster := match ty
+        case ClusterElementType.VARIABLE algorithm
+          UnorderedSet.add(cref, cluster.variables);
+        then cluster;
+        case ClusterElementType.EQUATION algorithm
+          UnorderedSet.add(cref, cluster.eqn_idnts);
+        then cluster;
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " failed for " + ComponentRef.toString(cref) + " because of unknown cluster element type."});
+        then fail();
+      end match;
+    end addElement;
+
+    function addToClockMap
+      "finds the first clock in the map and adds cref->clock for all crefs in this cluster.
+      Note: does not check if there are different clocks that contradict, this check will be done later.
+      this is only for naive clock inference that will be checked for consistency later."
+      input Cluster cluster;
+      input EquationPointers equations;
+      input ClockedInfo info;
+      input UnorderedMap<ComponentRef, ComponentRef> clock_map;
+    protected
+      function findClock
+        "finds the first clock/clocked signal and skips everything afterwards"
+        input output Expression exp;
+        input ClockedInfo info;
+        input Pointer<Option<ComponentRef>> clock_ptr;
+      protected
+        Option<ComponentRef> clock_opt = Pointer.access(clock_ptr);
+      algorithm
+        exp := match (exp, clock_opt)
+          // already found clock, do nothing
+          case (_, SOME(_)) then exp;
+
+          case (Expression.CREF(), NONE()) guard(BVariable.isClockOrClocked(BVariable.getVarPointer(exp.cref, sourceInfo()))) algorithm
+            // add the clock cref
+            Pointer.update(clock_ptr, SOME(exp.cref));
+          then exp;
+
+          // do nothing on clock sampling functions as they do not imply a clock for this cluster
+          case (Expression.CALL(), _) guard(Expression.isClockOrSampleFunction(exp)) then exp;
+
+          // go deeper
+          else Expression.mapShallow(exp, function findClock(info = info, clock_ptr = clock_ptr));
+        end match;
+      end findClock;
+      Pointer<Option<ComponentRef>> clock_ptr = Pointer.create(NONE());
+      Option<ComponentRef> clock_opt = NONE();
+      ComponentRef clock;
+    algorithm
+      // search all equations until first clock/clocked signal is found
+      for eqn_name in UnorderedSet.toList(cluster.eqn_idnts) loop
+        Equation.map(Pointer.access(EquationPointers.getEqnByName(equations, eqn_name)), function findClock(info = info, clock_ptr = clock_ptr), NONE(), Expression.fakeMap);
+        clock_opt := Pointer.access(clock_ptr);
+        if isSome(clock_opt) then break; end if;
+      end for;
+
+      // if a clock/clocked signal was found, add all a mapping for each variable in the cluster to the clock
+      if isSome(clock_opt) then
+        SOME(clock) := clock_opt;
+        for var_name in UnorderedSet.toList(cluster.variables) loop
+          UnorderedMap.add(var_name, clock, clock_map);
+        end for;
+      end if;
+    end addToClockMap;
+
+    function toPartition
+      input Cluster cluster;
+      input VariablePointers variables;
+      input EquationPointers equations;
+      input Partition.Kind kind;
+      input ClockedInfo info;
+      input UnorderedSet<ComponentRef> held_crefs;
+      input UnorderedSet<ComponentRef> infer_del;
+      output Partition.Partition partition;
+    protected
+      list<ComponentRef> cvars = UnorderedSet.toList(cluster.variables);
+      list<ComponentRef> cidnt = UnorderedSet.toList(cluster.eqn_idnts);
+      Partition.Association association;
+      list<Pointer<Variable>> var_lst, filtered_vars;
+      list<Pointer<Equation>> eqn_lst;
+      VariablePointers partVariables;
+      EquationPointers partEquations;
+      UnorderedSet<ComponentRef> inferred_clocks = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    algorithm
+      // find all variables and equations
+      var_lst := list(BVariable.getVarPointer(cref, sourceInfo()) for cref in cvars);
+      filtered_vars := list(var for var guard(VariablePointers.contains(var, variables)) in var_lst);
+      eqn_lst := list(EquationPointers.getEqnByName(equations, name) for name in cidnt);
+
+      // create variable and equation arrays
+      partVariables := VariablePointers.fromList(filtered_vars);
+      partEquations := EquationPointers.fromList(eqn_lst);
+
+      // create the association (clocked/continuous)
+      association := Partition.Association.create(partEquations, kind, info, infer_del);
+
+      // replace the clocked functions, inline clocked when equations and set equations to clocked
+      partEquations := EquationPointers.mapExp(partEquations, function replaceClockedFunctions(held_crefs = held_crefs));
+      if Partition.Association.isClocked(association) then
+        // remove the inferred clocks
+        partVariables := VariablePointers.mapRemovePtr(partVariables, function collectInferredClock(inferred_clocks = inferred_clocks));
+        partEquations := EquationPointers.mapRemovePtr(partEquations, function removeInferredClock(inferred_clocks = inferred_clocks));
+        // replace clocked when equations and make all variables clocked
+        partEquations := EquationPointers.map(partEquations, replaceClockedWhen);
+        partVariables := VariablePointers.mapPtr(partVariables, function BVariable.setVarKind(varKind = VariableKind.CLOCKED()));
+
+        // if the partition will be removed add all unused inferred clocks
+        if EquationPointers.size(partEquations) == 0 then
+          UnorderedSet.merge(infer_del, inferred_clocks);
+        end if;
+      end if;
+
+      partition := Partition.PARTITION(
+        index             = 0,
+        association       = association,
+        unknowns          = partVariables,
+        daeUnknowns       = NONE(),
+        equations         = partEquations,
+        adjacencyMatrix   = NONE(),
+        matching          = NONE(),
+        strongComponents  = NONE()
+      );
+    end toPartition;
+
+  protected
+    function collectInferredClock
+      input Pointer<Variable> var;
+      input UnorderedSet<ComponentRef> inferred_clocks;
+      output Boolean delete = BVariable.isClock(var);
+    algorithm
+      if delete then
+        UnorderedSet.add(BVariable.getVarName(var), inferred_clocks);
+      end if;
+    end collectInferredClock;
+
+    function removeInferredClock
+      input Pointer<Equation> eqn;
+      input UnorderedSet<ComponentRef> inferred_clocks;
+      output Boolean delete;
+    algorithm
+      delete := match Pointer.access(eqn)
+        local
+          ComponentRef lhs;
+        case Equation.SCALAR_EQUATION(lhs = Expression.CREF(cref = lhs)) then UnorderedSet.contains(lhs, inferred_clocks);
+        else false;
+      end match;
+    end removeInferredClock;
+  end Cluster;
+
+  // Perhaps this deserves its own place in Util/*.mo
+  uniontype DisjointSetForest
+    "Custom implementation of disjoint-set data structure with constant number of elements."
+    record FOREST
+      Pointer<array<Integer>> parent;
+      Pointer<array<Integer>> rank;
+    end FOREST;
+
+    function new
+      "Creates n disjoit subsets of size 1."
+      input Integer n;
+      output DisjointSetForest dsf;
+    algorithm
+      dsf := FOREST(
+        parent = Pointer.create(listArray(list(i for i in 1:n))),
+        rank   = Pointer.create(arrayCreate(n, 0))
+      );
+    end new;
+
+    function find
+      input DisjointSetForest dsf;
+      input output Integer index;
+    protected
+      array<Integer> parent = Pointer.access(dsf.parent);
+    algorithm
+      while index <> parent[index] loop
+        parent[index] := parent[parent[index]] "path halving";
+        index := parent[index];
+      end while;
+      Pointer.update(dsf.parent, parent);
+    end find;
+
+    function unite
+      input DisjointSetForest dsf;
+      input list<Integer> indices;
+      output Integer root;
+    protected
+      list<Integer> roots = list(find(dsf, i) for i in indices);
+      array<Integer> parent = Pointer.access(dsf.parent);
+      array<Integer> rank = Pointer.access(dsf.rank);
+      Integer maxRank;
+      Boolean tied = false;
+    algorithm
+      // find root with highest rank
+      root := listHead(roots);
+      maxRank := rank[root];
+      for r in listRest(roots) loop
+        if r <> root then
+          if rank[r] > maxRank then
+            root := r;
+            maxRank := rank[root];
+            tied := false;
+          elseif rank[r] == maxRank then
+            tied := true;
+          end if;
+        end if;
+      end for;
+
+      // update parents
+      for r in roots loop
+        parent[find(dsf, r)] := root;
+      end for;
+
+      // if necessary increment rank
+      if tied then
+        rank[root] := rank[root] + 1;
+      end if;
+
+      Pointer.update(dsf.parent, parent);
+      Pointer.update(dsf.rank, rank);
+    end unite;
+  end DisjointSetForest;
+
+  function partitioningNone extends Module.partitioningInterface;
+  protected
+    VariablePointers clone_vars;
+    EquationPointers clone_eqns;
+  algorithm
+    clone_vars := VariablePointers.clone(variables);
+    clone_eqns := EquationPointers.clone(equations);
+    partitions := {Partition.PARTITION(
+      index             = 1,
+      association       = Partition.Association.CONTINUOUS(kind, NONE(), NONE(), NONE(), NONE(), NONE()),
+      unknowns          = clone_vars,
+      daeUnknowns       = NONE(),
+      equations         = clone_eqns,
+      adjacencyMatrix   = NONE(),
+      matching          = NONE(),
+      strongComponents  = NONE()
+    )};
+  end partitioningNone;
+
+  function partitioningClocked
+    "partitions all individual partitions and collects the clocked partitions and clocks/subclocks"
+    extends Module.partitioningInterface;
+  protected
+    DisjointSetForest eqn_dsf = DisjointSetForest.new(ExpandableArray.getLastUsedIndex(equations.eqArr));
+    array<Integer> var_map = arrayCreate(ExpandableArray.getLastUsedIndex(variables.varArr), -1);
+    Pointer<Equation> eqn;
+    Pointer<Variable> var;
+    UnorderedSet<ComponentRef> var_crefs;
+    list<Integer> var_indices;
+    Integer part_idx;
+    UnorderedMap<Integer, Cluster> cluster_map = UnorderedMap.new<Cluster>(Util.id, intEq);
+    ComponentRef name_cref;
+    array<Boolean> marked_vars;
+    list<Pointer<Variable>> single_vars;
+    UnorderedSet<ComponentRef> held_crefs = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    // maps each cref to the clock it is listening to
+    UnorderedMap<ComponentRef, ComponentRef> clock_map = UnorderedMap.new<ComponentRef>(ComponentRef.hash, ComponentRef.isEqual);
+    UnorderedSet<ComponentRef> infer_del = UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+    Pointer<Integer> index = Pointer.create(1);
+  algorithm
+    // parse clock assignments
+    for eq_idx in UnorderedMap.valueList(clocked.map) loop
+      if eq_idx > 0 then
+        eqn := EquationPointers.getEqnAt(clocked, eq_idx);
+        BClock.add(Pointer.access(eqn), info);
+      end if;
+    end for;
+
+    // other equations - collect all variables and check for clocked signals
+    for eq_idx in UnorderedMap.valueList(equations.map) loop
+      if eq_idx > 0 then
+        eqn := EquationPointers.getEqnAt(equations, eq_idx);
+        BClock.add(Pointer.access(eqn), info);
+
+        // collect all crefs in equation
+        var_crefs := UnorderedSet.new(ComponentRef.hash, ComponentRef.isEqual);
+        Equation.map(Pointer.access(eqn), function collectPartitioningCrefs(var_crefs = var_crefs, strip = true), NONE(), Expression.fakeMap);
+
+        // find all indices of connected variables
+        var_indices := list(VariablePointers.getVarIndex(variables, cref) for cref in UnorderedSet.toList(var_crefs));
+        // filter indices of non existant variables (e.g. time)
+        var_indices := list(i for i guard(i > 0) in var_indices);
+
+        // unite current equation and all variables that already belong to a partition
+        part_idx := DisjointSetForest.unite(eqn_dsf, eq_idx :: list(var_map[j] for j guard(var_map[j] > 0) in var_indices));
+
+        // update connected variable partition indices
+        for i in var_indices loop
+          var_map[i] := part_idx;
+        end for;
+      end if;
+    end for;
+
+    // find and report variables that could not be assigned to a partition (exclude clocks)
+    marked_vars := listArray(list(var_map[var_idx] < 0 for var_idx in UnorderedMap.valueList(variables.map)));
+    single_vars := list(var_ptr for var_ptr in VariablePointers.getMarkedVars(variables, marked_vars));
+
+    if not listEmpty(single_vars) then
+      Error.addMessage(Error.INTERNAL_ERROR, {getInstanceName() + " (" + Partition.Partition.kindToString(kind)
+        + ") failed because the following variables could not be assigned to a partition:\n  {"
+        + stringDelimitList(list(BVariable.toString(Pointer.access(var_ptr)) for var_ptr in single_vars), "\n") + "}"});
+      fail();
+    end if;
+
+    // collect cluster equations
+    for eq_idx in UnorderedMap.valueList(equations.map) loop
+      if eq_idx > 0 then
+        // add the equation
+        eqn       := EquationPointers.getEqnAt(equations, eq_idx);
+        name_cref := Equation.getEqnName(eqn);
+        part_idx  := DisjointSetForest.find(eqn_dsf, eq_idx);
+        UnorderedMap.addUpdate(part_idx, function Cluster.addElement(cref = name_cref, ty = ClusterElementType.EQUATION), cluster_map);
+      end if;
+    end for;
+
+    // collect cluster variables
+    for var_idx in UnorderedMap.valueList(variables.map) loop
+      if var_idx > 0 then
+        var       := VariablePointers.getVarAt(variables, var_idx);
+        name_cref := BVariable.getVarName(var);
+        part_idx  := DisjointSetForest.find(eqn_dsf, var_map[var_idx]);
+        UnorderedMap.addUpdate(part_idx, function Cluster.addElement(cref = name_cref, ty = ClusterElementType.VARIABLE), cluster_map);
+      end if;
+    end for;
+
+    for cluster in UnorderedMap.valueList(cluster_map) loop
+      Cluster.addToClockMap(cluster, equations, info, clock_map);
+    end for;
+
+    // resolve inner sub clock dependencies
+    ClockedInfo.resolveSubClocks(info, clock_map);
+
+    // get the actual partitions from the clusters and split continuous/clocked
+    partitions := list(Cluster.toPartition(cl, variables, equations, kind, info, held_crefs, infer_del) for cl in UnorderedMap.valueList(cluster_map));
+    // update the partitions if one of their variables is in a hold() function
+    partitions := list(Partition.Partition.updateHeldVars(part, held_crefs) for part in partitions);
+    // merge all clocked partitions with equal base and sub clock and find the proper order
+    partitions := list(Partition.Partition.setIndex(partition, index) for partition guard(not Partition.Partition.isEmpty(partition)) in sortAndMergeClockedPartitions(partitions, info));
+
+    // remove the unused inferred clocks from clock structure
+    for unused_infer in UnorderedSet.toList(infer_del) loop
+      UnorderedMap.remove(unused_infer, info.baseClocks);
+      UnorderedMap.remove(unused_infer, info.baseToSub);
+    end for;
+
+
+    if Flags.isSet(Flags.DUMP_SYNCHRONOUS) then
+      print(StringUtil.headline_1("[dumpSynchronous] Partitioning result:") + "\n" + List.toString(partitions, function Partition.Partition.toString(level = 2), List.Style.NEWLINE) + "\n");
+      print(ClockedInfo.toString(info));
+    end if;
+  end partitioningClocked;
+
+  function sortAndMergeClockedPartitions
+    input output list<Partition.Partition> partitions;
+    input ClockedInfo info;
+  protected
+    list<Partition.Partition> clocked_partitions;
+    list<list<Partition.Partition>> new_clocked = {};
+    // type for for double map. base clock -> {sub_clock -> partition}
+    type SubMap = UnorderedMap<BClock, Partition.Partition>;
+    UnorderedMap<BClock, SubMap> clock_collector = UnorderedMap.new<SubMap>(BClock.hash, BClock.isEqual);
+    UnorderedMap<ComponentRef, BClock> base_clock_inferrence = UnorderedMap.new<BClock>(ComponentRef.hash, ComponentRef.isEqual);
+    BClock clock, baseClock, subClock;
+    Option<BClock> baseClock_opt;
+    SubMap subClockMap "maps sub clock to it's partition for current base clock";
+    Partition.Partition new_part;
+  algorithm
+    // filter all clocked partitions
+    (clocked_partitions, partitions) := List.splitOnTrue(partitions, Partition.Partition.isClocked);
+
+    // initialize for all base clocks
+    for baseClock in UnorderedMap.valueList(info.baseClocks) loop
+      UnorderedMap.add(baseClock, UnorderedMap.new<Partition.Partition>(BClock.hash, BClock.isEqual), clock_collector);
+    end for;
+
+    // collect the base clock inferrence data to correctly associate the inferred clocks
+    for partition in clocked_partitions loop
+      (clock, baseClock_opt, _)  := Partition.Partition.getClocks(partition);
+      clock := match baseClock_opt
+        case SOME(clock) then clock;
+        else clock;
+      end match;
+      for var in VariablePointers.toList(partition.unknowns) loop
+        UnorderedMap.add(BVariable.getVarName(var), clock, base_clock_inferrence);
+      end for;
+    end for;
+
+    // merge clocked partitions by baseclock, subclock
+    for partition in clocked_partitions loop
+      (clock, baseClock_opt, _)  := Partition.Partition.getClocks(partition);
+      if isSome(baseClock_opt) then
+        // it is a sub clock
+        SOME(baseClock) := baseClock_opt;
+        baseClock       := BClock.baseClockInferrence(baseClock, base_clock_inferrence);
+        subClock        := clock;
+      else
+        // it is a base clock, use the default sub clock
+        baseClock       := BClock.baseClockInferrence(clock, base_clock_inferrence);
+        subClock        := DEFAULT_SUB_CLOCK;
+      end if;
+      partition       := Partition.Partition.setClocks(partition, subClock, SOME(baseClock));
+      subClockMap     := UnorderedMap.getSafe(baseClock, clock_collector, sourceInfo());
+      new_part := match UnorderedMap.get(subClock, subClockMap)
+        case SOME(new_part) then Partition.Partition.merge(new_part, partition, true);
+        else partition;
+      end match;
+      UnorderedMap.add(subClock, new_part, subClockMap);
+    end for;
+
+    // recollect all clocked partitions and sort the sub partitions. resolve potential artifical algebraic loops
+    for tpl in UnorderedMap.toList(clock_collector) loop
+      (baseClock, subClockMap) := tpl;
+      new_clocked := sortClockedPartitions(UnorderedMap.valueList(subClockMap)) :: new_clocked;
+    end for;
+
+    // append all clocked partitions in the end and apply proper indexing
+    partitions := listAppend(partition for partition in listReverse(partitions :: new_clocked));
+  end sortAndMergeClockedPartitions;
+
+  function sortClockedPartitions
+    "use tarjan to sort sub partitions that rely on order. if an artificial algebraic loop occurs,
+    break up the partitions such that the loop does not occur anymore. Actual algebraic loops with
+    different clocks are forbidden by Section 16.7.4 in the Modelica Specification Version 3.7,
+    therefore an issue will be raised in that case."
+    input list<Partition.Partition> unsorted;
+    output list<Partition.Partition> sorted = {};
+  protected
+    Integer n = listLength(unsorted);
+    array<Partition.Partition> partitions = listArray(listReverse(unsorted));
+    Adjacency.IntMatrix.Builder m = Adjacency.IntMatrix.newBuilder(n);
+    // create a trivial matching for an artificially matched bipartite graph (tarjan implementation needs it)
+    Matching matching = Matching.trivial(n);
+    UnorderedMap<BClock, Integer> index_map = UnorderedMap.new<Integer>(BClock.hash, BClock.isEqual);
+    list<list<Integer>> partition_order;
+    Integer j;
+  algorithm
+    // prepare the clock to partition index map
+    for i in 1:n loop
+      UnorderedMap.add(Partition.Partition.getClocks(partitions[i]), i, index_map);
+    end for;
+
+    // fill the adjacency matrix
+    for i in 1:n loop
+      for clock in UnorderedSet.toList(Partition.Partition.getClockDependencies(partitions[i])) loop
+        j := UnorderedMap.getSafe(clock, index_map, sourceInfo());
+        Adjacency.IntMatrix.builderAdd(m, i, j);
+      end for;
+    end for;
+
+    // use tarjan to sort the artificial bipartite graph
+    partition_order := Sorting.tarjanScalar(Adjacency.IntMatrix.fromBuilder(m, n), matching);
+
+    // use the strong components to sort partitions. no algebraic loops allowed
+    for comp in listReverse(partition_order) loop
+      sorted := match comp
+        local
+          UnorderedMap<VariablePointer, BClock> var_clock_map;
+          Partition.Partition part;
+          list<StrongComponent> sub_comps;
+          list<Pointer<Variable>> sub_comp_vars;
+          list<Pointer<Equation>> sub_comp_eqns;
+          Option<tuple<list<Pointer<Variable>>, list<Pointer<Equation>>, BClock>> collector;
+          UnorderedSet<BClock> var_clocks;
+          Option<BClock> baseClock;
+
+          list<Pointer<Variable>> vars;
+          list<Pointer<Equation>> eqns;
+          BClock clock, new_clock;
+
+        // standard non loop partition
+        case {j} then partitions[j] :: sorted;
+
+        // multiple partitions form an artificial algebraic loop
+        else algorithm
+          // save which variable listens to which clock
+          var_clock_map := UnorderedMap.new<BClock>(BVariable.hash, BVariable.equalName);
+          for i in comp loop
+            part := partitions[i];
+            for var in VariablePointers.toList(part.unknowns) loop
+              UnorderedMap.add(var, Partition.Partition.getClocks(part), var_clock_map);
+            end for;
+          end for;
+
+          // merge all partitions (allow different clocks)
+          j :: comp := comp;
+          part := partitions[j];
+          for i in comp loop
+            part := Partition.Partition.merge(part, partitions[i], false);
+          end for;
+
+          // all base clocks have to be equal, just get any of them
+          (_, baseClock, _) := Partition.Partition.getClocks(part);
+
+          // causalize
+          (_, sub_comps) := Causalize.simple(part.unknowns, part.equations, Partition.Partition.getKind(part));
+
+          // split the resulting strong components into partitions by clocks
+          collector := NONE();
+          for sub_comp in listReverse(sub_comps) loop
+            sub_comp_vars := StrongComponent.getVariables(sub_comp);
+            sub_comp_eqns := StrongComponent.getEquations(sub_comp);
+            var_clocks    := UnorderedSet.new(BClock.hash, BClock.isEqual);
+
+            for var in sub_comp_vars loop
+              UnorderedSet.add(UnorderedMap.getSafe(var, var_clock_map, sourceInfo()), var_clocks);
+            end for;
+
+            // update the collector, either 1) make new collector, 2) add to existing collector 3) finalize partition and make new collector
+            collector := match (collector, UnorderedSet.toList(var_clocks))
+              // 1) no previous collector, make new one
+              case (NONE(), {new_clock}) then SOME((sub_comp_vars, sub_comp_eqns, new_clock));
+
+              // previous collector, check if still same clock
+              case (SOME((vars, eqns, clock)), {new_clock}) algorithm
+                if BClock.isEqual(clock, new_clock) then
+                  // 2) same clock, just append to partition
+                  collector := SOME((listAppend(sub_comp_vars, vars), listAppend(sub_comp_eqns, eqns), clock));
+                else
+                  // 3) new clock, split partition
+                  // ToDo: keep sorting and reuse later
+                  part := Partition.PARTITION(0, Partition.Association.CLOCKED(clock, baseClock, UnorderedSet.new(BClock.hash, BClock.isEqual), false),
+                    VariablePointers.fromList(vars), NONE(), EquationPointers.fromList(eqns), NONE(), NONE(), NONE());
+                  sorted := part :: sorted;
+
+                  // open new collector
+                  collector := SOME((sub_comp_vars, sub_comp_eqns, new_clock));
+                end if;
+              then collector;
+
+              else algorithm
+                Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for sub-partitions with cyclic dependency that could not be resolved:\n"
+                 + "There are contradicting sub-clocks: " + List.toString(UnorderedSet.toList(var_clocks), BClock.toString) + " in strong component:\n"
+                 + StrongComponent.toString(sub_comp)});
+              then fail();
+            end match;
+          end for;
+
+          // finalize last partition
+          if isSome(collector) then
+            SOME((vars, eqns, clock)) := collector;
+            part := Partition.PARTITION(0, Partition.Association.CLOCKED(clock, baseClock, UnorderedSet.new(BClock.hash, BClock.isEqual), false),
+              VariablePointers.fromList(vars), NONE(), EquationPointers.fromList(eqns), NONE(), NONE(), NONE());
+            sorted := part :: sorted;
+          end if;
+        then sorted;
+      end match;
+    end for;
+  end sortClockedPartitions;
+
+  function solvingComponents
+    "a literal element (x[2]) solved by its own component only depends on that component"
+    input ComponentRef cref;
+    input UnorderedMap<ComponentRef, Slice.IntLst> solved_elements;
+    input UnorderedMap<ComponentRef, Slice.IntLst> solved;
+    output Slice.IntLst comps;
+  algorithm
+    comps := match UnorderedMap.get(cref, solved_elements)
+      case SOME(comps) guard(hasLiteralSubscripts(cref)) then comps;
+      else UnorderedMap.getOrDefault(ComponentRef.stripSubscriptsAll(cref), solved, {});
+    end match;
+  end solvingComponents;
+
+  function hasLiteralSubscripts
+    "true for a single element, an array cref like x stands for all components solving any of its elements"
+    input ComponentRef cref;
+    output Boolean b = List.all(ComponentRef.subscriptsAllFlat(cref), Subscript.isLiteral)
+      and not Type.isArray(ComponentRef.getSubscriptedType(cref, true));
+  end hasLiteralSubscripts;
+
+  function collectPartitioningCrefs
+    input output Expression exp;
+    input UnorderedSet<ComponentRef> var_crefs;
+    input Boolean strip = true "false to keep the subscripts of the variables";
+  algorithm
+    exp := match exp
+      local
+        Expression newExp;
+        Call call;
+        Expression arg;
+        list<ComponentRef> children;
+        ComponentRef stripped;
+
+      // clocked partitioning special rules
+      case Expression.CALL(call = call as Call.TYPED_CALL()) algorithm
+        newExp := match AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn))
+          // skip these as they do not cause dependency
+          case "subSample"    then exp;
+          case "superSample"  then exp;
+          case "shiftSample"  then exp;
+          case "backSample"   then exp;
+          case "previous"     then exp;
+          case "hold"         then exp;
+          // sample can have dependencies
+          case "sample" algorithm
+            arg := match Call.arguments(exp.call)
+              // not collected samples have 2 arguments
+              case {_, arg} then arg;
+              // collected samples have 3 arguments
+              case {_, _, arg} then arg;
+              else algorithm
+                Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for: " + Expression.toString(exp) + "."});
+              then fail();
+            end match;
+          then Expression.mapShallow(arg, function collectPartitioningCrefs(var_crefs = var_crefs, strip = strip));
+          else Expression.mapShallow(exp, function collectPartitioningCrefs(var_crefs = var_crefs, strip = strip));
+        end match;
+      then newExp;
+
+      // get all variable crefs for this cref and add to set
+      case Expression.CREF() algorithm
+        // extract potential record children
+        children := match BVariable.getVar(exp.cref, sourceInfo())
+          local
+            list<PointerWeak<Variable>> children_vars;
+          case Variable.VARIABLE(backendinfo = BackendInfo.BACKEND_INFO(varKind = VariableKind.RECORD(children = children_vars)))
+          then list(BVariable.getVarName(PointerWeak.upgrade(var)) for var in children_vars);
+          else {exp.cref};
+        end match;
+
+        for child in children loop
+          // check if cref has to be considered as a dependency
+          stripped := if strip then ComponentRef.stripSubscriptsAll(child) else child;
+          if not BVariable.checkCref(stripped, BVariable.isParamOrConst, sourceInfo()) then
+            addCrefToSet(stripped, var_crefs);
+          end if;
+        end for;
+
+        // variables in subscripts (e.g. idx in y = val[idx]) are dependencies as well
+        for sub in ComponentRef.subscriptsAllFlat(exp.cref) loop
+          if (Subscript.isIndex(sub) or (Subscript.isSliced(sub) and not Subscript.isWhole(sub))) and not Subscript.isLiteral(sub) then
+            collectPartitioningCrefs(Subscript.toExp(sub), var_crefs, strip);
+          end if;
+        end for;
+      then exp;
+
+      else Expression.mapShallow(exp, function collectPartitioningCrefs(var_crefs = var_crefs, strip = strip));
+    end match;
+  end collectPartitioningCrefs;
+
+  function addCrefToSet
+    input ComponentRef cref;
+    input UnorderedSet<ComponentRef> set;
+  protected
+    Pointer<Variable> var_ptr = BVariable.getVarPointer(cref, sourceInfo());
+  algorithm
+    // states and there derivatives belong to one partition
+    // discrete states and there pre value also
+    if BVariable.isState(var_ptr) then
+      UnorderedSet.add(BVariable.getPartnerCref(cref, BVariable.getVarDer), set);
+    elseif BVariable.isPrevious(var_ptr) then
+      UnorderedSet.add(BVariable.getPartnerCref(cref, BVariable.getVarPre), set);
+    else
+      UnorderedSet.add(cref, set);
+    end if;
+  end addCrefToSet;
+
+  function replaceClockedFunctions
+    "replaces sample() and hold() calls using clocks as condition with the $getPart function"
+    input output Expression exp;
+    input UnorderedSet<ComponentRef> held_crefs;
+    function replaceSample
+      input output Expression exp;
+      input Call call;
+      input Boolean basic;
+    protected
+      Expression arg1, arg2;
+    algorithm
+      {arg1, arg2} := match Call.arguments(call)
+        // not collected samples have 2 arguments
+        case {arg1, arg2} then {arg1, arg2};
+        // collected samples have 3 arguments
+        case {_, arg1, arg2} guard(basic) then {arg1, arg2};
+        // non basic with 3 arguments only care for the first argument as signal
+        case {arg1, arg2, _} then {arg1, arg2};
+        else algorithm
+          Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for: " + Expression.toString(exp) + "."});
+        then fail();
+      end match;
+      // if it's the basic sample operator, the second argument is supposed to be the clock, otherwise the first
+      if basic then
+        exp := if Type.isClock(Expression.typeOf(arg2)) then replaceClockedFunctionExp(arg1) else exp;
+      else
+        exp := replaceClockedFunctionExp(arg1);
+      end if;
+    end replaceSample;
+  algorithm
+    exp := match exp
+      local
+        Expression newExp, arg;
+        Call call;
+
+      case Expression.CALL(call = call as Call.TYPED_CALL()) algorithm
+        newExp := match AbsynUtil.pathString(Function.nameConsiderBuiltin(call.fn))
+          // sample cases
+          case "sample"       then replaceSample(exp, call, true);
+          case "subSample"    then replaceSample(exp, call, false);
+          case "superSample"  then replaceSample(exp, call, false);
+          case "shiftSample"  then replaceSample(exp, call, false);
+          case "backSample"   then replaceSample(exp, call, false);
+
+          // hold case
+          case "hold" algorithm
+            arg := match Call.arguments(exp.call)
+              // hold can only have one argument
+              case {arg as Expression.CREF()} algorithm
+                UnorderedSet.add(arg.cref, held_crefs);
+              then arg;
+              else algorithm
+                Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed for: " + Expression.toString(exp) + "."});
+              then fail();
+            end match;
+          then replaceClockedFunctionExp(arg);
+
+          else exp;
+        end match;
+      then newExp;
+      else exp;
+    end match;
+  end replaceClockedFunctions;
+
+  function replaceClockedFunctionExp
+    input output Expression exp;
+  protected
+    Function func;
+  algorithm
+    func := match Expression.typeOf(exp)
+      case Type.REAL()    then NFBuiltinFuncs.GET_PART_REAL;
+      case Type.INTEGER() then NFBuiltinFuncs.GET_PART_INT;
+      case Type.BOOLEAN() then NFBuiltinFuncs.GET_PART_BOOL;
+      case Type.CLOCK()   then NFBuiltinFuncs.GET_PART_CLOCK;
+      else algorithm
+        Error.addMessage(Error.INTERNAL_ERROR,{getInstanceName() + " failed. " + Expression.toString(exp) + " is of type "
+         + Type.toString(Expression.typeOf(exp)) + ", only real, integer, boolean and clock are allowed."});
+      then fail();
+    end match;
+    exp := Expression.CALL(Call.makeTypedCall(
+      fn          = func,
+      args        = {exp},
+      variability = Expression.variability(exp),
+      purity      = NFPrefixes.Purity.PURE
+    ));
+  end replaceClockedFunctionExp;
+
+  function replaceClockedWhen
+    "replace clocked when equations in clocked partitions with their body statement.
+    only works for split up when equations with a single statement and no else when."
+    input output Equation eqn;
+  algorithm
+    eqn := match eqn
+      local
+        Expression cond;
+        WhenStatement stmt;
+
+      case Equation.WHEN_EQUATION(body = WhenEquationBody.WHEN_EQUATION_BODY(condition = cond, when_stmts = {stmt}, else_when = NONE()))
+        guard(Type.isClock(Expression.typeOf(cond)))
+      then WhenStatement.toEquation(stmt, eqn.attr, false);
+
+      else eqn;
+    end match;
+  end replaceClockedWhen;
+
+annotation(__OpenModelica_Interface="nbackend");
+end NBPartitioning;

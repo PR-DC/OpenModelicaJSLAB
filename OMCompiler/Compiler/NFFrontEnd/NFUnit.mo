@@ -1,0 +1,957 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package NFUnit
+" file:        NFUnit.mo
+  package:     Unit
+  description: This package defines the type Unit, which represents a unit based
+               on SI base units, and some auxiliary functions therefore.
+
+               authors: Jan Hagemann and Lennart Ochel (FH Bielefeld, Germany)"
+
+public
+import ComponentRef = NFComponentRef;
+import Absyn;
+import NFInstNode.InstNode;
+import Type = NFType;
+import UnorderedMap;
+
+protected
+import Debug;
+import Error;
+import Flags;
+import Util;
+
+public
+type StringToUnitTable = UnorderedMap<String, Unit>;
+type UnitToStringTable = UnorderedMap<Unit, String>;
+type CrefToUnitTable = UnorderedMap<ComponentRef, Unit>;
+
+public uniontype Unit
+  record UNIT "based on SI base units"
+    Integer s   "second";
+    Integer m   "meter";
+    Integer g   "gram";
+    Integer A   "ampere";
+    Integer K   "kelvin";
+    Integer mol "mole";
+    Integer cd  "candela";
+    Real factor "prefix";
+    Real offset "v_SI = factor*v + offset; nonzero only for a bare affine unit
+                 (degC, degF), since composing units drops it";
+  end UNIT;
+
+  record MASTER "unknown unit that belongs to all the variables from varList"
+    list<ComponentRef> varList;
+  end MASTER;
+
+  record UNKNOWN "unknown SI base unit decomposition"
+    String unit;
+  end UNKNOWN;
+end Unit;
+
+public constant Unit ONE = UNIT(0, 0, 0, 0, 0, 0, 0, 1e0, 0.0);
+public constant Unit SECOND = UNIT(1, 0, 0, 0, 0, 0, 0, 1e0, 0.0);
+//public constant Unit THRICE = ?
+
+protected uniontype Token
+  record T_NUMBER
+    Integer number;
+  end T_NUMBER;
+
+  record T_UNIT
+    String unit;
+  end T_UNIT;
+
+  record T_MUL end T_MUL;
+  record T_DIV end T_DIV;
+  record T_LPAREN end T_LPAREN;
+  record T_RPAREN end T_RPAREN;
+end Token;
+
+public constant ComponentRef UPDATECREF = ComponentRef.CREF(InstNode.NAME_NODE("jhagemann"), {},
+  Type.UNKNOWN(), NFComponentRef.Origin.CREF, ComponentRef.EMPTY());
+
+/* from https://www.bipm.org/documents/d/guest/si-brochure-9-en-pdf */
+public constant list<tuple<String, Unit>> LU_COMPLEXUNITS = {
+  /*                 s, m, g, A, K,mol,cd,factor,offset */
+  ("1",         UNIT(0, 0, 0, 0, 0, 0, 0, 1e0, 0.0)), // 1
+
+  /* base units */
+  ("s",         UNIT(1, 0, 0, 0, 0, 0, 0, 1e0, 0.0)), // second
+  ("m",         UNIT(0, 1, 0, 0, 0, 0, 0, 1e0, 0.0)), // meter
+  ("g",         UNIT(0, 0, 1, 0, 0, 0, 0, 1e0, 0.0)), // gram
+  ("A",         UNIT(0, 0, 0, 1, 0, 0, 0, 1e0, 0.0)), // ampere
+  ("K",         UNIT(0, 0, 0, 0, 1, 0, 0, 1e0, 0.0)), // kelvin
+  ("mol",       UNIT(0, 0, 0, 0, 0, 1, 0, 1e0, 0.0)), // mole
+  ("cd",        UNIT(0, 0, 0, 0, 0, 0, 1, 1e0, 0.0)), // candela
+
+  /* derived units */
+  ("rad",       UNIT(0, 0, 0, 0, 0, 0, 0, 1e0, 0.0)), // radian
+//("sr",        UNIT(0, 0, 0, 0, 0, 0, 0, 1e0, 0.0)), // steradian
+  ("Hz",        UNIT(-1,0, 0, 0, 0, 0, 0, 1e0, 0.0)), // hertz
+  ("N",         UNIT(-2,1, 1, 0, 0, 0, 0, 1e3, 0.0)), // newton
+  ("Pa",        UNIT(-2,-1,1, 0, 0, 0, 0, 1e3, 0.0)), // pascal
+  ("J",         UNIT(-2,2, 1, 0, 0, 0, 0, 1e3, 0.0)), // joule
+  ("W",         UNIT(-3,2, 1, 0, 0, 0, 0, 1e3, 0.0)), // watt
+  ("C",         UNIT(1, 0, 0, 1, 0, 0, 0, 1e0, 0.0)), // coulomb
+  ("V",         UNIT(-3,2, 1,-1, 0, 0, 0, 1e3, 0.0)), // volt
+  ("F",         UNIT(4,-2,-1, 2, 0, 0, 0,1e-3, 0.0)), // farad
+  ("Ohm",       UNIT(-3,2, 1,-2, 0, 0, 0, 1e3, 0.0)), // ohm
+  ("S",         UNIT(3,-2,-1, 2, 0, 0, 0,1e-3, 0.0)), // siemens
+  ("Wb",        UNIT(-2,2, 1,-1, 0, 0, 0, 1e3, 0.0)), // weber
+  ("T",         UNIT(-2,0, 1,-1, 0, 0, 0, 1e3, 0.0)), // tesla
+  ("H",         UNIT(-2,2, 1,-2, 0, 0, 0, 1e3, 0.0)), // henry
+  ("degC",      UNIT(0, 0, 0, 0, 1, 0, 0, 1e0, 273.15)), // °Celsius
+//("lm",        UNIT(0, 0, 0, 0, 0, 0, 1, 1e0, 0.0)), // lumen
+//("lx",        UNIT(0,-2, 0, 0, 0, 0, 1, 1e0, 0.0)), // lux
+//("Bq",        UNIT(-1,0, 0, 0, 0, 0, 0, 1e0, 0.0)), // becquerel
+//("Gy",        UNIT(-2,2, 0, 0, 0, 0, 0, 1e0, 0.0)), // gray
+//("Sv",        UNIT(-2,2, 0, 0, 0, 0, 0, 1e0, 0.0)), // sievert
+  ("kat",       UNIT(-1,0, 0, 0, 0, 1, 0, 1e0, 0.0)), // katal
+
+  /* accepted non-SI units */
+  ("min",       UNIT(1, 0, 0, 0, 0, 0, 0,  60, 0.0)), // minute
+  ("h",         UNIT(1, 0, 0, 0, 0, 0, 0,3600, 0.0)), // hour
+  ("d",         UNIT(1, 0, 0, 0, 0, 0, 0,86400, 0.0)), // day
+//("au",        UNIT(0, 1, 0, 0, 0, 0, 0,149597870700, 0.0)), // astronomical unit
+//("deg",       UNIT(0, 0, 0, 0, 0, 0, 0,1.7453292519943295e-2, 0.0)), // degree
+//("???",       UNIT(0, 0, 0, 0, 0, 0, 0,2.908882086657216e-4, 0.0)), // arcminute
+//("???",       UNIT(0, 0, 0, 0, 0, 0, 0,4.84813681109536e-6, 0.0)), // arcsecond
+//("ha",        UNIT(0, 2, 0, 0, 0, 0, 0, 1e4, 0.0)), // hectare
+  ("l",         UNIT(0, 3, 0, 0, 0, 0, 0,1e-3, 0.0)), // liter
+//("L",         UNIT(0, 3, 0, 0, 0, 0, 0,1e-3, 0.0)), // liter
+//("t",         UNIT(0, 0, 1, 0, 0, 0, 0, 1e6, 0.0)), // tonne
+//("eV",        UNIT(-2,2, 1, 0, 0, 0, 0,1.602176634e-16, 0.0)), // electronvolt
+//("B",         UNIT(0, 0, 0, 0, 0, 0, 0,1e-2, 0.0)), // bel (dezibel dB)
+
+  /* custom units */
+  ("bar",       UNIT(-2,-1,1, 0, 0, 0, 0, 1e8, 0.0)), // bar = 100kPa
+  ("degF",      UNIT(0, 0, 0, 0, 1, 0, 0, 5.0/9.0, 459.67*5.0/9.0))//°Fahrenheit
+
+/* old implementation */
+/*                   fac,mol,cd, m, s, A, K, g*/
+//("VA",        UNIT(1e3, 0, 0, 2,-3, 0, 0, 1, 0.0)), //Voltampere=Watt
+//("var",       UNIT(1e3, 0, 0, 2,-3, 0, 0, 1, 0.0)), //Var=Watt
+//("R",         UNIT(2.58e-7, 0, 0, 0, 1, 1, 0,-1, 0.0)), //Röntgen    2, 58*10^-4 C/kg
+//("phon",      UNIT(1e0, 0, 0, 0, 0, 0, 0, 0, 0.0)), //Phon
+//("sone",      UNIT(1e0, 0, 0, 0, 0, 0, 0, 0, 0.0)), //Sone
+};
+
+public function getKnownUnits
+  output StringToUnitTable outKnownUnits;
+protected
+  String s;
+  Unit ut;
+algorithm
+  outKnownUnits := UnorderedMap.new<Unit>(stringHashDjb2, stringEq, Util.nextPrime(listLength(LU_COMPLEXUNITS)));
+
+  for unit in LU_COMPLEXUNITS loop
+    (s, ut) := unit;
+    UnorderedMap.add(s, ut, outKnownUnits);
+  end for;
+end getKnownUnits;
+
+public function getKnownUnitsInverse
+  output UnitToStringTable outKnownUnitsInverse;
+algorithm
+  outKnownUnitsInverse := UnorderedMap.new<String>(hash, isEqual, Util.nextPrime(listLength(LU_COMPLEXUNITS)));
+  addKnownUnitsInverse(outKnownUnitsInverse);
+end getKnownUnitsInverse;
+
+public function addKnownUnitsInverse
+  "Fills a table from UnorderedMap.new<String>(hash, isEqual) the way
+   getKnownUnitsInverse does, so it can be built only when first needed."
+  input UnitToStringTable table;
+protected
+  String s;
+  Unit ut;
+algorithm
+  for unit in LU_COMPLEXUNITS loop
+    (s, ut) := unit;
+    UnorderedMap.tryAdd(ut, s, table);
+  end for;
+end addKnownUnitsInverse;
+
+public function newCrefUnitTable
+  input Integer size;
+  output CrefToUnitTable table;
+algorithm
+  table := UnorderedMap.new<Unit>(ComponentRef.hash, ComponentRef.isEqual, size);
+end newCrefUnitTable;
+
+public function isUnit
+  input Unit inUnit;
+  output Boolean b;
+algorithm
+  b := match inUnit
+    case UNIT() then true;
+    else false;
+  end match;
+end isUnit;
+
+public function isMaster
+  input Unit unit;
+  output Boolean res;
+algorithm
+  res := match unit
+    case MASTER() then true;
+    else false;
+  end match;
+end isMaster;
+
+public function hash
+  input Unit inKey;
+  output Integer outHash = stringHashDjb2(unit2string(inKey));
+end hash;
+
+function realAlmostEqRel
+  // TODO move to MetaModelicaBuiltin.mo?
+  input Real a;
+  input Real b;
+  input Real relTol = 1e-3;
+  output Boolean c;
+algorithm
+  c := if a == b then true else relTol > abs(a - b)/(abs(a) + abs(b));
+end realAlmostEqRel;
+
+public function isEqual
+  "Dimensional equality: the offset is deliberately not compared, so degC and K
+   remain the same unit to the unit checker (and to `hash`, which goes through
+   unit2string). The offset exists to be exported, not to split unit identity."
+  input Unit unit1;
+  input Unit unit2;
+  output Boolean res;
+algorithm
+  res := match (unit1, unit2)
+    case (UNIT(), UNIT())
+    then  unit1.s   == unit2.s
+      and unit1.m   == unit2.m
+      and unit1.g   == unit2.g
+      and unit1.A   == unit2.A
+      and unit1.K   == unit2.K
+      and unit1.mol == unit2.mol
+      and unit1.cd  == unit2.cd
+      and realAlmostEqRel(unit1.factor, unit2.factor);
+
+    case (MASTER(), MASTER()) //equation
+      // lcr comparison????
+    then true;
+
+    case (UNKNOWN(), UNKNOWN()) then unit1.unit == unit2.unit;
+
+    else false;
+  end match;
+end isEqual;
+
+public function unit2string
+  input Unit unit;
+  output String outString;
+algorithm
+  outString := match unit
+    local
+      String s, str;
+      Boolean b;
+
+    case UNIT() algorithm
+      str := realString(unit.factor) + " * ";
+
+      b := false;
+      s := "mol^(" + intString(unit.mol) + ")";
+      s := if intEq(unit.mol, 0) then "" else s;
+      b := b or intNe(unit.mol, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.cd, 0) then " * " else "";
+      str := str + s;
+      s := "cd^(" + intString(unit.cd) + ")";
+      s := if intEq(unit.cd, 0) then "" else s;
+      b := b or intNe(unit.cd, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.m, 0) then " * " else "";
+      str := str + s;
+      s := "m^(" + intString(unit.m) + ")";
+      s := if intEq(unit.m, 0) then "" else s;
+      b := b or intNe(unit.m, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.s, 0) then " * " else "";
+      str := str + s;
+      s := "s^(" + intString(unit.s) + ")";
+      s := if intEq(unit.s, 0) then "" else s;
+      b := b or intNe(unit.s, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.A, 0) then " * " else "";
+      str := str + s;
+      s := "A^(" + intString(unit.A) + ")";
+      s := if intEq(unit.A, 0) then "" else s;
+      b := b or intNe(unit.A, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.K, 0) then " * " else "";
+      str := str + s;
+      //s := "(K-" + realString(unit.shift) + ")^(" + intString(unit.K) + ")";
+      s := "K^(" + intString(unit.K) + ")";
+      s := if intEq(unit.K, 0) then "" else s;
+      b := b or intNe(unit.K, 0);
+      str := str + s;
+
+      s := if b and intNe(unit.g, 0) then " * " else "";
+      str := str + s;
+      s := "g^(" + intString(unit.g) + ")";
+      s := if intEq(unit.g, 0) then "" else s;
+      b := b or intNe(unit.g, 0);
+      str := str + s;
+
+      str := str + (if b then "" else "1");
+    then str;
+
+    case MASTER()   then List.toStringCustom(unit.varList, ComponentRef.toString, "MASTER", "(", ", ", ")");
+    case UNKNOWN()  then "UNKOWN(" + unit.unit + ")";
+  end match;
+end unit2string;
+
+protected function isOne
+  "The dimensionless identity, which composing against changes nothing."
+  input Unit unit;
+  output Boolean res;
+algorithm
+  res := match unit
+    case UNIT() then unit.s == 0 and unit.m == 0 and unit.g == 0 and unit.A == 0
+      and unit.K == 0 and unit.mol == 0 and unit.cd == 0
+      and unit.factor == 1.0 and unit.offset == 0.0;
+    else false;
+  end match;
+end isOne;
+
+public function unitMul
+  "An affine unit only survives multiplication by the identity: degC*s is a
+   ratio scale, not a shifted one, and parser3 builds every unit as ONE*u."
+  input Unit inUnit1;
+  input Unit inUnit2;
+  output Unit outUnit;
+algorithm
+  outUnit := match (inUnit1, inUnit2)
+    case (UNIT(), UNIT())
+    then UNIT(
+      s   = inUnit1.s + inUnit2.s,
+      m   = inUnit1.m + inUnit2.m,
+      g   = inUnit1.g + inUnit2.g,
+      A   = inUnit1.A + inUnit2.A,
+      K   = inUnit1.K + inUnit2.K,
+      mol = inUnit1.mol + inUnit2.mol,
+      cd  = inUnit1.cd + inUnit2.cd,
+      factor = inUnit1.factor * inUnit2.factor,
+      offset = if isOne(inUnit1) then inUnit2.offset
+               elseif isOne(inUnit2) then inUnit1.offset else 0.0
+    );
+  end match;
+end unitMul;
+
+public function unitDiv
+  input Unit inUnit1;
+  input Unit inUnit2;
+  output Unit outUnit;
+algorithm
+  outUnit := match (inUnit1, inUnit2)
+    case (UNIT(), UNIT())
+    then UNIT(
+      s   = inUnit1.s - inUnit2.s,
+      m   = inUnit1.m - inUnit2.m,
+      g   = inUnit1.g - inUnit2.g,
+      A   = inUnit1.A - inUnit2.A,
+      K   = inUnit1.K - inUnit2.K,
+      mol = inUnit1.mol - inUnit2.mol,
+      cd  = inUnit1.cd - inUnit2.cd,
+      factor = inUnit1.factor / inUnit2.factor,
+      offset = if isOne(inUnit2) then inUnit1.offset else 0.0
+    );
+  end match;
+end unitDiv;
+
+public function unitPow
+  input Unit inUnit;
+  input Integer inExp "exponent";
+  output Unit outUnit;
+algorithm
+  outUnit := match inUnit
+    case UNIT()
+    then UNIT(
+      s   = inUnit.s * inExp,
+      m   = inUnit.m * inExp,
+      g   = inUnit.g * inExp,
+      A   = inUnit.A * inExp,
+      K   = inUnit.K * inExp,
+      mol = inUnit.mol * inExp,
+      cd  = inUnit.cd * inExp,
+      factor = inUnit.factor^inExp,
+      offset = if inExp == 1 then inUnit.offset else 0.0
+    );
+  end match;
+end unitPow;
+
+public function unitMulReal
+  input Unit inUnit;
+  input Real inFactor;
+  output Unit outUnit;
+algorithm
+  outUnit := match inUnit
+    local
+      Unit unit;
+    case unit as UNIT() algorithm
+      unit.factor := unit.factor * inFactor;
+      unit.offset := unit.offset * inFactor;
+    then unit;
+  end match;
+end unitMulReal;
+
+public function unitRoot
+  input Unit inUnit;
+  input Real inExponent;
+  output Unit outUnit;
+algorithm
+  outUnit := match inUnit
+    local
+      Real r, factor;
+      Integer i, s, m, g, A, K, mol, cd;
+
+    case UNIT() algorithm
+      i := realInt(inExponent);
+      r := realDiv(1.0, inExponent);
+      factor := realPow(inUnit.factor, r);
+
+      r := realDiv(intReal(inUnit.s),inExponent);
+      s := intDiv(inUnit.s, i);
+      true := realEq(r, intReal(s));
+
+      r := realDiv(intReal(inUnit.m),inExponent);
+      m := intDiv(inUnit.m, i);
+      true := realEq(r, intReal(m));
+
+      r := realDiv(intReal(inUnit.g),inExponent);
+      g := intDiv(inUnit.g, i);
+      true := realEq(r, intReal(g));
+
+      r := realDiv(intReal(inUnit.A),inExponent);
+      A := intDiv(inUnit.A, i);
+      true := realEq(r, intReal(A));
+
+      r := realDiv(intReal(inUnit.K),inExponent);
+      K := intDiv(inUnit.K, i);
+      true := realEq(r, intReal(K));
+
+      r := realDiv(intReal(inUnit.mol),inExponent);
+      mol := intDiv(inUnit.mol, i);
+      true := realEq(r, intReal(mol));
+
+      r := realDiv(intReal(inUnit.cd),inExponent);
+      cd := intDiv(inUnit.cd, i);
+      true := realEq(r, intReal(cd));
+    then UNIT(s, m, g, A, K, mol, cd, factor, 0.0);
+  end match;
+end unitRoot;
+
+public function unitString "Unit to Modelica unit string"
+  input Unit inUnit;
+  input UnitToStringTable inHtU2S = getKnownUnitsInverse();
+  output String outString;
+protected
+  Option<String> opt_s;
+  String s, s1, s2, s3, s4, s5, s6, s7, sExponent;
+  Boolean b;
+  Unit unit;
+algorithm
+  opt_s := UnorderedMap.get(inUnit, inHtU2S);
+
+  if isSome(opt_s) then
+    SOME(outString) := opt_s;
+    return;
+  end if;
+
+  outString := match inUnit
+    case unit as UNIT() algorithm
+      s := if unit.factor == 1.0 then "" else prefix2String(unit.factor);
+      b := false;
+      sExponent := if intEq(unit.mol, 1) then "" else intString(unit.mol);
+      s1 := "mol" + sExponent;
+      s1 := if intEq(unit.mol, 0) then "" else s1;
+      b := b or intNe(unit.mol, 0);
+
+      s2 := if b and intNe(unit.cd, 0) then "." else "";
+      sExponent := if intEq(unit.cd, 1) then "" else intString(unit.cd);
+      s2 := s2 + "cd" + sExponent;
+      s2 := if intEq(unit.cd, 0) then "" else s2;
+      b := b or intNe(unit.cd, 0);
+
+      s3 := if b and intNe(unit.m, 0) then "." else "";
+      sExponent := if intEq(unit.m, 1) then "" else intString(unit.m);
+      s3 := s3 + "m" + sExponent;
+      s3 := if intEq(unit.m, 0) then "" else s3;
+      b := b or intNe(unit.m, 0);
+
+      s4 := if b and intNe(unit.s, 0) then "." else "";
+      sExponent := if intEq(unit.s, 1) then "" else intString(unit.s);
+      s4 := s4 + "s" + sExponent;
+      s4 := if intEq(unit.s, 0) then "" else s4;
+      b := b or intNe(unit.s, 0);
+
+      s5 := if b and intNe(unit.A, 0) then "." else "";
+      sExponent := if intEq(unit.A, 1) then "" else intString(unit.A);
+      s5 := s5 + "A" + sExponent;
+      s5 := if intEq(unit.A, 0) then "" else s5;
+      b := b or intNe(unit.A, 0);
+
+      s6 := if b and intNe(unit.K, 0) then "." else "";
+      sExponent := if intEq(unit.K, 1) then "" else intString(unit.K);
+      s6 := s6 + "K" + sExponent;
+      s6 := if intEq(unit.K, 0) then "" else s6;
+      b := b or intNe(unit.K, 0);
+
+      s7 := if b and intNe(unit.g, 0) then "." else "";
+      sExponent := if intEq(unit.g, 1) then "" else intString(unit.g);
+      s7 := s7 + "g" + sExponent;
+      s7 := if intEq(unit.g, 0) then "" else s7;
+      b := b or intNe(unit.g, 0);
+
+      s := if b then s + s1 + s2 + s3 + s4 + s5 + s6 + s7 else "1";
+    then s;
+
+    else algorithm
+      Error.addCompilerWarning("function Unit.unitString failed for \"" + unit2string(inUnit) +"\".");
+    then fail();
+  end match;
+end unitString;
+
+protected function prefix2String
+  "from https://www.bipm.org/en/measurement-units/si-prefixes"
+  input Real inReal;
+  output String outPrefix;
+algorithm
+  outPrefix := match inReal
+    case 1e30   then "Q";   // quetta
+    case 1e27   then "R";   // ronna
+    case 1e24   then "Y";   // yotta
+    case 1e21   then "Z";   // zetta
+    case 1e18   then "E";   // exa
+    case 1e15   then "P";   // peta
+    case 1e12   then "T";   // tera
+    case 1e9    then "G";   // giga
+    case 1e6    then "M";   // mega
+    case 1e3    then "k";   // kilo
+    case 1e2    then "h";   // hecto
+    case 1e1    then "da";  // deca
+    case 1e-1   then "d";   // deci
+    case 1e-2   then "c";   // centi
+    case 1e-3   then "m";   // milli
+    case 1e-6   then "u";   // micro
+    case 1e-9   then "n";   // nano
+    case 1e-12  then "p";   // pico
+    case 1e-15  then "f";   // femto
+    case 1e-18  then "a";   // atto
+    case 1e-21  then "z";   // zepto
+    case 1e-24  then "y";   // yocto
+    case 1e-27  then "r";   // ronto
+    case 1e-30  then "q";   // quecto
+    else realString(inReal);
+  end match;
+end prefix2String;
+
+public function parseUnitString "author: lochel
+  The second argument is optional."
+  input String inUnitString;
+  input StringToUnitTable inKnownUnits = getKnownUnits();
+  input SourceInfo info = Absyn.dummyInfo;
+  output Unit outUnit;
+protected
+  list<String> charList;
+  list<Token> tokenList;
+algorithm
+  charList := stringListStringChar(inUnitString);
+  if listEmpty(charList) then
+    fail();
+  end if;
+
+  try
+    tokenList := lexer(charList);
+  else
+    Error.addSourceMessage(Error.INVALID_UNIT, {inUnitString}, info);
+    fail();
+  end try;
+
+  outUnit := parser3({true, true}, tokenList, NFUnit.ONE, inKnownUnits);
+  if not isUnit(outUnit) then
+    if Flags.isSet(Flags.FAILTRACE) then
+      Debug.traceln(getInstanceName() + ": failed to parse unit string " + inUnitString);
+    end if;
+  end if;
+end parseUnitString;
+
+protected function parser3
+  input list<Boolean> inMul "true=Mul, false=Div, initial call with true";
+  input list<Token> inTokenList "Tokenliste";
+  input Unit inUnit "initial call with NFUnit.ONE";
+  input StringToUnitTable inHtS2U;
+  output Unit outUnit;
+algorithm
+  outUnit := matchcontinue(inMul, inTokenList)
+    local
+      String s, unit;
+      list<Token> tokens;
+      Unit ut;
+      Integer exponent;
+      Boolean bMul, b;
+      list<Boolean> bRest;
+
+    // ""
+    case ({true}, {}) then inUnit;
+
+    // "1"
+    case (bMul::bRest, T_NUMBER(number=1)::tokens) algorithm
+      ut := NFUnit.ONE;
+      ut := if bMul then unitMul(inUnit,ut) else unitDiv(inUnit, ut);
+      ut := parser3(bRest, tokens, ut, inHtS2U);
+    then ut;
+
+    // "unit^i"
+    case (bMul::bRest, T_UNIT(unit=s)::T_NUMBER(exponent)::tokens) algorithm
+      ut := unitToken2unit(s, inHtS2U);
+      ut := unitPow(ut, exponent);
+      ut := if bMul then unitMul(inUnit,ut) else unitDiv(inUnit, ut);
+      ut := parser3(bRest, tokens, ut, inHtS2U);
+    then ut;
+
+    // "unit"
+    case (bMul::bRest, T_UNIT(unit=s)::tokens) algorithm
+      ut := unitToken2unit(s, inHtS2U);
+      ut := if bMul then unitMul(inUnit,ut) else unitDiv(inUnit, ut);
+      ut := parser3(bRest, tokens, ut, inHtS2U);
+    then ut;
+
+    // "*("
+    case (bMul::_, T_MUL()::T_LPAREN()::tokens) algorithm
+      ut := parser3(bMul::bMul::inMul, tokens, inUnit, inHtS2U);
+    then ut;
+
+    // "/("
+    case (bMul::_, T_DIV()::T_LPAREN()::tokens) algorithm
+      b := not bMul;
+      ut := parser3(b::b::inMul, tokens, inUnit, inHtS2U);
+    then ut;
+
+    // ")"
+    case (_::bRest, T_RPAREN()::tokens) algorithm
+      ut := parser3(bRest, tokens, inUnit, inHtS2U);
+    then ut;
+
+    // "*"
+    case (bMul::_, T_MUL()::tokens) algorithm
+      ut := parser3(bMul::inMul, tokens, inUnit, inHtS2U);
+    then ut;
+
+    // "/"
+    case (bMul::_, T_DIV()::tokens) algorithm
+      b := not bMul;
+      ut := parser3(b::inMul, tokens, inUnit, inHtS2U);
+    then ut;
+
+    else UNKNOWN("");
+  end matchcontinue;
+end parser3;
+
+protected function unitToken2unit
+  input String inS;
+  input StringToUnitTable inHtS2U;
+  output Unit outUnit;
+protected
+  Option<Unit> opt_unit;
+  String s;
+  Real r;
+algorithm
+  opt_unit := UnorderedMap.get(inS, inHtS2U);
+
+  if isSome(opt_unit) then
+    SOME(outUnit) := opt_unit;
+  else
+    s := stringGetStringChar(inS, 1);
+    (r, s) := getPrefix(s, inS);
+    outUnit := unitToken2unit(s, inHtS2U);
+    outUnit := unitMulReal(outUnit, r);
+  end if;
+end unitToken2unit;
+
+protected function getPrefix
+  input String inS;
+  input String inS2;
+  output Real outR;
+  output String  outUnit;
+algorithm
+  (outR, outUnit) := matchcontinue inS
+    local
+      list<String> strRest;
+      String s;
+
+    case "y" //-24
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-24, s);
+
+    case "z" //-21
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-21, s);
+
+    case "a" //-18
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-18, s);
+
+    case "f" //-15
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-15, s);
+
+    case "p" //-12
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-12, s);
+
+    case "u" //-6
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-6, s);
+
+    case "m" //-3
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-3, s);
+
+    case "c" //-2
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-2, s);
+
+    case "d"  //+1
+      algorithm
+        strRest := stringListStringChar(inS2);
+        "d"::"a"::strRest := strRest;
+        s := stringCharListString(strRest);
+    then (1e1, s);
+
+    case "d" //-1
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e-1, s);
+
+    case "h" //+2
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e2, s);
+
+    case "k" //+3
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e3, s);
+
+    case "M" //+6
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e6, s);
+
+    case "G" //+9
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e9, s);
+
+    case "T" //+12
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e12, s);
+
+    case "P" //+15
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e15, s);
+
+    case "E" //+18
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e18, s);
+
+    case "Z" //+21
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e21, s);
+
+    case "Y" //+24
+      algorithm
+        _::strRest := stringListStringChar(inS2);
+        s := stringCharListString(strRest);
+    then (1e24, s);
+
+    else fail();
+  end matchcontinue;
+end getPrefix;
+
+protected function lexer "author: lochel
+  Tokenizer: charList to tokenList"
+  input list<String> inCharList;
+  output list<Token> outTokenList;
+algorithm
+  outTokenList := matchcontinue inCharList
+    local
+      list<String> charList;
+      String number;
+      String unit;
+      list<Token> tokenList;
+      Integer i;
+
+    case {} then {};
+
+    case "."::charList algorithm
+      tokenList := lexer(charList);
+    then T_MUL()::tokenList;
+
+    case "("::charList algorithm
+      tokenList := lexer(charList);
+    then T_LPAREN()::tokenList;
+
+    case ")"::charList algorithm
+      tokenList := lexer(charList);
+    then T_RPAREN()::tokenList;
+
+    case "/"::charList algorithm
+      tokenList := lexer(charList);
+    then T_DIV()::tokenList;
+
+    case "+"::charList algorithm
+      (charList, number) := popNumber(charList);
+      false := (number == "");
+      tokenList := lexer(charList);
+      i := stringInt(number);
+    then T_NUMBER(i)::tokenList;
+
+    case "-"::charList algorithm
+      (charList, number) := popNumber(charList);
+      false := (number == "");
+      tokenList := lexer(charList);
+      i := -stringInt(number);
+    then T_NUMBER(i)::tokenList;
+
+    case charList algorithm
+      (charList, number) := popNumber(charList);
+      false := (number == "");
+      tokenList := lexer(charList);
+      i := stringInt(number);
+    then T_NUMBER(i)::tokenList;
+
+    case charList algorithm
+      (charList, unit) := popUnit(charList);
+      false := (unit == "");
+      tokenList := lexer(charList);
+    then T_UNIT(unit)::tokenList;
+
+  end matchcontinue;
+end lexer;
+
+protected function popUnit
+  input list<String> inCharList;
+  output list<String> outCharList;
+  output String outUnit;
+algorithm
+  (outCharList, outUnit) := match inCharList
+    local
+      String s1, s2;
+      list<String> strRest;
+
+    case {}
+    then ({}, "");
+
+    case s1::strRest guard (stringCompare(s1, "a") >= 0) and (stringCompare(s1, "z") <= 0) algorithm
+      (strRest, s2) := popUnit(strRest);
+    then (strRest, s1 + s2);
+
+    case s1::strRest guard (stringCompare(s1, "A") >= 0) and (stringCompare(s1, "Z") <= 0) algorithm
+      (strRest, s2) := popUnit(strRest);
+    then (strRest, s1 + s2);
+
+    else (inCharList, "");
+  end match;
+end popUnit;
+
+protected function popNumber
+  input list<String> inCharList;
+  output list<String> outCharList;
+  output String outNumber;
+algorithm
+  (outCharList, outNumber) := matchcontinue inCharList
+    local
+      String s1, s2;
+      list<String> strRest;
+      Integer i;
+
+    case {}
+    then ({}, "");
+
+    case s1::strRest algorithm
+      i := stringInt(s1);
+      true := (intString(i) == s1);
+      (strRest, s2) := popNumber(strRest);
+    then (strRest, s1 + s2);
+
+    else (inCharList, "");
+  end matchcontinue;
+end popNumber;
+
+annotation(__OpenModelica_Interface="nf_frontend");
+end NFUnit;

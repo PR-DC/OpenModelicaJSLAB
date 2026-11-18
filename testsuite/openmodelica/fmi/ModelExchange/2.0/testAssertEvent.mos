@@ -1,0 +1,88 @@
+// name:     testAssertEvent
+// keywords: fmu export import assert
+// status: correct
+// teardown_command: rm -rf binaries sources modelDescription.xml R134a_pTX_phX_all* resources
+
+// testAssert's counterpart: the assert() is violated at a point that is a real
+// event, so the event update forgives it instead of throwing.
+// ModelicaTest.Media.TestOnly.R134a_pTX_phX_all, inlined so the assert position does
+// not name the library path, and stopped right after the first violation at 0.230204.
+
+loadModel(Modelica,{"4.1.0"}); getErrorString();
+loadString("
+model R134a_pTX_phX_all
+  package Medium = Modelica.Media.R134a.R134a_ph;
+  parameter Medium.AbsolutePressure pmin = 0.0042e5;
+  parameter Medium.AbsolutePressure pmax = 700e5;
+  parameter Modelica.Units.SI.PerUnit p_increase = 2;
+  parameter Medium.Temperature Tmin = 190;
+  parameter Medium.Temperature Tmax = 450;
+
+  Medium.ThermodynamicState state = Medium.setState_pTX(p,T);
+  Medium.Temperature Tsat = Medium.saturationTemperature(p);
+  Medium.AbsolutePressure p;
+  Medium.Temperature T;
+  Medium.Density d = Medium.density(state);
+  Medium.SpecificEnthalpy h = Medium.specificEnthalpy(state);
+  Medium.ThermalConductivity k = Medium.thermalConductivity(state);
+
+  Medium.ThermodynamicState state_check = Medium.setState_phX(p,h);
+  Medium.Temperature T_check = Medium.temperature(state_check);
+  Medium.Density d_check = Medium.density(state_check);
+
+  Modelica.Units.SI.PerUnit dT;
+initial equation
+  p = pmin;
+  T = Tmin;
+  dT = 100*45;
+equation
+  der(T) = dT;
+  when abs(T - Tsat) < 2 then
+    reinit(T, Tsat+4*sign(dT));
+  end when;
+  when {T > Tmax, T < Tmin} then
+    dT = -pre(dT);
+    p = pre(p)*p_increase;
+  end when;
+  assert(0.7e5 < h and h < 6e5, \"Specific enthalpy h out of bounds\");
+  assert(d > 0 and d < 1600, \"Density out of bounds\");
+  assert(abs(T - T_check)/T < 1e-3 and abs(d - d_check)/d < 1e-2, \"Convergence error\");
+end R134a_pTX_phX_all;
+"); getErrorString();
+
+buildModelFMU(R134a_pTX_phX_all, version="2.0"); getErrorString();
+importFMU("R134a_pTX_phX_all.fmu"); getErrorString();
+setCommandLineOptions("--allowNonStandardModelica=reinitInAlgorithms"); getErrorString();
+loadFile("R134a_pTX_phX_all_me_FMU.mo"); getErrorString();
+// The rejected solver steps before the event differ between runtimes, so
+// only check that the violated assert is ignored at the event.
+echo(false);
+res := simulate(R134a_pTX_phX_all_me_FMU, stopTime=0.2305);
+messages := res.messages;
+echo(true);
+getErrorString();
+res.resultFile;
+regexBool(messages, {"The following assertion has been violated at time 0.230204",
+  "Found event, previous asserts are ignored.", "The simulation finished successfully."}); getErrorString();
+
+// Result:
+// true
+// ""
+// true
+// ""
+// "R134a_pTX_phX_all.fmu"
+// "Notification: Building FMU for platform 'static' (1/1).
+// Notification: Finished FMU for platform 'static' (1/1).
+// "
+// "R134a_pTX_phX_all_me_FMU.mo"
+// ""
+// true
+// ""
+// true
+// ""
+// true
+// ""
+// "R134a_pTX_phX_all_me_FMU_res.mat"
+// {true, true, true}
+// ""
+// endResult

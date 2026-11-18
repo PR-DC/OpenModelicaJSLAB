@@ -1,0 +1,71 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+/*
+ * @author Adeel Asghar <adeel.asghar@liu.se>
+ */
+#ifndef SCALEDRAW_H
+#define SCALEDRAW_H
+
+#include "qwt_scale_draw.h"
+
+namespace OMPlot
+{
+class Plot;
+class ScaleDraw : public QwtScaleDraw
+{
+public:
+  ScaleDraw(bool prefixLabel, Plot *pParent);
+  QString getUnitPrefix() const {return mUnitPrefix;}
+  int getExponent() const {return mExponent;}
+  void invalidateCache() {QwtAbstractScaleDraw::invalidateCache();}
+  virtual QwtText label(double value) const override;
+protected:
+  /* Draw the axis backbone/ticks with the coordinates snapped to device pixels
+   * ( qRound( logical * dpr ) / dpr ) so that, even at a fractional device pixel
+   * ratio (e.g. 125% scaling on Windows), the lines sit on a fixed device pixel
+   * row/column. This keeps the backbone/ticks crisp and prevents them from being
+   * intermittently covered by the canvas edge while the plot is resized. */
+  virtual void drawTick(QPainter *painter, double value, double len) const override;
+  virtual void drawBackbone(QPainter *painter) const override;
+private:
+  bool mPrefixLabel;
+  Plot *mpParentPlot;
+  mutable QString mUnitPrefix;
+  mutable int mExponent;
+};
+}
+
+#endif // SCALEDRAW_H

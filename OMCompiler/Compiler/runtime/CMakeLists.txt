@@ -1,0 +1,250 @@
+# MSVC builds go without gettext and iconv, see systemimpl.h and systemimpl.c.
+if(NOT MSVC)
+  find_package(Intl REQUIRED)
+  find_package(Iconv REQUIRED)
+endif()
+
+if(OM_OMC_USE_LAPACK)
+  message(STATUS "Looking for LAPACK. This can be slow sometimes. Hang tight!")
+  find_package(LAPACK REQUIRED)
+
+  # Check if our lapack version have the deprecated functions.
+  set(CMAKE_REQUIRED_LIBRARIES_OLD ${CMAKE_REQUIRED_LIBRARIES})
+  set(CMAKE_REQUIRED_LIBRARIES ${LAPACK_LIBRARIES})
+  check_function_exists(dgeqpf_ OMC_HAVE_LAPACK_DEPRECATED)
+  set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_OLD})
+endif()
+
+# On Win32 we use system UUID lib which is one of the default libs that cmake adds to any target on Win32. On non Win32
+# systems we need to link explicitly to uuid. However, there is no FindUUID yet. We can add one later. Instead we use
+# find library for now. It should be okay for now since I am guessing uuid headers should be in the default include dirs
+# anyway.
+if(UNIX AND NOT APPLE)
+  find_library(UUID_LIB NAMES uuid REQUIRED)
+endif()
+
+
+# Existence checks
+#################################################################################################
+
+# Some example portability checks. Add more just like this if you need more.
+# e.g this will define HAVE_TIME_H 1 if found or HAVE_TIME_H 0 otherwise
+omc_check_header_exists_and_define(time.h)
+# e.g this will define HAVE_CTIME_S 1 if found or HAVE_CTIME_S 0 otherwise
+omc_check_function_exists_and_define(ctime_s)
+omc_check_function_exists_and_define(ctime_r)
+
+
+
+# Libraries
+##################################################################################################
+set(OMC_RUNTIME_SOURCES
+    Error_omc.cpp
+    Dynload_omc.cpp
+    Print_omc.c
+    ModelInstanceReference_omc.c
+    ErrorMessage.cpp
+    System_omc.c
+    Lapack_omc.cpp
+    omc_lapack.c
+    Settings_omc.cpp
+    UnitParserExt_omc.cpp
+    unitparser.cpp
+    IOStreamExt_omc.cpp
+    Socket_omc.c
+    ZeroMQ_omc.c
+    getMemorySize.c
+    OMSimulator_omc.c
+    is_utf8.c
+    om_zip.c
+    bootstrap_externals.c
+    ModelicaDiff_omc.c
+    PackageManagerExt_omc.c
+    SemanticVersion_omc.c
+    SimulationResults_omc.c
+    systemimplmisc.cpp
+    ffi_omc.cpp
+    OMGraphics.cpp
+    OMGraphics_omc.cpp)
+
+if(OM_OMC_ENABLE_COLPACK)
+  list(APPEND OMC_RUNTIME_SOURCES ColPackBicoloring_omc.cpp)
+endif()
+
+
+# ######################################################################################################################
+# Library: omcruntime
+add_library(omcruntime STATIC)
+add_library(omc::compiler::runtime ALIAS omcruntime)
+
+target_sources(omcruntime PRIVATE ${OMC_RUNTIME_SOURCES})
+
+target_link_libraries(omcruntime PUBLIC omc::config)
+target_link_libraries(omcruntime PUBLIC ${Intl_LIBRARIES})
+if(NOT MSVC)
+  target_link_libraries(omcruntime PUBLIC Iconv::Iconv)
+endif()
+target_link_libraries(omcruntime PUBLIC omc::mmc::runtime)
+# The scripting API reads, compares and converts result files through libomc_result.
+target_link_libraries(omcruntime PUBLIC omc::result)
+target_link_libraries(omcruntime PUBLIC omc::3rd::ffi)
+target_link_libraries(omcruntime PUBLIC omc::3rd::libzmq)
+target_link_libraries(omcruntime PUBLIC omc::3rd::simdjson)
+target_link_libraries(omcruntime PUBLIC omc::3rd::zlib)
+target_link_libraries(omcruntime PUBLIC omc::runtime_rust)
+
+if(OM_OMC_ENABLE_COLPACK)
+  target_link_libraries(omcruntime PUBLIC omc::3rd::colpack)
+endif()
+
+if(OM_OMC_USE_LAPACK)
+  if(WIN32)
+    # Do not import LAPACK into the compiler on Windows. OpenBLAS allocates its
+    # per-thread buffers in DllMain, which Windows charges as committed memory
+    # (~128 MB per hardware thread) on every omc process even though the
+    # compiler never writes to them. lapackimpl.c loads the library on demand
+    # instead, with the thread count pinned to one across the load. See #16638.
+    #
+    # Hand it the library the build resolved so it does not have to guess: an
+    # import library such as libopenblas.dll.a names the DLL beside it. Only the
+    # first entry is needed, it is the one carrying the LAPACK routines, and the
+    # loader in lapackimpl.c falls back to the usual names if it does not open.
+    list(GET LAPACK_LIBRARIES 0 OMC_LAPACK_DLL)
+    if(OMC_LAPACK_DLL MATCHES "^-l(.+)$")
+      # A bare linker flag rather than a path, e.g. -lopenblas.
+      set(OMC_LAPACK_DLL "lib${CMAKE_MATCH_1}")
+    endif()
+    get_filename_component(OMC_LAPACK_DLL "${OMC_LAPACK_DLL}" NAME)
+    string(REGEX REPLACE "\\.(a|lib)$" "" OMC_LAPACK_DLL "${OMC_LAPACK_DLL}")
+    if(NOT OMC_LAPACK_DLL MATCHES "\\.dll$")
+      set(OMC_LAPACK_DLL "${OMC_LAPACK_DLL}.dll")
+    endif()
+    message(STATUS "omc will load LAPACK on demand from ${OMC_LAPACK_DLL}")
+    target_compile_definitions(omcruntime PRIVATE OMC_LAPACK_DLL_NAMES="${OMC_LAPACK_DLL}")
+  else()
+    target_link_libraries(omcruntime PUBLIC ${LAPACK_LIBRARIES})
+  endif()
+endif()
+
+target_include_directories(omcruntime PUBLIC ${Intl_INCLUDE_DIRS})
+target_include_directories(omcruntime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(MSVC)
+  target_compile_definitions(omcruntime PRIVATE NOMINMAX)
+  # dirent.h for MSVC.
+  target_include_directories(omcruntime PRIVATE ${OMCompiler_SOURCE_DIR}/3rdParty/simdjson/windows)
+endif()
+
+# uuid is one of the default libs that cmake adds to any target on Win32. On non-Win systems we look for the library and
+# explicitly use it.
+if(UNIX AND NOT APPLE)
+  target_link_libraries(omcruntime PUBLIC ${UUID_LIB})
+endif()
+
+# Install omcruntime. It is needed by bootstrapping tests.
+install(TARGETS omcruntime)
+
+
+
+# ######################################################################################################################
+# Library: omcbackendruntime
+add_library(omcbackendruntime STATIC)
+add_library(omc::compiler::backendruntime ALIAS omcbackendruntime)
+
+set(OMC_BACKENDRUNTIIME_SOURCES
+    HpcOmSchedulerExt_omc.cpp
+    HpcOmBenchmarkExt_omc.cpp
+    TaskGraphResults_omc.cpp
+    ASSCEXT_omc.cpp
+    BackendDAEEXT_omc.cpp
+    matching.c
+    matching_cheap.c
+    FMI_omc.c
+    cJSON.c)
+
+target_sources(omcbackendruntime PRIVATE ${OMC_BACKENDRUNTIIME_SOURCES})
+
+target_link_libraries(omcbackendruntime PUBLIC omc::config)
+target_link_libraries(omcbackendruntime PUBLIC ${Intl_LIBRARIES})
+target_link_libraries(omcbackendruntime PUBLIC omc::mmc::runtime)
+target_link_libraries(omcbackendruntime PUBLIC omc::3rd::metis)
+target_link_libraries(omcbackendruntime PUBLIC omc::3rd::fmilib)
+target_link_libraries(omcbackendruntime PUBLIC omc::3rd::zlib)
+target_link_libraries(omcbackendruntime PUBLIC omc::3rd::FMIL::expat)
+target_include_directories(omcbackendruntime PUBLIC ${Intl_INCLUDE_DIRS})
+target_include_directories(omcbackendruntime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+################################################################################
+# This is a lazy approach to generating OMCompiler/omc_config.unix.h and Compiler/Util/Autoconf.mo
+# Needs to be refactored quite a bit. The variable names should be updated to be more
+# unique and descriptive.
+# However, If I do that I need to update the .in files which means the normal compilation is
+# also affected. As a result I would have to change a few things since many things depend on
+# the generated output files. For now just mimic the old compilation.
+
+
+# omc_config.unix.h generation lives in a standalone module so the Rust build
+# can run it too (Compiler/CMakeLists.txt includes it before its early return;
+# the simulation runtime needs the header but the Rust path skips this file).
+# Sets the platform/compiler vars and writes omc_config.unix.h into the build
+# tree; the feature vars set elsewhere in this file (above) are still in scope
+# for the configure_file inside it.
+include(${CMAKE_CURRENT_SOURCE_DIR}/omc_config_unix.cmake)
+
+# Generate Autoconf.mo here since we have some of the variables already defined for omc_config.unix.h above.
+
+
+check_c_compiler_flag("-Wl,-Bstatic  -Wl,-Bdynamic" BSTATIC_INT)
+if(BSTATIC_INT)
+  set(BSTATIC "true")
+else()
+  set(BSTATIC "false")
+endif()
+
+# For now assume mingw32-make is available here. It should be because it is what we use
+# to compile generated simulation code on Windows when omc is issuing the compilation.
+# This variable will substitute @ Autoconf.make.
+# Autoconf.make inturn (at least so far) is used to issue compilation of FMU sources.
+# For anything that is issued through SystemCall use this mingw32-make (instead of just 'make'
+# which is the MSYS make.) since the latter is not supposed to be used on Windows shells.
+# (systemCall uses 'cmd \c' to issue commands.)
+if (MINGW)
+  set(OMC_MAKE_EXE "mingw32-make")
+else()
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "FreeBSD")
+    set(OMC_MAKE_EXE "gmake")
+  else()
+    set(OMC_MAKE_EXE "make")
+  endif()
+endif()
+
+set(OMC_CMAKE_EXE "${CMAKE_COMMAND}")
+
+string(REPLACE ";" " " LAPACK_LIBRARIES_SPACE "${LAPACK_LIBRARIES}")
+
+if(MINGW)
+  set(CONFIG_OS "Windows_NT")
+elseif(MSVC)
+  set(CONFIG_OS "Windows_NT")
+elseif(APPLE)
+  set(CONFIG_OS "OSX")
+elseif(UNIX AND NOT APPLE)
+  set(CONFIG_OS ${OMC_TARGET_SYSTEM_NAME})
+else()
+   message(FATAL_ERROR "Unknow system for OpenModelica simulation code generation and compilation. OpenModelica does not know how to compile and simulate simulation code on this configuration.")
+endif()
+
+# RT_LDFLAGS_GENERATED_CODE* (the link flags for generated simulation/FMU code).
+include(${CMAKE_CURRENT_SOURCE_DIR}/rt_ldflags_generated_code.cmake)
+
+# Libraries linked into generated simulation code when --parmodauto is enabled (ParModelica auto + oneTBB).
+# OMC_PARMODELICA_TBB_LINK_NAME is resolved to oneTBB's default library name in OMCompiler/3rdParty/CMakeLists.txt.
+if(NOT OMC_PARMODELICA_TBB_LINK_NAME)
+  set(OMC_PARMODELICA_TBB_LINK_NAME tbb)
+endif()
+set(PARMODELICAAUTO_LDFLAGS " -lParModelicaAuto -l${OMC_PARMODELICA_TBB_LINK_NAME} ")
+
+# Written into the source tree, which all build directories share. A build from
+# prebuilt sources does not read it, so it leaves the file alone.
+if(NOT OM_OMC_PREBUILT_C_SOURCES)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../Util/Autoconf.mo.in ${CMAKE_CURRENT_SOURCE_DIR}/../Util/Autoconf.mo)
+endif()

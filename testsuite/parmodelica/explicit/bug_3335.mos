@@ -1,0 +1,29 @@
+// name: bug_3335
+// status: correct
+
+setCommandLineOptions("-g=ParModelica"); getErrorString();
+setDefaultOpenCLDevice(0); // 0 = auto-select a device with double precision support
+loadFile("bug_3335.mo"); getErrorString();
+simulate(ParArray.M, stopTime=1, numberOfIntervals=2); getErrorString();
+val(x[3], 0);
+val(y[2,3], 0);
+val(err, 0);
+
+// Result:
+// true
+// ""
+// true
+// true
+// ""
+// record SimulationResult
+//     resultFile = "ParArray.M_res.mat",
+//     simulationOptions = "startTime = 0.0, stopTime = 1.0, numberOfIntervals = 2, tolerance = 1e-6, method = 'auto', fileNamePrefix = 'ParArray.M', options = '', outputFormat = 'mat', variableFilter = '.*', cflags = '', simflags = ''",
+//     messages = "LOG_SUCCESS       | info    | The initialization finished successfully without homotopy method.
+// LOG_SUCCESS       | info    | The simulation finished successfully.
+// "
+// end SimulationResult;
+// ""
+// 15.0
+// 30.0
+// 0.0
+// endResult

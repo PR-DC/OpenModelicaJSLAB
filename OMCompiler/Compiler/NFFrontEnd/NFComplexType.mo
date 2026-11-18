@@ -1,0 +1,81 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated uniontype NFComplexType
+  import NFInstNode.InstNode;
+  import NFInstNode;
+  import Record = NFRecord;
+  import UnorderedMap;
+
+protected
+  import ComplexType = NFComplexType;
+
+public
+  record CLASS end CLASS;
+
+  record EXTENDS_TYPE
+    "Used for long class declarations extending from a type, e.g.:
+       type SomeType
+         extends Real;
+       end SomeType;"
+    NFInstNode.ScopeRef baseClass "Weakly: the class tree owns it.";
+  end EXTENDS_TYPE;
+
+  record CONNECTOR
+    list<NFInstNode.ScopeRef> potentials "Weakly: the class tree owns them.";
+    list<NFInstNode.ScopeRef> flows;
+    list<NFInstNode.ScopeRef> streams;
+  end CONNECTOR;
+
+  record EXPANDABLE_CONNECTOR
+    list<NFInstNode.ScopeRef> potentiallyPresents "Weakly: the class tree owns them.";
+    list<NFInstNode.ScopeRef> expandableConnectors;
+  end EXPANDABLE_CONNECTOR;
+
+  record RECORD
+    NFInstNode.ScopeRef constructor "Weakly: the class tree owns it.";
+    array<Record.Field> fields;
+    UnorderedMap<String, Integer> indexMap;
+  end RECORD;
+
+  record EXTERNAL_OBJECT
+    "Strong: a structor is stored here instead of in the class tree, so this
+     field is its only owner."
+    NFInstNode.ScopeRef constructor "Weakly: the class tree owns them.";
+    NFInstNode.ScopeRef destructor;
+  end EXTERNAL_OBJECT;
+
+annotation(__OpenModelica_Interface="nf_frontend");
+end NFComplexType;

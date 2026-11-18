@@ -1,0 +1,754 @@
+/*
+ * This file is part of OpenModelica.
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC),
+ * c/o Linköpings universitet, Department of Computer and Information Science,
+ * SE-58183 Linköping, Sweden.
+ *
+ * All rights reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF AGPL VERSION 3 LICENSE OR
+ * THIS OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8.
+ * ANY USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES
+ * RECIPIENT'S ACCEPTANCE OF THE OSMC PUBLIC LICENSE OR THE GNU AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium)
+ * Public License (OSMC-PL) are obtained from OSMC, either from the above
+ * address, from the URLs:
+ * http://www.openmodelica.org or
+ * https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica,
+ * and in the OpenModelica distribution.
+ *
+ * GNU AGPL version 3 is obtained from:
+ * https://www.gnu.org/licenses/licenses.html#GPL
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY SET FORTH
+ * IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF OSMC-PL.
+ *
+ * See the full OSMC Public License conditions for more details.
+ *
+ */
+
+encapsulated package ClassLoader
+" file:        ClassLoader.mo
+  package:     ClassLoader
+  description: Loading of classes from $OPENMODELICALIBRARY.
+
+
+  This module loads classes from $OPENMODELICALIBRARY. It exports several functions:
+  loadClass function
+  loadModel function
+  loadFile function"
+
+import Absyn;
+
+protected
+import AbsynUtil;
+import Autoconf;
+import BaseHashTable;
+import Config;
+import Error;
+import HashTableStringToProgram;
+import List;
+import PackageManagement;
+import Parser;
+import StringUtil;
+import System;
+import Testsuite;
+import Util;
+
+type HashTable = HashTableStringToProgram.HashTable;
+
+protected
+
+uniontype PackageOrder
+  record CLASSPART
+    Absyn.ClassPart cp;
+  end CLASSPART;
+  record ELEMENT
+    Absyn.ElementItem element;
+    Boolean pub "public";
+  end ELEMENT;
+  record CLASSLOAD
+    String cl;
+  end CLASSLOAD;
+end PackageOrder;
+
+uniontype LoadFileStrategy
+  record STRATEGY_HASHTABLE
+    HashTable ht;
+  end STRATEGY_HASHTABLE;
+  record STRATEGY_ON_DEMAND
+    String encoding;
+  end STRATEGY_ON_DEMAND;
+end LoadFileStrategy;
+
+public function notifyInstallable
+  "Tells how to install a library that is not found, if the package index
+   has it."
+  input String id;
+  input list<String> prios;
+protected
+  String version;
+  list<String> versions, commands;
+algorithm
+  version := match prios
+    case version::_ then version;
+    else "default";
+  end match;
+  versions := PackageManagement.versionsThatProvideTheWanted(id, version, printError=false);
+  if listEmpty(versions) then
+    return;
+  end if;
+  if version=="default" or version=="" then
+    commands := {"  installPackage("+id+")"};
+  else
+    commands := {};
+    if listMember(version, versions) then
+      commands := "  installPackage("+id+", \""+version+"\", exactMatch=true)" :: commands;
+    end if;
+    commands := "  installPackage("+id+", \""+version+"\", exactMatch=false)" :: commands;
+  end if;
+  if listHead(versions) <> version then
+    commands := "  installPackage("+id+", \""+listHead(versions)+"\", exactMatch=true)" :: commands;
+  end if;
+  Error.addMessage(Error.NOTIFY_PKG_FOUND, {stringDelimitList(commands, "\n")});
+end notifyInstallable;
+
+public function loadClassFromPath
+  "Loads the library id from a directory with a package.mo or from a .mo file,
+   given as a MODELICAPATH entry and a file name separated by /."
+  input String id;
+  input String path;
+  input Boolean encrypted = false;
+  output Absyn.Program outProgram;
+protected
+  Integer i = StringUtil.rfindChar(path, stringCharInt("/"));
+  String name = substring(path, i + 1, stringLength(path));
+  Option<Absyn.Class> cl;
+algorithm
+  Config.setLanguageStandardFromMSL(name);
+  cl := loadClassFromMp(id, substring(path, 1, i - 1), name, System.directoryExists(path), NONE(), encrypted);
+  outProgram := Absyn.PROGRAM(if isSome(cl) then {Util.getOption(cl)} else {}, Absyn.TOP());
+  checkOnLoadMessage(outProgram);
+end loadClassFromPath;
+
+public function loadClassFromMp
+  input String id "the actual class name";
+  input String path;
+  input String name;
+  input Boolean isDir;
+  input Option<String> optEncoding;
+  input Boolean encrypted = false;
+  output Option<Absyn.Class> outClass;
+algorithm
+  outClass := match isDir
+    local
+      String pd,encoding,encodingfile;
+      Option<Absyn.Class> cl;
+      list<String> filenames;
+      LoadFileStrategy strategy;
+      Boolean lveStarted = false;
+      Option<Integer> lveInstance;
+
+    case false
+      algorithm
+        pd := Autoconf.pathDelimiter;
+        /* Check for path/package.encoding; OpenModelica extension */
+        encodingfile := stringAppendList({path,pd,"package.encoding"});
+        encoding := System.trimChar(System.trimChar(if System.regularFileExists(encodingfile) then System.readFile(encodingfile) else Util.getOptionOrDefault(optEncoding,"UTF-8"),"\n")," ");
+        strategy := STRATEGY_ON_DEMAND(encoding);
+        cl := parsePackageFile(path + pd + name, strategy, false, Absyn.TOP(), id, encrypted);
+      then
+        cl;
+
+    case true
+      algorithm
+        /* Check for path/package.encoding; OpenModelica extension */
+        pd := Autoconf.pathDelimiter;
+        encodingfile := stringAppendList({path,pd,name,pd,"package.encoding"});
+        encoding := System.trimChar(System.trimChar(if System.regularFileExists(encodingfile) then System.readFile(encodingfile) else Util.getOptionOrDefault(optEncoding,"UTF-8"),"\n")," ");
+
+        lveInstance := NONE();
+        if encrypted then
+          (lveStarted, lveInstance) := Parser.startLibraryVendorExecutable(path + pd + name);
+          if not lveStarted then
+            Error.addMessage(Error.INTERNAL_ERROR, {"Unable to start library vendor executable."});
+            fail();
+          end if;
+        end if;
+
+        if (Testsuite.isRunning() or Config.noProc()==1) and not encrypted then
+          strategy := STRATEGY_ON_DEMAND(encoding);
+        else
+          filenames := getAllFilesFromDirectory(path + pd + name, encrypted);
+      // print("Files load in parallel:\n" + stringDelimitList(filenames, "\n") + "\n");
+          strategy := STRATEGY_HASHTABLE(Parser.parallelParseFiles(filenames, encoding, Config.noProc(), path + pd + name, lveInstance));
+        end if;
+        cl := loadCompletePackageFromMp(id, name, path, strategy, Absyn.TOP(), Error.getNumErrorMessages(), encrypted);
+        if (encrypted and lveStarted) then
+          Parser.stopLibraryVendorExecutable(lveInstance);
+        end if;
+      then
+        cl;
+  end match;
+end loadClassFromMp;
+
+protected function getAllFilesFromDirectory
+  input String dir;
+  input Boolean encrypted;
+  input list<String> acc = {};
+  output list<String> files;
+protected
+  list<String> subdirs;
+  String pd = Autoconf.pathDelimiter;
+algorithm
+  if encrypted then
+    files := (dir + pd + "package.moc") :: listAppend(list(dir + pd + f for f in System.mocFiles(dir)), acc);
+  else
+    files := (dir + pd + "package.mo") :: listAppend(list(dir + pd + f for f in System.moFiles(dir)), acc);
+  end if;
+  subdirs := list(dir + pd + d for d in List.filter2OnTrue(System.subDirectories(dir), existPackage, dir, encrypted));
+  files := List.fold1(subdirs, getAllFilesFromDirectory, encrypted, files);
+end getAllFilesFromDirectory;
+
+protected function loadCompletePackageFromMp
+"Loads a whole package from the ModelicaPaths defined in OPENMODELICALIBRARY"
+  input String id "actual class identifier";
+  input Absyn.Ident inIdent;
+  input String inString;
+  input LoadFileStrategy strategy;
+  input Absyn.Within inWithin;
+  input Integer numError;
+  input Boolean encrypted = false;
+  output Option<Absyn.Class> cl;
+algorithm
+  cl := matchcontinue (inIdent, inString, inWithin)
+    local
+      String pd,mp_1,packagefile,orderfile,pack,mp;
+      Absyn.Within within_;
+      list<String> tv;
+      list<Absyn.NamedArg> ca;
+      list<Absyn.ClassPart> cp;
+      Option<String> cmt;
+      Option<Absyn.Class> opt_cl;
+      Absyn.Class class_;
+      Absyn.Path path;
+      Absyn.Within w2;
+      list<PackageOrder> reverseOrder;
+      list<Absyn.Annotation> ann;
+    case (pack, mp, within_)
+      algorithm
+        pd := Autoconf.pathDelimiter;
+        mp_1 := stringAppendList({mp,pd,pack});
+        packagefile := stringAppendList({mp_1,pd,if encrypted then "package.moc" else "package.mo"});
+        orderfile := stringAppendList({mp_1,pd,"package.order"});
+        if not System.regularFileExists(packagefile) then
+          Error.addInternalError("Expected file " + packagefile + " to exist", sourceInfo());
+          fail();
+        end if;
+        // print("Look for " + packagefile + "\n");
+        opt_cl := parsePackageFile(packagefile, strategy, true, within_, id, encrypted);
+        // print("Got " + packagefile + "\n");
+        if (isSome(opt_cl)) then
+          class_ as Absyn.CLASS(body=Absyn.PARTS(tv,ca,cp,ann,cmt)) := Util.getOption(opt_cl);
+          reverseOrder := getPackageContentNames(class_, orderfile, mp_1, Error.getNumErrorMessages(), encrypted);
+          path := AbsynUtil.joinWithinPath(within_,Absyn.IDENT(id));
+          w2 := Absyn.WITHIN(path);
+          cp := List.fold4(reverseOrder, loadCompletePackageFromMp2, mp_1, strategy, w2, encrypted, {});
+          class_.body := Absyn.PARTS(tv,ca,cp,ann,cmt);
+          opt_cl := SOME(class_);
+        end if;
+      then opt_cl;
+    case (pack, mp, _)
+      algorithm
+        true := numError == Error.getNumErrorMessages();
+        Error.addInternalError("loadCompletePackageFromMp failed for unknown reason: mp=" + mp + " pack=" + pack, sourceInfo());
+      then fail();
+  end matchcontinue;
+end loadCompletePackageFromMp;
+
+protected function mergeBefore
+  input Absyn.ClassPart cp;
+  input list<Absyn.ClassPart> cps;
+  output list<Absyn.ClassPart> ocp;
+algorithm
+  ocp := match (cp,cps)
+    local
+      list<Absyn.ElementItem> ei1,ei2,ei;
+      list<Absyn.ClassPart> rest;
+    case (Absyn.PUBLIC(ei1),Absyn.PUBLIC(ei2)::rest)
+      algorithm
+        ei := listAppend(ei1,ei2);
+      then Absyn.PUBLIC(ei)::rest;
+    case (Absyn.PROTECTED(ei1),Absyn.PROTECTED(ei2)::rest)
+      algorithm
+        ei := listAppend(ei1,ei2);
+      then Absyn.PROTECTED(ei)::rest;
+    else cp::cps;
+  end match;
+end mergeBefore;
+
+protected function loadCompletePackageFromMp2
+"Loads a whole package from the ModelicaPaths defined in OPENMODELICALIBRARY"
+  input PackageOrder po "mo-file or directory";
+  input String mp;
+  input LoadFileStrategy strategy;
+  input Absyn.Within w1 "With the parent added";
+  input Boolean encrypted = false;
+  input list<Absyn.ClassPart> acc;
+  output list<Absyn.ClassPart> cps;
+algorithm
+  cps := match po
+    local
+      Absyn.ElementItem ei;
+      String pd,file,id;
+      Absyn.ClassPart cp;
+      Option<Absyn.Class> cl;
+      Boolean bDirectoryAndFileExists;
+
+    case CLASSPART(cp)
+      algorithm
+        cps := mergeBefore(cp,acc);
+      then cps;
+
+    case ELEMENT(ei,true)
+      algorithm
+        cps := mergeBefore(Absyn.PUBLIC({ei}),acc);
+      then cps;
+
+    case ELEMENT(ei,false)
+      algorithm
+        cps := mergeBefore(Absyn.PROTECTED({ei}),acc);
+      then cps;
+
+    case CLASSLOAD(id)
+      algorithm
+        pd := Autoconf.pathDelimiter;
+        file := mp + pd + id + (if encrypted then "/package.moc" else "/package.mo");
+        bDirectoryAndFileExists := System.directoryExists(mp + pd + id) and System.regularFileExists(file);
+        if bDirectoryAndFileExists then
+          cl := loadCompletePackageFromMp(id,id,mp,strategy,w1,Error.getNumErrorMessages(),encrypted);
+          if (isSome(cl)) then
+            ei := AbsynUtil.makeClassElement(Util.getOption(cl));
+            cps := mergeBefore(Absyn.PUBLIC({ei}),acc);
+          else
+            cps := acc;
+          end if;
+        else
+          file := mp + pd + id + (if encrypted then ".moc" else ".mo");
+          if not System.regularFileExists(file) then
+            Error.addInternalError("Expected file " + file + " to exist", sourceInfo());
+            fail();
+          end if;
+          cl := parsePackageFile(file, strategy, false, w1, id, encrypted);
+          if (isSome(cl)) then
+            ei := AbsynUtil.makeClassElement(Util.getOption(cl));
+            cps := mergeBefore(Absyn.PUBLIC({ei}),acc);
+          else
+            cps := acc;
+          end if;
+        end if;
+      then cps;
+
+  end match;
+end loadCompletePackageFromMp2;
+
+public function parsePackageFile
+  "Parses a file containing a single class that matches the within"
+  input String name;
+  input LoadFileStrategy strategy;
+  input Boolean expectPackage;
+  input Absyn.Within w1 "Expected within of the package";
+  input String pack "Expected name of the package";
+  input Boolean encrypted = false;
+  output Option<Absyn.Class> cl;
+protected
+  Absyn.Class class_;
+  list<Absyn.Class> cs;
+  Absyn.Within w2;
+  list<String> classNames;
+  SourceInfo info;
+  String str,s1,s2,cname;
+  Absyn.ClassDef body;
+algorithm
+  Absyn.PROGRAM(cs,w2) := getProgramFromStrategy(name, strategy);
+  classNames := List.map(cs, AbsynUtil.getClassName);
+  str := stringDelimitList(classNames,", ");
+  if not listLength(cs)==1 then
+    if encrypted then
+      cl := NONE();
+      return;
+    else
+      Error.addSourceMessage(Error.LIBRARY_ONE_PACKAGE_PER_FILE, {str}, SOURCEINFO(name,true,0,0,0,0,0.0));
+      fail();
+    end if;
+  end if;
+  (class_ as Absyn.CLASS(name=cname,body=body,info=info))::{} := cs;
+  cl := SOME(class_);
+  if not stringEqual(cname,pack) then
+    if stringEqual(System.tolower(cname), System.tolower(pack)) then
+      Error.addSourceMessage(Error.LIBRARY_UNEXPECTED_NAME_CASE_SENSITIVE, {pack,cname}, info);
+    else
+      Error.addSourceMessage(Error.LIBRARY_UNEXPECTED_NAME, {pack,cname}, info);
+      fail();
+    end if;
+  end if;
+  if expectPackage and not AbsynUtil.isParts(body) then
+    Error.addSourceMessage(Error.LIBRARY_EXPECTED_PARTS, {pack}, info);
+    fail();
+  elseif not (AbsynUtil.withinEqual(w1,w2) or Config.languageStandardAtMost(Config.LanguageStandard._2_x)) then
+     s1 := AbsynUtil.withinString(w1);
+     s2 := AbsynUtil.withinString(w2);
+     if AbsynUtil.withinEqualCaseInsensitive(w1,w2) then
+       Error.addSourceMessage(Error.LIBRARY_WITHIN_WRONG_CASE, {s1,s2}, info);
+     else
+       Error.addSourceMessage(Error.LIBRARY_UNEXPECTED_WITHIN, {s1,s2}, info);
+       fail();
+     end if;
+  end if;
+end parsePackageFile;
+
+protected function getBothPackageAndFilename
+  input String str;
+  input String mp;
+  output String out;
+algorithm
+  out := Testsuite.friendly(System.realpath(mp + "/" + str + ".mo")) + ", " + Testsuite.friendly(System.realpath(mp + "/" + str + "/package.mo"));
+end getBothPackageAndFilename;
+
+protected function getPackageContentNames
+  "Gets the names of packages to load before the package.mo, and the ones to load after"
+  input Absyn.Class cl;
+  input String filename;
+  input String mp;
+  input Integer numError;
+  input Boolean encrypted = false;
+  output list<PackageOrder> po "reverse";
+algorithm
+  po := matchcontinue cl
+    local
+      String contents, duplicatesStr, differencesStr;
+      list<String> duplicates, namesToFind, mofiles, subdirs, differences, intersection;
+      list<Absyn.ClassPart> cp;
+      SourceInfo info;
+      list<PackageOrder> po1, po2;
+
+    case Absyn.CLASS(body=Absyn.PARTS(classParts=cp),info=info)
+      algorithm
+        try
+          true := System.regularFileExists(filename);
+          contents := System.readFile(filename);
+          namesToFind := System.strtok(contents, "\n");
+          namesToFind := List.removeOnTrue("",stringEqual,List.map(namesToFind,System.trimWhitespace));
+          duplicates := List.sortedDuplicates(List.sort(namesToFind,Util.strcmpBool),stringEq);
+          duplicatesStr := stringDelimitList(duplicates, ", ");
+          Error.assertionOrAddSourceMessage(listEmpty(duplicates),Error.PACKAGE_ORDER_DUPLICATES,{duplicatesStr},SOURCEINFO(filename,true,0,0,0,0,0.0));
+
+          if encrypted then
+            // get all the .moc files in the directory!
+            mofiles := List.map(System.mocFiles(mp), Util.removeLast4Char);
+          else
+            // get all the .mo files in the directory!
+            mofiles := List.map(System.moFiles(mp), Util.removeLast3Char);
+          end if;
+          // get all the subdirs
+          subdirs := System.subDirectories(mp);
+          subdirs := List.filter2OnTrue(subdirs, existPackage, mp, encrypted);
+          // build a list
+          intersection := List.intersectionOnTrue(subdirs,mofiles,stringEq);
+          differencesStr := stringDelimitList(List.map1(intersection, getBothPackageAndFilename, mp), ", ");
+          Error.assertionOrAddSourceMessage(listEmpty(intersection),Error.PACKAGE_DUPLICATE_CHILDREN,{differencesStr},SOURCEINFO(filename,true,0,0,0,0,0.0));
+          mofiles := listAppend(subdirs,mofiles);
+          // check if all are present in the package.order
+          differences := List.setDifference(mofiles, namesToFind);
+          po1 := getPackageContentNamesinParts(namesToFind,cp,{});
+          (po1,differences) := List.map3Fold(po1,checkPackageOrderFilesExist,mp,info,encrypted,differences);
+
+          // issue a warning if not all are present
+          differencesStr := stringDelimitList(differences, "\n\t");
+          Error.assertionOrAddSourceMessage(listEmpty(differences),Error.PACKAGE_ORDER_FILE_NOT_COMPLETE,{differencesStr},SOURCEINFO(filename,true,0,0,0,0,0.0));
+
+          po2 := List.map(differences, makeClassLoad);
+
+          po := listAppend(po2, po1);
+        else // file not found
+          mofiles := List.map(System.moFiles(mp), Util.removeLast3Char) "Here .mo files in same directory as package.mo should be loaded as sub-packages";
+          subdirs := System.subDirectories(mp);
+          subdirs := List.filter2OnTrue(subdirs, existPackage, mp, encrypted);
+          mofiles := List.sort(listAppend(subdirs,mofiles), Util.strcmpBool);
+          // Look for duplicates
+          intersection := List.sortedDuplicates(mofiles,stringEq);
+          differencesStr := stringDelimitList(List.map1(intersection, getBothPackageAndFilename, mp), ", ");
+          Error.assertionOrAddSourceMessage(listEmpty(intersection),Error.PACKAGE_DUPLICATE_CHILDREN,{differencesStr},info);
+
+          po := listAppend(List.map(cp, makeClassPart),List.map(mofiles, makeClassLoad));
+        end try;
+      then
+        po;
+
+    case Absyn.CLASS(info=info)
+      algorithm
+        true := numError == Error.getNumErrorMessages();
+        Error.addSourceMessage(Error.INTERNAL_ERROR,{"getPackageContentNames failed for unknown reason"},info);
+      then fail();
+
+  end matchcontinue;
+end getPackageContentNames;
+
+protected function makeClassPart
+  input Absyn.ClassPart part;
+  output PackageOrder po;
+algorithm
+  po := CLASSPART(part);
+end makeClassPart;
+
+protected function makeElement
+  input Absyn.ElementItem el;
+  input Boolean pub;
+  output PackageOrder po;
+algorithm
+  po := ELEMENT(el,pub);
+end makeElement;
+
+protected function makeClassLoad
+  input String str;
+  output PackageOrder po;
+algorithm
+  po := CLASSLOAD(str);
+end makeClassLoad;
+
+protected function checkPackageOrderFilesExist
+  input output PackageOrder po;
+  input String mp;
+  input SourceInfo info;
+  input Boolean encrypted = false;
+  input output list<String> differences;
+algorithm
+  () := match po
+    local
+      String pd,str,str2,str3,str4;
+    case CLASSLOAD(str)
+      algorithm
+        pd := Autoconf.pathDelimiter;
+        str2 := str + (if encrypted then ".moc" else ".mo");
+        if not (System.directoryExists(mp + pd + str) or System.regularFileExists(mp + pd + str2)) then
+          try
+            str3 := List.find(System.moFiles(mp), function Util.stringEqCaseInsensitive(str2=System.tolower(str2)));
+          else
+            Error.addSourceMessage(Error.PACKAGE_ORDER_FILE_NOT_FOUND,{str},info);
+            fail();
+          end try;
+          Error.addSourceMessage(Error.PACKAGE_ORDER_CASE_SENSITIVE, {str, str2, str3}, info);
+          str4 := Util.removeLastNChar(str3,if encrypted then 4 else 3);
+          differences := List.removeOnTrue(str4, stringEq, differences);
+          po := CLASSLOAD(str4);
+        end if;
+      then ();
+    else ();
+  end match;
+end checkPackageOrderFilesExist;
+
+protected function existPackage
+  input String name;
+  input String mp;
+  input Boolean encrypted = false;
+  output Boolean b;
+protected
+  String pd;
+algorithm
+  pd := Autoconf.pathDelimiter;
+  b := System.regularFileExists(mp + pd + name + pd + (if encrypted then "package.moc" else "package.mo"));
+end existPackage;
+
+protected function getPackageContentNamesinParts
+  input list<String> inNamesToSort;
+  input list<Absyn.ClassPart> cps;
+  input list<PackageOrder> acc;
+  output list<PackageOrder> outOrder "reverse";
+algorithm
+  outOrder := match (inNamesToSort, cps)
+    local
+      list<Absyn.ClassPart> rcp;
+      list<Absyn.ElementItem> elts;
+      list<String> namesToSort;
+      Absyn.ClassPart cp;
+    case (namesToSort, {})
+      algorithm
+        outOrder := listAppend(List.mapReverse(namesToSort,makeClassLoad),acc);
+      then outOrder;
+    case (namesToSort, Absyn.PUBLIC(elts)::rcp)
+      algorithm
+        (outOrder,namesToSort) := getPackageContentNamesinElts(namesToSort,elts,acc,true);
+        outOrder := getPackageContentNamesinParts(namesToSort,rcp,outOrder);
+      then outOrder;
+    case (namesToSort, Absyn.PROTECTED(elts)::rcp)
+      algorithm
+        (outOrder,namesToSort) := getPackageContentNamesinElts(namesToSort,elts,acc,false);
+        outOrder := getPackageContentNamesinParts(namesToSort,rcp,outOrder);
+      then outOrder;
+    case (namesToSort, cp::rcp)
+      algorithm
+        outOrder := getPackageContentNamesinParts(namesToSort,rcp,CLASSPART(cp)::acc);
+      then outOrder;
+  end match;
+end getPackageContentNamesinParts;
+
+protected function getPackageContentNamesinElts
+  input list<String> inNamesToSort;
+  input list<Absyn.ElementItem> inElts;
+  input list<PackageOrder> po;
+  input Boolean pub;
+  output list<PackageOrder> outOrder;
+  output list<String> outNames;
+algorithm
+  (outOrder,outNames) := match (inNamesToSort, inElts)
+    local
+      String name1,name2;
+      list<String> namesToSort,names,compNames;
+      list<Absyn.ElementItem> elts;
+      Boolean b;
+      SourceInfo info;
+      list<Absyn.ComponentItem> comps;
+      Absyn.ElementItem ei;
+      PackageOrder orderElt,load;
+    case (namesToSort, {}) then (po,namesToSort);
+
+    case (name1::_, (ei as Absyn.ELEMENTITEM(Absyn.ELEMENT(specification=Absyn.COMPONENTS(components=comps),info=info)))::elts)
+      algorithm
+        compNames := List.map(comps,AbsynUtil.componentName);
+        (names,b) := matchCompNames(inNamesToSort,compNames,info);
+        orderElt := if b then makeElement(ei,pub) else makeClassLoad(name1);
+        (outOrder,names) := getPackageContentNamesinElts(names,if b then elts else inElts,orderElt :: po,pub);
+      then (outOrder,names);
+
+    case (name1::namesToSort, (ei as Absyn.ELEMENTITEM(Absyn.ELEMENT(specification=Absyn.CLASSDEF(class_=Absyn.CLASS(name=name2,info=info)))))::elts)
+      algorithm
+        load := makeClassLoad(name1);
+        b := name1 == name2;
+        Error.assertionOrAddSourceMessage(if b then not listMember(load,po) else true, Error.PACKAGE_MO_NOT_IN_ORDER, {name2}, info);
+        orderElt := if b then makeElement(ei,pub) else load;
+        (outOrder,names) := getPackageContentNamesinElts(namesToSort,if b then elts else inElts,orderElt :: po, pub);
+      then (outOrder,names);
+
+    case ({}, (Absyn.ELEMENTITEM(Absyn.ELEMENT(specification=Absyn.CLASSDEF(class_=Absyn.CLASS(name=name2,info=info)))))::_)
+      algorithm
+        load := makeClassLoad(name2);
+        Error.assertionOrAddSourceMessage(not listMember(load,po), Error.PACKAGE_MO_NOT_IN_ORDER, {name2}, info);
+        Error.addSourceMessage(Error.FOUND_ELEMENT_NOT_IN_ORDER_FILE, {name2}, info);
+        (outOrder,names) := getPackageContentNamesinElts(name2 :: inNamesToSort, inElts, po, pub);
+      then (outOrder,names);
+
+    case ({}, Absyn.ELEMENTITEM(Absyn.ELEMENT(specification=Absyn.COMPONENTS(components=Absyn.COMPONENTITEM(component=Absyn.COMPONENT(name=name2))::_),info=info))::_)
+      algorithm
+        load := makeClassLoad(name2);
+        Error.assertionOrAddSourceMessage(not listMember(load,po), Error.PACKAGE_MO_NOT_IN_ORDER, {name2}, info);
+        Error.addSourceMessage(Error.FOUND_ELEMENT_NOT_IN_ORDER_FILE, {name2}, info);
+        (outOrder,names) := getPackageContentNamesinElts(name2 :: inNamesToSort, inElts, po, pub);
+      then (outOrder,names);
+
+    case (namesToSort, ei::elts)
+      algorithm
+        (outOrder,names) := getPackageContentNamesinElts(namesToSort,elts,ELEMENT(ei,pub) :: po, pub);
+      then (outOrder,names);
+  end match;
+end getPackageContentNamesinElts;
+
+protected function matchCompNames
+  input list<String> names;
+  input list<String> comps;
+  input SourceInfo info;
+  output list<String> outNames;
+  output Boolean matchedNames;
+algorithm
+  (outNames,matchedNames) := match (names, comps)
+    local
+      Boolean b, b1;
+      String n1,n2;
+      list<String> rest1,rest2;
+
+    case (_, {}) then (names,true);
+
+    case (n1::rest1, n2::rest2)
+      algorithm
+        if (n1 == n2)
+        then
+          (rest1,b) := matchCompNames(rest1,rest2,info);
+          Error.assertionOrAddSourceMessage(b, Error.ORDER_FILE_COMPONENTS, {}, info);
+          b1 := true;
+        else
+          b1 := false;
+        end if;
+      then (rest1,b1);
+
+  end match;
+end matchCompNames;
+
+protected function packageOrderName
+  input PackageOrder ord;
+  output String name;
+algorithm
+  name := match ord
+    case CLASSLOAD(name) then name;
+    else "#";
+  end match;
+end packageOrderName;
+
+public function checkOnLoadMessage
+  "Checks annotation __OpenModelica_messageOnLoad for a message to display"
+  input Absyn.Program p1;
+protected
+  list<Absyn.Class> classes;
+algorithm
+  Absyn.PROGRAM(classes=classes) := p1;
+  List.map2(classes,AbsynUtil.getNamedAnnotationInClass,Absyn.IDENT("__OpenModelica_messageOnLoad"),checkOnLoadMessageWork);
+end checkOnLoadMessage;
+
+protected function checkOnLoadMessageWork
+  "Checks annotation __OpenModelica_messageOnLoad for a message to display"
+  input Option<Absyn.Modification> mod;
+  output Integer dummy;
+algorithm
+  dummy := match mod
+    local
+      String str;
+      SourceInfo info;
+    case SOME(Absyn.CLASSMOD(eqMod=Absyn.EQMOD(info=info,exp=Absyn.STRING(str))))
+      algorithm
+        Error.addSourceMessage(Error.COMPILER_NOTIFICATION_SCRIPTING,{str},info);
+      then 1;
+  end match;
+end checkOnLoadMessageWork;
+
+function getProgramFromStrategy
+  input String filename;
+  input LoadFileStrategy strategy;
+  output Absyn.Program program;
+protected
+  String f = filename;
+algorithm
+  program := match strategy
+    case STRATEGY_HASHTABLE()
+      algorithm
+        if not BaseHashTable.hasKey(filename, strategy.ht) then
+          // it might NOT be in the hashtable because of case issues, check that!
+          try
+            f := List.getMemberOnTrue(filename, BaseHashTable.hashTableKeyList(strategy.ht), Util.stringEqCaseInsensitive);
+            // adrpo: not needed, a warning is given earlier about the case of the file vs the class
+            //        Error.addSourceMessage(Error.COMPILER_WARNING, {"HashTable has entry for file:\n" + filename + "\nwith a different case:\n" + f + "\ncontinue ...\n"}, sourceInfo());
+          else
+            Error.addInternalError("HashTable missing file: " + filename + " - all entries include:\n" + stringDelimitList(BaseHashTable.hashTableKeyList(strategy.ht), "\n"), sourceInfo());
+            fail();
+          end try;
+        end if;
+      then BaseHashTable.get(f, strategy.ht);
+    case STRATEGY_ON_DEMAND() then Parser.parse(filename, strategy.encoding);
+  end match;
+end getProgramFromStrategy;
+
+annotation(__OpenModelica_Interface="loader");
+end ClassLoader;

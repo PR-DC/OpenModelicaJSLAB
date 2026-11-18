@@ -1,0 +1,496 @@
+/*
+ * This file belongs to the OpenModelica Run-Time System
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC), c/o Linköpings
+ * universitet, Department of Computer and Information Science, SE-58183 Linköping, Sweden. All rights
+ * reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF THE BSD NEW LICENSE OR THE
+ * AGPL VERSION 3 LICENSE OR THE OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8. ANY
+ * USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES RECIPIENT'S
+ * ACCEPTANCE OF THE BSD NEW LICENSE OR THE OSMC PUBLIC LICENSE OR THE AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium) Public License
+ * (OSMC-PL) are obtained from OSMC, either from the above address, from the URLs:
+ * http://www.openmodelica.org or https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica, and in the OpenModelica distribution. GNU
+ * AGPL version 3 is obtained from: https://www.gnu.org/licenses/licenses.html#GPL. The BSD NEW
+ * License is obtained from: http://www.opensource.org/licenses/BSD-3-Clause.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY
+ * SET FORTH IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF
+ * OSMC-PL.
+ *
+ */
+
+#include "events.h"
+#include "../../util/omc_error.h"
+#include "../options.h"
+#include "../../simulation_data.h"
+#include "../../openmodelica.h"         /* for modelica types */
+#include "../../openmodelica_func.h"    /* for modelica functions */
+#include "solver_main.h"
+#include "model_help.h"
+#include "external_input.h"
+#include "epsilon.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int maxBisectionIterations = 0;
+void bisection(DATA* data, threadData_t *threadData, double*, double*, double*, double*, LIST*, LIST*);
+
+/*! \fn checkForSampleEvent
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [solverInfo]
+ *  \return indicates if a time event is occurred or not.
+ *
+ *  Function check if a sample expression should be activated
+ *  before next step and sets then the next step size to the
+ *  time event.
+ *
+ */
+void checkForSampleEvent(DATA *data, SOLVER_INFO* solverInfo)
+{
+  double nextTimeStep = solverInfo->currentTime + solverInfo->currentStepSize;
+  /* A short run would otherwise lose output points to the pulled-in step. */
+  double eps = fmin(SAMPLE_EPS, 1e-9 * fabs(data->simulationInfo->stopTime - data->simulationInfo->startTime));
+
+  if ((data->simulationInfo->nextSampleEvent <= nextTimeStep + eps) && (data->simulationInfo->nextSampleEvent >= solverInfo->currentTime))
+  {
+    const double t = solverInfo->currentTime, te = data->simulationInfo->nextSampleEvent;
+    double h = te - t;
+    int i;
+    /* A relation `time >= te` only switches if the step lands on te exactly. */
+    for (i = 0; i < 4 && t + h < te; i++) h = nextafter(h, INFINITY);
+    for (i = 0; i < 4 && t + h > te; i++) h = nextafter(h, 0.0);
+    solverInfo->currentStepSize = h;
+    data->simulationInfo->sampleActivated = 1;
+    infoStreamPrint(OMC_LOG_EVENTS_V, 0, "Adjust step-size to %.15g at time %.15g to get next sample event at %.15g", solverInfo->currentStepSize, solverInfo->currentTime, data->simulationInfo->nextSampleEvent );
+  }
+}
+
+/*! \fn checkForStateEvent
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [eventList]
+ *
+ *  This function checks for events in interval=[oldTime, timeValue]
+ *  If a zero crossing function cause a sign change, root finding
+ *  process will start
+ */
+int checkForStateEvent(DATA* data, LIST *eventList)
+{
+  for(long i=0; i<data->modelData->nZeroCrossings; i++)
+  {
+    // Check if sign of zero crossing changed
+    if(sign(data->simulationInfo->zeroCrossings[i]) != sign(data->simulationInfo->zeroCrossingsPre[i]))
+    {
+      listPushFront(eventList, &(data->simulationInfo->zeroCrossingIndex[i]));
+    }
+  }
+
+  if(listLen(eventList) > 0)
+  {
+    return 1;
+  }
+
+  return 0;
+}
+
+/*! \fn checkEvents
+ *
+ *  This function check if a time event or a state event should
+ *  processed. If sample and state event have the same event-time
+ *  then time events are prioritize, since they handle also
+ *  state event. It returns 1 if state event is before time event
+ *  then it de-activate the time events.
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [threadData]
+ *  \param [ref] [eventLst]
+ *  \param [in]  [useRootFinding]
+ *  \param [out] [eventTime]
+ *  \return 0: no event; 1: time event; 2: state event
+ */
+int checkEvents(DATA* data, threadData_t *threadData, LIST* eventLst, modelica_boolean useRootFinding, double *eventTime)
+{
+  int found = checkForStateEvent(data, eventLst);
+  if(found && useRootFinding)
+  {
+    *eventTime = findRoot(data, threadData, eventLst, data->simulationInfo->timeValueOld, data->simulationInfo->realVarsOld, data->localData[0]->timeValue, data->localData[0]->realVars);
+    if (*eventTime < data->simulationInfo->nextSampleEvent)
+    {
+      data->simulationInfo->sampleActivated = 0;
+    }
+  }
+
+  if(data->simulationInfo->sampleActivated == 1)
+  {
+    return 1;
+  }
+
+  if(listLen(eventLst) > 0)
+  {
+    return 2;
+  }
+
+  return 0;
+}
+
+/* Chattering: numEvents state events in a row within less than the step size
+ * and intervalFraction*(stopTime-startTime). numEventLimit is the largest
+ * numEvents. */
+static const struct { int numEvents; double intervalFraction; } chatteringLimits[] = {
+  {1000, 1e-6},
+  {100, 1e-9}
+};
+
+static double chatteringTimeLimit(SIMULATION_INFO *simulationInfo, double intervalFraction)
+{
+  double interval = simulationInfo->stopTime - simulationInfo->startTime;
+  if (interval > 0 && isfinite(interval)) {
+    return fmin(simulationInfo->stepSize, intervalFraction * interval);
+  }
+  return simulationInfo->stepSize;
+}
+
+/*! \fn handleEvents
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [eventList]
+ *  \param [in]  [eventTime]
+ *
+ *  This handles all zero crossing events from event list at event time
+ */
+void handleEvents(DATA* data, threadData_t *threadData, LIST* eventLst, double *eventTime, SOLVER_INFO* solverInfo)
+{
+  double time = data->localData[0]->timeValue;
+  long i;
+  LIST_NODE* it;
+
+  /* time event */
+  if(data->simulationInfo->sampleActivated)
+  {
+    storePreValues(data);
+
+    /* activate time event */
+    for(i=0; i<data->modelData->nSamples; ++i) {
+      if(data->simulationInfo->nextSampleTimes[i] <= time + SAMPLE_EPS)
+      {
+        data->simulationInfo->samples[i] = 1;
+        infoStreamPrint(OMC_LOG_EVENTS, 0, "[%ld] sample(%g, %g)", data->modelData->samplesInfo[i].index, data->modelData->samplesInfo[i].start, data->modelData->samplesInfo[i].interval);
+      }
+    }
+
+    solverInfo->sampleEvents++;
+  }
+  /* state event */
+  if(listLen(eventLst)>0)
+  {
+    CHATTERING_INFO *chattering = &data->simulationInfo->chatteringInfo;
+    data->localData[0]->timeValue = *eventTime;
+    /* time = data->localData[0]->timeValue; */
+
+    if (omc_useStream[OMC_LOG_EVENTS])
+    {
+      for(it = listFirstNode(eventLst); it; it = listNextNode(it))
+      {
+        long ix = *((long*) listNodeData(it));
+        int *eq_indexes;
+        const char *exp_str = data->callback->zeroCrossingDescription(ix,&eq_indexes);
+        infoStreamPrintWithEquationIndexes(OMC_LOG_EVENTS, omc_dummyFileInfo, 0, eq_indexes, "[%ld] %s", ix+1, exp_str);
+      }
+    }
+
+    solverInfo->stateEvents++;
+    if (chattering->stateEventsInARow < chattering->numEventLimit) {
+      chattering->stateEventsInARow++;
+    }
+    chattering->lastTimes[chattering->currentIndex]=time;
+
+    for (i = 0; !chattering->messageEmitted && i < (long) (sizeof(chatteringLimits)/sizeof(chatteringLimits[0])); i++)
+    {
+      int numEvents = chatteringLimits[i].numEvents;
+      double t0, limit;
+      if (chattering->stateEventsInARow < numEvents) {
+        continue;
+      }
+      t0 = chattering->lastTimes[(chattering->currentIndex + chattering->numEventLimit - (numEvents-1)) % chattering->numEventLimit];
+      limit = chatteringTimeLimit(data->simulationInfo, chatteringLimits[i].intervalFraction);
+      if (time - t0 < limit)
+      {
+        long ix = *((long*) listNodeData(listFirstNode(eventLst)));
+        int *eq_indexes;
+        const char *exp_str = data->callback->zeroCrossingDescription(ix,&eq_indexes);
+        infoStreamPrintWithEquationIndexes(OMC_LOG_STDOUT, omc_dummyFileInfo, 0, eq_indexes, "Chattering detected around time %.12g..%.12g (%d state events in a row with a total time delta less than %.12g, the smaller of the step size and %g times the simulation interval). This can be a performance bottleneck. Use -lv LOG_EVENTS for more information. The zero-crossing was: %s", t0, time, numEvents, limit, chatteringLimits[i].intervalFraction, exp_str);
+        chattering->messageEmitted = 1;
+        if (omc_flag[FLAG_ABORT_SLOW])
+        {
+          throwStreamPrintWithEquationIndexes(threadData, omc_dummyFileInfo, eq_indexes, "Aborting simulation due to chattering being detected and the simulation flags requesting we do not continue further.");
+        }
+      }
+    }
+    chattering->currentIndex = (chattering->currentIndex+1) % chattering->numEventLimit;
+
+    listClear(eventLst);
+  } else {
+    data->simulationInfo->chatteringInfo.stateEventsInARow = 0;
+  }
+
+  /* update the whole system */
+  updateDiscreteSystem(data, threadData);
+  if (OMC_ERROR_RAISED()) {
+    return;
+  }
+  saveZeroCrossingsAfterEvent(data, threadData);
+  /*sim_result_emit(data);*/
+
+  updateNextSampleEvent(data, threadData);
+  data->simulationInfo->sampleActivated = 0;
+}
+
+/*! \fn findRoot
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [threadData]
+ *  \param [ref] [eventList]
+ *  \param [in]  [time_left]
+ *  \param [in]  [values_left]
+ *  \param [in]  [time_right]
+ *  \param [in]  [values_right]
+ *  \return: first event of interval [time_left, time_right]
+ */
+double findRoot(DATA* data, threadData_t* threadData, LIST* eventList, double time_left, double* values_left, double time_right, double* values_right)
+{
+  LIST_NODE* it;
+  fortran_integer i=0;
+  LIST *tmpEventList = allocList(eventListAlloc, eventListFree, eventListCopy);
+
+  /* static work arrays */
+  double *states_left = data->simulationInfo->states_left;
+  double *states_right = data->simulationInfo->states_right;
+
+
+  /* write states to work arrays */
+  memcpy(states_left,  values_left,  data->modelData->nStates * sizeof(double));
+  memcpy(states_right, values_right, data->modelData->nStates * sizeof(double));
+
+  for(it=listFirstNode(eventList); it; it=listNextNode(it))
+  {
+    infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "search for current event. Events in list: %ld", *((long*)listNodeData(it)));
+  }
+
+  /* Search for event time and event_id with bisection method */
+  bisection(data, threadData, &time_left, &time_right, states_left, states_right, tmpEventList, eventList);
+
+  /* what happens here? */
+  if(listLen(tmpEventList) == 0)
+  {
+    double value = fabs(data->simulationInfo->zeroCrossings[*((long*) listFirstData(eventList))]);
+    for(it = listFirstNode(eventList); it; it = listNextNode(it))
+    {
+      double fvalue = fabs(data->simulationInfo->zeroCrossings[*((long*) listNodeData(it))]);
+      if(value > fvalue)
+      {
+        value = fvalue;
+      }
+    }
+    infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "Minimum value: %e", value);
+    for(it = listFirstNode(eventList); it; it = listNextNode(it))
+    {
+      if(value == fabs(data->simulationInfo->zeroCrossings[*((long*) listNodeData(it))]))
+      {
+        listPushBack(tmpEventList, listNodeData(it));
+        infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "added tmp event : %ld", *((long*) listNodeData(it)));
+      }
+    }
+  }
+
+  listClear(eventList);
+
+  while(listLen(tmpEventList) > 0)
+  {
+    long event_id = *((long*)listFirstData(tmpEventList));
+    listPushFrontNodeNoCopy(eventList, listPopFrontNode(tmpEventList));
+    infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "Event id: %ld", event_id);
+  }
+
+  data->localData[0]->timeValue = time_left;
+  memcpy(data->localData[0]->realVars, states_left, data->modelData->nStates * sizeof(double));
+
+  /* determined continuous system */
+#ifdef OMC_FMI_RUNTIME
+  /* An FMU has no updateContinuousSystem; the importer sets the inputs. */
+  data->callback->functionODE(data, threadData);
+  data->callback->functionAlgebraics(data, threadData);
+#else
+  data->callback->updateContinuousSystem(data, threadData);
+#endif
+  updateRelationsPre(data);
+  /*sim_result_emit(data);*/
+
+  data->localData[0]->timeValue = time_right;
+  memcpy(data->localData[0]->realVars, states_right, data->modelData->nStates * sizeof(double));
+
+  freeList(tmpEventList);
+
+  return time_right;
+}
+
+/*! \fn bisection
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [a]
+ *  \param [ref] [b]
+ *  \param [ref] [states_a]
+ *  \param [ref] [states_b]
+ *  \param [ref] [eventListTmp]
+ *  \param [in]  [eventList]
+ *
+ *  Method to find root in interval [oldTime, timeValue]
+ */
+void bisection(DATA* data, threadData_t *threadData, double* a, double* b, double* states_a, double* states_b, LIST *tmpEventList, LIST *eventList)
+{
+  double TTOL = MINIMAL_STEP_SIZE + MINIMAL_STEP_SIZE*fabs(*b-*a); /* absTol + relTol*abs(b-a) */
+  double c;
+  long i=0;
+  /* n >= log(2)/log(2) + log(|b-a|/TOL)/log(2)*/
+  unsigned int n = maxBisectionIterations > 0 ? maxBisectionIterations : 1 + ceil(log(fabs(*b - *a)/TTOL)/log(2));
+
+  memcpy(data->simulationInfo->zeroCrossingsBackup, data->simulationInfo->zeroCrossings, data->modelData->nZeroCrossings * sizeof(modelica_real));
+
+  infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "bisection method starts in interval [%e, %e]", *a, *b);
+  infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "TTOL is set to %e and maximum number of intersections %d.", TTOL, n);
+
+  while(fabs(*b - *a) > MINIMAL_STEP_SIZE && n-- > 0)
+  {
+    c = 0.5 * (*a + *b);
+    data->localData[0]->timeValue = c;
+
+    /*calculates states at time c */
+    for(i=0; i < data->modelData->nStates; i++)
+    {
+      data->localData[0]->realVars[i] = 0.5*(states_a[i] + states_b[i]);
+    }
+
+    /*calculates Values dependents on new states*/
+    /* read input vars */
+#ifndef OMC_FMI_RUNTIME
+    externalInputUpdate(data);
+    data->callback->input_function(data, threadData);
+#endif
+    /* eval needed equations*/
+    data->callback->function_ZeroCrossingsEquations(data, threadData);
+
+    data->callback->function_ZeroCrossings(data, threadData, data->simulationInfo->zeroCrossings);
+
+    if(checkZeroCrossings(data, tmpEventList, eventList))  /* If Zerocrossing in left Section */
+    {
+      memcpy(states_b, data->localData[0]->realVars, data->modelData->nStates * sizeof(modelica_real));
+      *b = c;
+      memcpy(data->simulationInfo->zeroCrossingsBackup, data->simulationInfo->zeroCrossings, data->modelData->nZeroCrossings * sizeof(modelica_real));
+    }
+    else  /*else Zerocrossing in right Section */
+    {
+      memcpy(states_a, data->localData[0]->realVars, data->modelData->nStates * sizeof(modelica_real));
+      *a = c;
+      memcpy(data->simulationInfo->zeroCrossingsPre, data->simulationInfo->zeroCrossings, data->modelData->nZeroCrossings * sizeof(modelica_real));
+      memcpy(data->simulationInfo->zeroCrossings, data->simulationInfo->zeroCrossingsBackup, data->modelData->nZeroCrossings * sizeof(modelica_real));
+    }
+  }
+}
+
+/*! \fn checkZeroCrossings
+ *
+ *  Function checks for an event list on events
+ *
+ *  \param [ref] [data]
+ *  \param [ref] [eventListTmp]
+ *  \param [in]  [eventList]
+ *  \return boolean value
+ */
+int checkZeroCrossings(DATA *data, LIST *tmpEventList, LIST *eventList)
+{
+  LIST_NODE *it;
+
+  listClear(tmpEventList);
+  infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "bisection checks for condition changes");
+
+  for(it=listFirstNode(eventList); it; it=listNextNode(it))
+  {
+    long i = *((long*) listNodeData(it));
+
+    /* found event in left section */
+    if(sign(data->simulationInfo->zeroCrossings[i]) != sign(data->simulationInfo->zeroCrossingsPre[i]))
+    {
+      infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "%ld changed from %g to current %g",
+            i,
+            data->simulationInfo->zeroCrossingsPre[i],
+            data->simulationInfo->zeroCrossings[i]);
+      listPushFront(tmpEventList, listNodeData(it));
+    }
+  }
+
+  if(listLen(tmpEventList) > 0)
+  {
+    return 1;   /* event in left section */
+  }
+
+  return 0;     /* event in right section */
+}
+
+/*! \fn saveZeroCrossingsAfterEvent
+ *
+ *  Function saves all zero-crossing values as pre(zero-crossing)
+ *
+ *  \param [ref] [data]
+ */
+void saveZeroCrossingsAfterEvent(DATA *data, threadData_t *threadData)
+{
+  long i=0;
+
+  infoStreamPrint(OMC_LOG_ZEROCROSSINGS, 0, "save all zerocrossings after an event at time=%g", data->localData[0]->timeValue); /* ??? */
+
+  data->callback->function_ZeroCrossings(data, threadData, data->simulationInfo->zeroCrossings);
+  for(i=0; i<data->modelData->nZeroCrossings; i++) {
+    data->simulationInfo->zeroCrossingsPre[i] = data->simulationInfo->zeroCrossings[i];
+  }
+}
+
+/**
+ * @brief Allocate memory for eventList elements.
+ *
+ * @param data      Unused.
+ * @return void*    Allocated memory for LIST_NODE data.
+ */
+void* eventListAlloc(const void* data) {
+  void* newElem = malloc(sizeof(long));
+  assertStreamPrint(NULL, newElem != NULL, "eventListAlloc: Out of memory");
+  return newElem;
+}
+
+/**
+ * @brief Free memory allocated with eventListAlloc.
+ *
+ * @param data      Void pointer, representing index for new list element.
+ */
+void eventListFree(void* data) {
+  free(data);
+}
+
+/**
+ * @brief Copy data of eventList elements.
+ *
+ * @param dest    Void pointer of destination data, representing long index.
+ * @param src     Void pointer of source data, representing long index.
+ */
+void eventListCopy(void* dest, const void* src) {
+  long* dest_event = (long*) dest;
+  *dest_event = *((long*) src);
+}

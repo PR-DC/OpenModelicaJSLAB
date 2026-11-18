@@ -1,0 +1,174 @@
+find_package(Qt6 COMPONENTS Test REQUIRED)
+
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+# Enable testing in this directory. This means you need to be in
+# <build_dir>/OMEdit/Testsuite/ folder to run ctest.
+# If you want to run the tests while in another directory (ctest > 3.22) you
+# have to specify --test-dir (e.g., --test-dir <build_dir>/OMEdit/Testsuite)
+enable_testing()
+
+add_library(OMEditTestSuiteUtil STATIC Util/Util.cpp)
+add_library(omedit::testsuite::util ALIAS OMEditTestSuiteUtil)
+
+target_link_libraries(OMEditTestSuiteUtil PUBLIC Qt6::Test)
+target_link_libraries(OMEditTestSuiteUtil PUBLIC OMEditLib)
+
+target_include_directories(OMEditTestSuiteUtil PUBLIC Util/)
+
+
+# This macro takes two arguments. The test executable name to be created (which will
+# also be the name of the test instance right now) and a list of source files to build
+# the test executable.
+# Note that you have to quote the list you send into this macro. See below for examples.
+# This is the ugly part of CMake script syntax.
+macro(add_omedit_test test_name test_source_files)
+  add_executable(${test_name} ${test_source_files})
+  target_link_libraries(${test_name} PUBLIC omedit::testsuite::util)
+
+  add_test(NAME ${test_name}
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/RunOMEditTest.sh $<TARGET_FILE:${test_name}>
+                                                              ${CMAKE_CURRENT_BINARY_DIR}/OMEditTestResult/)
+
+  # Label the tests (does not matter just now but it will of more types of tests are added.).
+  set_tests_properties(${TEST_FILE_NAME} PROPERTIES LABELS "OMEditTestsuite")
+
+  message(STATUS "Added OMEdit test ${test_name}.")
+endmacro()
+
+set(OMEDIT_TEST_AUTOCOMPLETION_SOURCES AutoCompletion/AutoCompletionTest.cpp
+                                        AutoCompletion/AutoCompletionTest.h)
+add_omedit_test(AutoCompletion "${OMEDIT_TEST_AUTOCOMPLETION_SOURCES}")
+
+set(OMEDIT_TEST_ARRAYPARAMETEREDITOR_SOURCES ArrayParameterEditor/ArrayParameterEditor.cpp
+                                             ArrayParameterEditor/ArrayParameterEditor.h)
+add_omedit_test(ArrayParameterEditor "${OMEDIT_TEST_ARRAYPARAMETEREDITOR_SOURCES}")
+
+set(OMEDIT_TEST_BROWSEMSL_SOURCES BrowseMSL/BrowseMSL.cpp
+                                  BrowseMSL/BrowseMSL.h)
+add_omedit_test(BrowseMSL "${OMEDIT_TEST_BROWSEMSL_SOURCES}")
+
+# Pure: the three-way sync planner and the manifest, with no network or provider.
+set(OMEDIT_TEST_CLOUD_SOURCES Cloud/CloudSyncPlanTest.cpp)
+add_omedit_test(CloudSyncPlan "${OMEDIT_TEST_CLOUD_SOURCES}")
+
+# The sync engine end to end, against an in-memory provider.
+set(OMEDIT_TEST_CLOUD_ENGINE_SOURCES Cloud/CloudSyncEngineTest.cpp)
+add_omedit_test(CloudSyncEngine "${OMEDIT_TEST_CLOUD_ENGINE_SOURCES}")
+
+set(OMEDIT_TEST_CHOICESENUMERATION_SOURCES ChoicesEnumeration/ChoicesEnumerationTest.cpp
+                                           ChoicesEnumeration/ChoicesEnumerationTest.h)
+add_omedit_test(ChoicesEnumeration "${OMEDIT_TEST_CHOICESENUMERATION_SOURCES}")
+
+set(OMEDIT_TEST_CONDITIONALCOMPONENT_SOURCES ConditionalComponent/ConditionalComponentTest.cpp
+                                                   ConditionalComponent/ConditionalComponentTest.h)
+add_omedit_test(ConditionalComponent "${OMEDIT_TEST_CONDITIONALCOMPONENT_SOURCES}")
+
+set(OMEDIT_TEST_DIAGRAM_SOURCES Diagram/Diagram.cpp
+                                Diagram/Diagram.h)
+add_omedit_test(Diagram "${OMEDIT_TEST_DIAGRAM_SOURCES}")
+
+set(OMEDIT_TEST_DYNAMICANNOTATION_SOURCES DynamicAnnotation/DynamicAnnotationTest.cpp
+                                           DynamicAnnotation/DynamicAnnotationTest.h)
+add_omedit_test(DynamicAnnotation "${OMEDIT_TEST_DYNAMICANNOTATION_SOURCES}")
+
+set(OMEDIT_TEST_EXPRESSION_SOURCES Expression/ExpressionTest.cpp
+                                   Expression/ExpressionTest.h)
+add_omedit_test(Expression "${OMEDIT_TEST_EXPRESSION_SOURCES}")
+
+set(OMEDIT_TEST_FMIGUIDE_SOURCES FMIGuide/FMIGuideTest.cpp
+                                 FMIGuide/FMIGuideTest.h)
+add_omedit_test(FMIGuide "${OMEDIT_TEST_FMIGUIDE_SOURCES}")
+
+set(OMEDIT_TEST_HOMOTOPY_SOURCES Homotopy/HomotopyTest.cpp
+                                 Homotopy/HomotopyTest.h)
+add_omedit_test(Homotopy "${OMEDIT_TEST_HOMOTOPY_SOURCES}")
+# Set a 5 min timeout for the Homotopy test. This should be investigated
+# to figure out why it takes so long in the first place.
+# set_tests_properties(Homotopy PROPERTIES TIMEOUT 300)
+
+set(OMEDIT_TEST_LANGUAGESERVER_SOURCES LanguageServer/LanguageServerTest.cpp
+                                       LanguageServer/LanguageServerTest.h)
+add_omedit_test(LanguageServer "${OMEDIT_TEST_LANGUAGESERVER_SOURCES}")
+
+# Real editor navigation against the same server staged for OMEdit. Builds that
+# deliberately omit the server can supply one with MODELICA_LS_DIR.
+if(MODELICA_LS_STAGE_EXE AND NOT CMAKE_CROSSCOMPILING)
+  set(OMEDIT_TEST_LANGUAGESERVERNAVIGATION_SOURCES LanguageServer/LanguageServerNavigationTest.cpp
+                                                LanguageServer/LanguageServerNavigationTest.h)
+  add_omedit_test(LanguageServerNavigation "${OMEDIT_TEST_LANGUAGESERVERNAVIGATION_SOURCES}")
+  add_executable(OMEditDefinitionTestServer LanguageServer/DefinitionTestServer.cpp)
+  target_link_libraries(OMEditDefinitionTestServer PRIVATE Qt6::Core)
+  add_dependencies(LanguageServerNavigation OMEditDefinitionTestServer)
+  target_compile_definitions(LanguageServerNavigation PRIVATE
+    OMEDIT_DEFINITION_TEST_SERVER="$<TARGET_FILE:OMEditDefinitionTestServer>")
+  # OMEdit's staging step renames downloaded assets and makes them executable.
+  add_dependencies(LanguageServerNavigation OMEdit)
+  target_compile_definitions(LanguageServerNavigation PRIVATE
+    OMEDIT_TEST_LSP_EXECUTABLE="$<TARGET_FILE_DIR:OMEdit>/ls/modelica/${MODELICA_LS_STAGE_EXE_NAME}")
+  set_tests_properties(LanguageServerNavigation PROPERTIES TIMEOUT 60 LABELS "OMEditTestsuite")
+else()
+  message(STATUS "LanguageServerNavigation not registered: no runnable staged language server")
+endif()
+
+set(OMEDIT_TEST_INSTALLLIBRARYFROMPATH_SOURCES InstallLibraryFromPath/InstallLibraryFromPathTest.cpp
+                                               InstallLibraryFromPath/InstallLibraryFromPathTest.h)
+add_omedit_test(InstallLibraryFromPath "${OMEDIT_TEST_INSTALLLIBRARYFROMPATH_SOURCES}")
+
+set(OMEDIT_TEST_MERGEEXTENDSMODIFIERS_SOURCES MergeExtendsModifiers/MergeExtendsModifiersTest.cpp
+                                              MergeExtendsModifiers/MergeExtendsModifiersTest.h)
+add_omedit_test(MergeExtendsModifiers "${OMEDIT_TEST_MERGEEXTENDSMODIFIERS_SOURCES}")
+
+set(OMEDIT_TEST_MODELINSTANCE_SOURCES ModelInstance/ModelInstanceTest.cpp
+                                      ModelInstance/ModelInstanceTest.h)
+add_omedit_test(ModelInstance "${OMEDIT_TEST_MODELINSTANCE_SOURCES}")
+
+set(OMEDIT_TEST_PLOTANNOTATION_SOURCES PlotAnnotation/PlotAnnotationTest.cpp
+                                       PlotAnnotation/PlotAnnotationTest.h)
+add_omedit_test(PlotAnnotation "${OMEDIT_TEST_PLOTANNOTATION_SOURCES}")
+
+set(OMEDIT_TEST_RECENTMODELS_SOURCES RecentModels/RecentModelsTest.cpp
+                                     RecentModels/RecentModelsTest.h)
+add_omedit_test(RecentModels "${OMEDIT_TEST_RECENTMODELS_SOURCES}")
+
+set(OMEDIT_TEST_REPLACEABLECONSTRAINEDBY_SOURCES ReplaceableConstrainedBy/ReplaceableConstrainedByTest.cpp
+                                                  ReplaceableConstrainedBy/ReplaceableConstrainedByTest.h)
+add_omedit_test(ReplaceableConstrainedBy "${OMEDIT_TEST_REPLACEABLECONSTRAINEDBY_SOURCES}")
+
+set(OMEDIT_TEST_DOCUMENTATION_SOURCES Documentation/DocumentationViewerTest.cpp
+                                       Documentation/DocumentationViewerTest.h)
+add_omedit_test(DocumentationViewer "${OMEDIT_TEST_DOCUMENTATION_SOURCES}")
+
+set(OMEDIT_TEST_OUTERPARAMETERDIALOG_SOURCES OuterParameterDialog/OuterParameterDialogTest.cpp
+                                            OuterParameterDialog/OuterParameterDialogTest.h)
+add_omedit_test(OuterParameterDialog "${OMEDIT_TEST_OUTERPARAMETERDIALOG_SOURCES}")
+
+set(OMEDIT_TEST_RECORDCHOICESALLMATCHING_SOURCES RecordChoicesAllMatching/RecordChoicesAllMatching.cpp
+                                                   RecordChoicesAllMatching/RecordChoicesAllMatching.h)
+add_omedit_test(RecordChoicesAllMatching "${OMEDIT_TEST_RECORDCHOICESALLMATCHING_SOURCES}")
+
+set(OMEDIT_TEST_STRINGHANDLER_SOURCES StringHandler/StringHandlerTest.cpp
+                                       StringHandler/StringHandlerTest.h)
+add_omedit_test(StringHandler "${OMEDIT_TEST_STRINGHANDLER_SOURCES}")
+
+set(OMEDIT_TEST_TABBEDVIEW_SOURCES TabbedView/TabbedViewTest.cpp
+                                   TabbedView/TabbedViewTest.h)
+add_omedit_test(TabbedView "${OMEDIT_TEST_TABBEDVIEW_SOURCES}")
+
+set(OMEDIT_TEST_TRANSFORMATION_SOURCES Transformation/TransformationTest.cpp
+                                       Transformation/TransformationTest.h)
+add_omedit_test(Transformation "${OMEDIT_TEST_TRANSFORMATION_SOURCES}")
+
+set(OMEDIT_TEST_VARIABLESBROWSER_SOURCES VariablesBrowser/VariablesBrowserTest.cpp
+                                         VariablesBrowser/VariablesBrowserTest.h)
+add_omedit_test(VariablesBrowser "${OMEDIT_TEST_VARIABLESBROWSER_SOURCES}")
+
+set(OMEDIT_TEST_UTILITIES_SOURCES Utilities/UtilitiesTest.cpp
+                                  Utilities/UtilitiesTest.h)
+add_omedit_test(Utilities "${OMEDIT_TEST_UTILITIES_SOURCES}")
+
+set(OMEDIT_TEST_VARIABLEVALUE_SOURCES VariableValue/VariableValueTest.cpp
+                                      VariableValue/VariableValueTest.h)
+add_omedit_test(VariableValue "${OMEDIT_TEST_VARIABLEVALUE_SOURCES}")

@@ -1,0 +1,61 @@
+// name:     ExternalFunction4
+// keywords: external function,code generation,constant propagation
+// status:   correct
+// teardown_command: rm -f ExternalFunction4_*
+//
+// Constant evaluation of function calls using Library annotation.
+// The following example is from MSL and should propagate all constants.
+//
+
+model ExternalFunction4
+
+function inv
+  input Real A[2,2];
+  output Real invA[2,2];
+protected
+  Integer info;
+  Integer pivots[size(A,1)];
+  Real LU[size(A,1),size(A,2)];
+algorithm
+  (LU,pivots,info) := dgetrf(A);
+  assert(info == 0,"Calculating an inverse matrix with function \"Matrices.inv\" is not possible, since matrix A is singular.");
+  invA := dgetri(LU,pivots);
+end inv;
+
+pure function dgetri
+  input Real LU[:,size(LU,1)];
+  input Integer pivots[size(LU,1)];
+  output Real inv[size(LU,1),size(LU,2)]=LU;
+protected
+  Integer lwork=min(10,size(LU,1))*size(LU,1);
+  Real work[lwork];
+  Integer info;
+  external "FORTRAN 77" dgetri(size(LU,1),inv,size(LU,1),pivots,work,lwork,info) annotation (Library="Lapack");
+end dgetri;
+
+pure function dgetrf
+  input Real A[:,:];
+  output Real LU[size(A,1),size(A,2)]=A;
+  output Integer pivots[min(size(A,1),size(A,2))];
+  output Integer info;
+external "FORTRAN 77" dgetrf(size(A,1),size(A,2),LU,size(A,1),pivots,info) annotation (Library="Lapack");
+end dgetrf;
+
+  constant Real r[2,2] = {{1,2},{3,4}};
+  Real r2[2,2] = r*inv(r);
+end ExternalFunction4;
+
+// Result:
+// class ExternalFunction4
+//   constant Real r[1,1] = 1.0;
+//   constant Real r[1,2] = 2.0;
+//   constant Real r[2,1] = 3.0;
+//   constant Real r[2,2] = 4.0;
+//   Real r2[1,1];
+//   Real r2[1,2];
+//   Real r2[2,1];
+//   Real r2[2,2];
+// equation
+//   r2 = {{1.0, 0.0}, {8.881784197001252e-16, 0.9999999999999996}};
+// end ExternalFunction4;
+// endResult

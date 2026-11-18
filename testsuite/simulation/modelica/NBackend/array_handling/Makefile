@@ -1,0 +1,182 @@
+TEST = ../../../../rtest -v
+
+TESTFILES = \
+sumRecordArraySlice.mos \
+arrayEquationRowLoop.mos \
+scalarProductSlice.mos \
+nlsArrayElementNominal.mos \
+resizableAliasMin.mos \
+reductionSkips.mos \
+nestedForConnectRange.mos \
+sparsityMatrixResidual.mos \
+forNestedElseIf.mos \
+forSliceRowMajor.mos \
+sliceRangeSparsity.mos \
+sparsityScalarTemplates.mos \
+sparsityNegatedAlias.mos \
+raggedComponentArrays.mos \
+scalarDivArray.mos \
+arrayRowScalar.mos \
+emptyArrayTupleArgument.mos \
+algorithmForSubscript.mos \
+eachScalarProduct.mos \
+ifBranchSizes.mos \
+recordActualStream.mos \
+arrayZeroDivisionInitial.mos \
+arrayPreValues.mos \
+jacobianElementSeed.mos \
+jacobianArrayIndices.mos \
+jacobianLiterals.mos \
+blockLiterals.mos \
+scalarSparsityTables.mos \
+array_constructor_if.mos \
+resizableConnectFor.mos \
+resizableNLSLogging.mos \
+resizableNLSNominal.mos \
+resizableSparsity.mos \
+resizableCoveredSparsity.mos \
+resizableSparsityArrayEqn.mos \
+resizableSparsityInner.mos \
+resizablePartialBodyFor.mos \
+resizableConnectChain.mos \
+resizableConnectIf.mos \
+arrayConnectOutside.mos \
+mixedDependencyFrames.mos \
+arrayConnectRooted.mos \
+entwinedOrder.mos \
+entwinedScalarAnchors.mos \
+entwinedOrderResizable.mos \
+resizableOverride.mos \
+resizableSizeDimension.mos \
+resizableDiffIteratorArray.mos \
+resizableOverrideDerived.mos \
+resizableAliasStart.mos \
+resizableStartSize.mos \
+resizablePartialLoops.mos \
+resizableArrayJacobian.mos \
+resizableMergedJacobian.mos \
+resizableLoopBlocks.mos \
+resizableTearStart.mos \
+resizableConnectArrays.mos \
+resizableConnectSizeAlias.mos \
+resizableManySizes.mos \
+resizableContiguousSlice.mos \
+literalConnects.mos \
+resizableSparseLoop.mos \
+resizableInputs.mos \
+resizableJacobianOffsets.mos \
+resizableAlgebraicLoops.mos \
+resizableFill.mos \
+resizableStreams.mos \
+resizableEvaluate.mos \
+resizableEvaluateAlias.mos \
+resizableStreamMixing.mos \
+resizableWholeSubscript.mos \
+resizableArrayBinding.mos \
+resizableArrayAlias.mos \
+resizableArrayBodyFor.mos \
+resizableInitOverdetermined.mos \
+resizableSlicedDummy.mos \
+resizableSlicedDummyInit.mos \
+array_start_vector.mos\
+array_start_int_bool_string.mos\
+array_inputs.mos\
+array_init_file.mos\
+array_each_attribute_ida.mos\
+array_bound_attributes.mos\
+array_bound_attributes_alias.mos\
+print_array_var_names.mos\
+integerComprehensionParameter.mos\
+arrayResultFile.mos\
+simple_for.mos\
+simple_nested_for.mos\
+irregular_for.mos\
+diagonal_slice_for.mos\
+simple_der_for.mos\
+slice_for.mos\
+for_exp.mos\
+for_list.mos\
+for_if.mos\
+Resizable_HeatTransfer_equations.mos\
+testVectorizedSolarSystem.mos\
+testVectorizedPowerSystem.mos\
+exemplary.mos\
+MultiDimensionalArrays1.mos\
+MultiDimensionalArrays2.mos\
+MultiDimensionalArrays3.mos\
+MultiDimensionalArrays4.mos\
+subscripted_expression.mos\
+matrix_vector_product.mos\
+scalar_product.mos\
+EnumIndex.mos\
+BenchmarksForResizeableArrays.ArrayEquations.CascadedFirstOrder1.mos\
+BenchmarksForResizeableArrays.ArrayEquations.CascadedFirstOrder2.mos\
+BenchmarksForResizeableArrays.ArrayEquations.CascadedFirstOrder3.mos\
+BenchmarksForResizeableArrays.ArrayEquations.CascadedFirstOrder4.mos\
+BenchmarksForResizeableArrays.ArrayEquations.WaterHammer.mos\
+BenchmarksForResizeableArrays.ArrayEquationsWithIndexReduction.SlidingMass3D.mos\
+BenchmarksForResizeableArrays.ForLoops.CascadedFirstOrder.mos\
+BenchmarksForResizeableArrays.ForLoops.CocurrentHeatExchanger.mos\
+BenchmarksForResizeableArrays.ComponentArrays.FiltersInSeries.mos\
+BenchmarksForResizeableArrays.ComponentArrays.TransmissionLine.mos\
+BenchmarksForResizeableArrays.ErrorsIfArraysNotExpanded.LinearSystemOfEquations.mos\
+BenchmarksForResizeableArrays.ErrorsIfArraysNotExpanded.WrongNumberOfArrayEquations.mos\
+BenchmarksForResizeableArrays.ErrorsIfArraysNotExpanded.MixedAlgebraicAndStatesArray.mos\
+BenchmarksForResizeableArrays.ErrorsIfArraysNotExpandedCorrected.FailedConsistencyCheckCorrected.mos\
+BenchmarksForResizeableArrays.Resizable.CascadedFirstOrder1_Resizable.mos\
+BenchmarksForResizeableArrays.Resizable.CascadedFirstOrder2_Resizable.mos\
+BenchmarksForResizeableArrays.Resizable.CascadedFirstOrder3_Resizable.mos\
+BenchmarksForResizeableArrays.Resizable.CascadedFirstOrder4_Resizable.mos\
+BenchmarksForResizeableArrays.Resizable.CascadedFirstOrder_Resizable.mos\
+BenchmarksForResizeableArrays.Resizable.FiltersInSeries_Resizable.mos \
+arrayStartSlice.mos \
+componentArraySlicedStart.mos \
+resizableConnectDeleted.mos \
+EmptyArrayInComponentArray.mos \
+sparsityRowsArrayComponents.mos \
+
+# test that currently fail. Move up when fixed.
+# Run make failingtest
+FAILINGTESTFILES = \
+
+# Dependency files that are not .mo .mos or Makefile
+# Add them here or they will be cleaned.
+DEPENDENCIES = \
+*.mo \
+*.mos \
+Makefile \
+ReferenceFiles \
+
+CLEAN = `ls | grep -w -v -f deps.tmp`
+
+.PHONY : test clean getdeps failingtest
+
+test:
+	@echo
+	@echo Running tests...
+	@echo
+	@echo OPENMODELICAHOME=" $(OPENMODELICAHOME) "
+	@$(TEST) $(TESTFILES)
+
+# Cleans all files that are not listed as dependencies
+clean:
+	@echo $(DEPENDENCIES) | sed 's/ /\\|/g' > deps.tmp
+	@rm -f $(CLEAN)
+
+# Run this if you want to list out the files (dependencies).
+# do it after cleaning and updating the folder
+# then you can get a list of file names (which must be dependencies
+# since you got them from repository + your own new files)
+# then add them to the DEPENDENCIES. You can find the
+# list in deps.txt
+getdeps:
+	@echo $(DEPENDENCIES) | sed 's/ /\\|/g' > deps.tmp
+	@echo $(CLEAN) | sed -r 's/deps.txt|deps.tmp//g' | sed 's/ / \\\n/g' > deps.txt
+	@echo Dependency list saved in deps.txt.
+	@echo Copy the list from deps.txt and add it to the Makefile @DEPENDENCIES
+
+failingtest:
+	@echo
+	@echo Running failing tests...
+	@echo
+	@$(TEST) -disabled $(FAILINGTESTFILES)

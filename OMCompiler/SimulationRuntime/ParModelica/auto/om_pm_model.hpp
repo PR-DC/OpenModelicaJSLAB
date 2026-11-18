@@ -1,0 +1,151 @@
+/*
+ * This file belongs to the OpenModelica Run-Time System
+ *
+ * Copyright (c) 1998-2026, Open Source Modelica Consortium (OSMC), c/o Linköpings
+ * universitet, Department of Computer and Information Science, SE-58183 Linköping, Sweden. All rights
+ * reserved.
+ *
+ * THIS PROGRAM IS PROVIDED UNDER THE TERMS OF THE BSD NEW LICENSE OR THE
+ * AGPL VERSION 3 LICENSE OR THE OSMC PUBLIC LICENSE (OSMC-PL) VERSION 1.8. ANY
+ * USE, REPRODUCTION OR DISTRIBUTION OF THIS PROGRAM CONSTITUTES RECIPIENT'S
+ * ACCEPTANCE OF THE BSD NEW LICENSE OR THE OSMC PUBLIC LICENSE OR THE AGPL
+ * VERSION 3, ACCORDING TO RECIPIENTS CHOICE.
+ *
+ * The OpenModelica software and the OSMC (Open Source Modelica Consortium) Public License
+ * (OSMC-PL) are obtained from OSMC, either from the above address, from the URLs:
+ * http://www.openmodelica.org or https://github.com/OpenModelica/ or
+ * http://www.ida.liu.se/projects/OpenModelica, and in the OpenModelica distribution. GNU
+ * AGPL version 3 is obtained from: https://www.gnu.org/licenses/licenses.html#GPL. The BSD NEW
+ * License is obtained from: http://www.opensource.org/licenses/BSD-3-Clause.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE, EXCEPT AS EXPRESSLY
+ * SET FORTH IN THE BY RECIPIENT SELECTED SUBSIDIARY LICENSE CONDITIONS OF
+ * OSMC-PL.
+ *
+ */
+
+#pragma once
+#ifndef idD09C04B9_F1BC_4139_8CFF2E562C8C1060
+#define idD09C04B9_F1BC_4139_8CFF2E562C8C1060
+
+/*
+ Mahder.Gebremedhin@liu.se  2020-10-12
+*/
+
+#include <tbb/global_control.h>
+#include <simulation_data.h>
+
+#include <memory>
+
+#include "pm_cluster_level_scheduler.hpp"
+#include "pm_cluster_dynamic_scheduler.hpp"
+#include "pm_scheduler_base.hpp"
+
+#include "pm_timer.hpp"
+
+#include "om_pm_equation.hpp"
+
+
+
+namespace openmodelica {
+namespace parmodelica {
+
+
+class OMModel;
+
+struct Equation : public TaskNode {
+
+    typedef void (*FunctionType)(DATA *, threadData_t*);
+private:
+    FunctionType* function_system;
+    DATA *data;
+    threadData_t* threadData;
+
+public:
+    Equation();
+
+    long index;
+    std::set<std::string> lhs;
+    std::set<std::string> rhs;
+    std::string type;
+
+    bool depends_on(const TaskNode&) const;
+
+    void execute();
+
+    friend class OMModel;
+
+};
+
+
+/*! Create the scheduler selected at run time by the parmodScheduler flag
+    ("flow" -> ClusterDynamicScheduler, "level" -> StepLevels). */
+std::unique_ptr<TaskGraphScheduler> make_parmod_scheduler(TaskSystem_v2<Equation>& sys, size_t max_num_threads);
+
+
+class OMModel
+  : utility::noncopyable {
+    typedef Equation::FunctionType FunctionType;
+
+    // typedef LevelSchedulerThreadAware<Equation> SchedulerT;
+    // typedef LevelSchedulerThreadOblivious<Equation> SchedulerT;
+    // typedef DynamicScheduler<Equation> SchedulerT;
+    // typedef TaskSystem<Equation> TaskSystemT;
+    // The scheduler is selected at run time (parmodScheduler flag) instead of a
+    // compile-time #define, so both implementations are compiled in.
+    typedef ClusterDynamicScheduler<Equation> FlowSchedulerT;
+    typedef StepLevels<Equation>              LevelSchedulerT;
+    typedef TaskSystem_v2<Equation>           TaskSystemT;
+
+
+
+public:
+    std::string name;
+    size_t max_num_threads;
+    // oneTBB removed tbb::task_scheduler_init; cap the global thread pool instead.
+    tbb::global_control tbb_system;
+
+    bool intialized;
+    DATA* data;
+    threadData_t* threadData;
+
+
+public:
+    OMModel(const std::string& name, size_t max_num_threads);
+    void load_ODE_system();
+
+    PMTimer load_system_timer;
+
+    FunctionType* ini_system_funcs;
+    TaskSystemT INI_system;
+    std::unique_ptr<TaskGraphScheduler> INI_scheduler;
+
+    FunctionType* dae_system_funcs;
+    TaskSystemT DAE_system;
+    std::unique_ptr<TaskGraphScheduler> DAE_scheduler;
+
+    FunctionType* ode_system_funcs;
+    TaskSystemT ODE_system;
+    std::unique_ptr<TaskGraphScheduler> ODE_scheduler;
+
+    FunctionType alg_system_funcs;
+    TaskSystemT ALG_system;
+    std::unique_ptr<TaskGraphScheduler> ALG_scheduler;
+
+    void load_from_json(TaskSystemT&, const std::string&, FunctionType*);
+};
+
+
+
+
+
+
+
+
+} // openmodelica
+} // parmodelica
+
+
+
+#endif // header

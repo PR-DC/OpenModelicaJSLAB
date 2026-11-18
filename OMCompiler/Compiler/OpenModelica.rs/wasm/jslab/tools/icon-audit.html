@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<style>
+body { margin: 0; padding: 16px; font: 13px Arial; background: #f5f7fa; }
+main { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+article { padding: 10px; height: 202px; background: white; border: 1px solid #d7dce2; border-radius: 4px; text-align: center; }
+svg { display: block; width: 100%; height: 166px; }
+.custom main { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.custom article { height: 140px; }
+.custom svg { height: 95px; }
+.custom span { font-size: 10px; overflow-wrap: anywhere; }
+.all main { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+.all article { height: 180px; padding: 8px; overflow: hidden; }
+.all svg { height: 145px; }
+.all span { display: block; font-size: 10px; overflow-wrap: anywhere; }
+</style>
+<main></main>
+<div id="audit-frame-marker" style="position:fixed;left:0;top:0;width:4px;height:4px;z-index:1000"></div>
+<script>
+const path = require('path');
+const sdk_root = path.join(new URLSearchParams(location.search).get('bundle'), 'js');
+const { renderAnnotation } = require(path.join(sdk_root, 'annotations'));
+const { renderBlockIcon, iconTypes } = require(path.join(sdk_root, 'icons'));
+const icon_style = document.createElement('style');
+icon_style.textContent = require('fs').readFileSync(path.join(sdk_root, 'icons.css'), 'utf8');
+document.head.appendChild(icon_style);
+const { readMetadata } = require(path.join(sdk_root, 'assets'));
+const graphics = readMetadata('library-graphics.json');
+const assets = readMetadata('library-assets.json');
+const custom = new URLSearchParams(location.search).get('custom') == '1';
+const all = new URLSearchParams(location.search).get('all') == '1';
+const annotations = new URLSearchParams(location.search).get('annotations') == '1';
+const language = new URLSearchParams(location.search).get('language') || 'en';
+if(custom) document.body.classList.add('custom');
+if(all) document.body.classList.add('all');
+const classes = readMetadata('library-catalog.json').classes;
+const types = all ? Object.values(classes)
+  .filter(item => ['block', 'model'].includes(item.restriction)).map(item => item.type).sort() :
+  custom ? Object.keys(readMetadata('custom-icons.json')) : [
+  'Modelica.Blocks.Continuous.CriticalDamping',
+  'Modelica.Blocks.Continuous.Filter',
+  'Modelica.Blocks.Discrete.FirstOrderHold',
+  'Modelica.Blocks.Interaction.Show.BooleanValue',
+  'Modelica.Electrical.Machines.BasicMachines.Components.AirGapDC',
+  'Modelica.Mechanics.MultiBody.Joints.Revolute',
+  'Modelica.Mechanics.MultiBody.Parts.BodyShape',
+  'Modelica.Mechanics.MultiBody.Joints.Spherical',
+  'Modelica.Blocks.Math.Gain',
+  'Modelica.Electrical.Analog.Examples.Utilities.Conductor',
+  'Modelica.Mechanics.Rotational.Examples.Utilities.SpringDamper',
+  'Modelica.Electrical.Machines.Utilities.MultiTerminalBox'
+];
+var auditPageCount = all ? Math.ceil(types.length / 30) : 1;
+async function renderAuditPage(page) {
+document.getElementById('audit-frame-marker').style.backgroundColor = 'rgb(' + (page + 1) + ',37,193)';
+document.querySelector('main').replaceChildren();
+var report = [];
+var fragment = document.createDocumentFragment(), image_loads = [], rendered = [];
+for(const type of all ? types.slice(page * 30, page * 30 + 30) : types) {
+  var article = document.createElement('article');
+  var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '-150 -150 300 300');
+  var item = { type: type, renderer: !annotations && iconTypes.includes(type) ? 'custom' : 'annotation', imageErrors: [], geometryValid: true };
+  try {
+    var metadata = Object.assign({}, graphics[type], { assets });
+    if(annotations || classes[type].partial) {
+      var primitives = renderAnnotation(svg, metadata, { name: 'audit', modifiers: [], language: language }, 200, 200);
+      item.expectedEmpty = !!classes[type].partial && primitives === 0;
+    }
+    else renderBlockIcon(svg, { type: type, name: 'audit', modifiers: [], language: language }, 200, 200, metadata);
+  }
+  catch(error) { item.error = error.message; }
+  var label = document.createElement('span');
+  label.textContent = custom || all ? type.split('.').slice(-3).join('.') : type.split('.').pop();
+  article.append(svg, label);
+  fragment.appendChild(article);
+  const current = item;
+  image_loads.push(...Array.from(svg.querySelectorAll('image')).map(image => new Promise(resolve => {
+    var probe = new Image();
+    probe.onload = resolve;
+    probe.onerror = () => { current.imageErrors.push(image.getAttribute('href')); resolve(); };
+    probe.src = image.getAttribute('href');
+  })));
+  rendered.push({ svg: svg, item: item });
+}
+document.querySelector('main').appendChild(fragment);
+await Promise.all(image_loads);
+await document.fonts.ready;
+for(const { svg, item } of rendered) {
+  var bounds = svg.getBBox();
+  item.invalidAttributes = Array.from(svg.querySelectorAll('*')).flatMap(element => Array.from(element.attributes)
+    .filter(attribute => /^(?:d|points|x|y|cx|cy|r|rx|ry|width|height|transform|stroke-width|font-size)$/.test(attribute.name) &&
+      /(?:NaN|Infinity)/.test(attribute.value)).map(attribute => ({ tag: element.tagName, name: attribute.name, value: attribute.value })));
+  item.geometryValid = [bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) &&
+    (item.expectedEmpty || bounds.width > 0 || bounds.height > 0) && !item.invalidAttributes.length;
+  item.bounds = { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+  item.textOverflow = Array.from(svg.querySelectorAll('text[data-text-extent]')).flatMap(text => {
+    var extent = JSON.parse(text.getAttribute('data-text-extent')), box = text.getBBox();
+    return extent[0] > 0 && box.width > extent[0] + 1 || extent[1] > 0 && box.height > extent[1] + 1 ?
+      [{ text: text.textContent, width: box.width, height: box.height, extent: extent }] : [];
+  });
+  var rect = svg.getBoundingClientRect();
+  item.rect = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  report.push(item);
+}
+await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+return report;
+}
+</script>

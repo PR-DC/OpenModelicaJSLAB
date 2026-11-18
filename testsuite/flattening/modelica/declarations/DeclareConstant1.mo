@@ -1,0 +1,15 @@
+// name:     DeclareConstant1
+// keywords: declaration,equation
+// status:   incorrect
+// suite: disabled
+//
+// A constant requires a declaration equation.
+// A normal equation from which we can compute
+// the constant is not sufficient.
+
+class DeclareConstant1
+  constant String s;
+equation
+  s = "value";
+  annotation(__OpenModelica_commandLineOptions="-d=-newInst");
+end DeclareConstant1;

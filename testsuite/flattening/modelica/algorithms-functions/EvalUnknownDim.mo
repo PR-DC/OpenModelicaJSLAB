@@ -1,0 +1,20 @@
+// status: correct
+
+model EvalUnknownDim
+  function mySize
+    input Real r[:];
+    output Integer s;
+  protected
+    Real tmp[:];
+  algorithm
+    tmp := r;
+    s := size(tmp,1);
+  end mySize;
+  constant Integer s = mySize({1,2,3});
+  annotation(__OpenModelica_commandLineOptions="+d=-gen");
+end EvalUnknownDim;
+// Result:
+// class EvalUnknownDim
+//   constant Integer s = 3;
+// end EvalUnknownDim;
+// endResult
